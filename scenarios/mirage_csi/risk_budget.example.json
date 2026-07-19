@@ -1,0 +1,8 @@
+{
+  "notional": 200000000,
+  "net_delta": 100000000,
+  "gross_delta": 250000000,
+  "net_vega": 20000000,
+  "stress_loss": 100000000
+}
+

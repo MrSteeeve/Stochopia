@@ -1,0 +1,17 @@
+{
+  "id": "institutional_demo",
+  "name": "Synthetic Institutional Client",
+  "capital": 50000000,
+  "max_loss_pct": 1.0,
+  "min_return_pct": 0.03,
+  "risk_appetite": "moderate",
+  "preferences": "balanced yield and transparent downside",
+  "max_maturity_months": 12,
+  "principal_protection_required": false,
+  "allowed_product_types": null,
+  "accepting_new_products": true,
+  "min_hit_prob": 0.5,
+  "current_focus": "",
+  "round_overrides": []
+}
+

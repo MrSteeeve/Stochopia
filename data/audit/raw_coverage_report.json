@@ -1,0 +1,214 @@
+{
+  "cffex": {
+    "archives": 48,
+    "crc_valid_archives": 48,
+    "csv_members": 969,
+    "duplicate_member_dates": 0,
+    "interim": {
+      "bytes": 20760008,
+      "first_date_by_product": {
+        "IC": "20220104",
+        "IM": "20220722",
+        "MO": "20220722"
+      },
+      "mo_first_date": "20220722",
+      "path": "data/interim/cffex/ic_im_mo_daily.csv",
+      "rows": 210480,
+      "rows_by_product_year": {
+        "IC": {
+          "2022": 968,
+          "2023": 968,
+          "2024": 968,
+          "2025": 972
+        },
+        "IM": {
+          "2022": 440,
+          "2023": 968,
+          "2024": 968,
+          "2025": 972
+        },
+        "MO": {
+          "2022": 23060,
+          "2023": 48410,
+          "2024": 70336,
+          "2025": 61450
+        }
+      },
+      "sha256": "f66c77d0b2eb3a15f8a212aaec9acbbf8e91e2f9e65d30a7d7126c6e4dfacd53"
+    },
+    "invalid_archives": [],
+    "manifest": {
+      "entries": 48,
+      "matched": 48,
+      "mismatched": [],
+      "missing": [],
+      "unlisted": [],
+      "valid": true
+    },
+    "member_max_date": "20251231",
+    "member_min_date": "20220104",
+    "wrong_member_month": []
+  },
+  "contains_raw_market_values": false,
+  "gate_a": {
+    "gaps": [],
+    "ready": true
+  },
+  "generated_at": "2026-07-13T11:05:22.883292+00:00",
+  "tushare": {
+    "completeness": {
+      "duplicate_option_dates": [],
+      "expected_core": 35,
+      "expected_option_dates": 120,
+      "extra_option_dates": [],
+      "missing_core_count": 0,
+      "missing_option_dates": [],
+      "present_core": 35,
+      "present_option_dates": 120,
+      "valid": true
+    },
+    "futures_master": {
+      "contracts_by_product": {
+        "IC": 138,
+        "IM": 51
+      },
+      "covered_products": [
+        "IC",
+        "IM"
+      ],
+      "invalid_master_contracts": 0,
+      "master_rows": 712,
+      "missing_products": [],
+      "ready": true,
+      "target_contracts": 189
+    },
+    "manifest": {
+      "entries": 310,
+      "matched": 310,
+      "mismatched": [],
+      "missing": [],
+      "unlisted": [],
+      "valid": true
+    },
+    "metadata": {
+      "failures": [],
+      "metadata_files": 155,
+      "valid": true,
+      "validated": 155
+    },
+    "options": {
+      "candidate_dates_covered": 120,
+      "candidate_dates_missing": [],
+      "daily_codes_missing_from_master": 0,
+      "exact_whitelist_contracts": 1614,
+      "expected_candidate_dates": 120,
+      "formal_whitelist_status": "ready",
+      "invalid_master_contracts": 0,
+      "m_a_counts": {
+        "A": 346,
+        "M": 1268
+      },
+      "master_rows": {
+        "CFFEX": 9924,
+        "SSE": 12030
+      },
+      "observed_active_join_failures": 0,
+      "raw_prerequisite_ready": true,
+      "sse_510500_audit_rule": "exchange=SSE; opt_code=OP510500.SH; symbol=^510500[CP]\\d{4}[MA]\\d{5}$; call_put/positive/date/active-date checks",
+      "sse_510500_candidate_contracts": 1614,
+      "sse_candidate_chain_rows": 13078,
+      "sse_candidate_contracts_observed": 1230,
+      "sse_chain_rows_total": 61652
+    },
+    "timeseries": {
+      "fund_adj": {
+        "510500.SH": {
+          "duplicate_primary_keys": 0,
+          "max_date": "20251231",
+          "min_date": "20210901",
+          "missing_open_date_count": 0,
+          "missing_open_dates": [],
+          "request_boundary_violations": 0,
+          "rows": 1050,
+          "rows_by_year": {
+            "2021": 81,
+            "2022": 242,
+            "2023": 242,
+            "2024": 242,
+            "2025": 243
+          }
+        }
+      },
+      "fund_daily": {
+        "510500.SH": {
+          "duplicate_primary_keys": 0,
+          "max_date": "20251231",
+          "min_date": "20210901",
+          "missing_open_date_count": 0,
+          "missing_open_dates": [],
+          "request_boundary_violations": 0,
+          "rows": 1050,
+          "rows_by_year": {
+            "2021": 81,
+            "2022": 242,
+            "2023": 242,
+            "2024": 242,
+            "2025": 243
+          }
+        }
+      },
+      "index_daily": {
+        "000852.SH": {
+          "duplicate_primary_keys": 0,
+          "max_date": "20251231",
+          "min_date": "20210901",
+          "missing_open_date_count": 0,
+          "missing_open_dates": [],
+          "request_boundary_violations": 0,
+          "rows": 1050,
+          "rows_by_year": {
+            "2021": 81,
+            "2022": 242,
+            "2023": 242,
+            "2024": 242,
+            "2025": 243
+          }
+        },
+        "000905.SH": {
+          "duplicate_primary_keys": 0,
+          "max_date": "20251231",
+          "min_date": "20210901",
+          "missing_open_date_count": 0,
+          "missing_open_dates": [],
+          "request_boundary_violations": 0,
+          "rows": 1050,
+          "rows_by_year": {
+            "2021": 81,
+            "2022": 242,
+            "2023": 242,
+            "2024": 242,
+            "2025": 243
+          }
+        }
+      },
+      "shibor": {
+        "shibor": {
+          "duplicate_primary_keys": 0,
+          "max_date": "20251231",
+          "min_date": "20210901",
+          "missing_open_date_count": 0,
+          "missing_open_dates": [],
+          "request_boundary_violations": 0,
+          "rows": 1075,
+          "rows_by_year": {
+            "2021": 81,
+            "2022": 246,
+            "2023": 249,
+            "2024": 251,
+            "2025": 248
+          }
+        }
+      }
+    }
+  }
+}

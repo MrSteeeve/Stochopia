@@ -1,0 +1,15 @@
+{
+  "product_type": "vanilla_call",
+  "notional": 1000000,
+  "maturity_months": 6,
+  "strike_pct": 1.0,
+  "barrier_pct": null,
+  "barrier_type": null,
+  "coupon_rate": null,
+  "participation_rate": 1.0,
+  "principal_protected": false,
+  "target_client": "institutional_demo",
+  "pitch": "参与指数上涨，并清楚披露期权费可能全部损失。",
+  "hedging_plan": "使用上市ETF进行Delta对冲。"
+}
+

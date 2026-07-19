@@ -1,0 +1,46 @@
+name: "MIRAGE CSI Long-Horizon Benchmark"
+status: "research protocol; public historical snapshots pending provenance audit"
+warmup_period: ["2022-01-01", "2022-12-31"]
+evaluation_period: ["2023-01-01", "2025-12-31"]
+round_frequency: "month_end"
+rounds_per_episode: 6
+quote_budget_per_round: 3
+client_query_budget_per_round: 3
+product_families:
+  - vanilla_call
+  - vanilla_put
+  - barrier_call
+  - barrier_put
+  - autocallable
+  - snowball
+conditions:
+  - full_static
+  - full_dynamic
+  - partial_static
+  - partial_dynamic
+episodes:
+  - CSI500_2023H1
+  - CSI500_2023H2
+  - CSI500_2024H1
+  - CSI500_2024H2
+  - CSI500_2025H1
+  - CSI500_2025H2
+  - CSI1000_2023H1
+  - CSI1000_2023H2
+  - CSI1000_2024H1
+  - CSI1000_2024H2
+  - CSI1000_2025H1
+  - CSI1000_2025H2
+volatility_fallback:
+  - atm_iv_3m
+  - atm_iv_1m
+  - atm_iv_6m
+  - realized_vol_20d
+  - realized_vol_60d
+risk_budget_calibration:
+  target_candidate_feasibility: [0.20, 0.40]
+  sensitivity_scales: [0.8, 1.0, 1.2]
+private_data_policy: >-
+  Workflow informed by institutional practices; all released scenarios, clients,
+  limits and rules are synthetic and contain no identifiable institution or client data.
+

@@ -1,0 +1,465 @@
+"""Research benchmark protocol: hard checks, state, leakage, market fallback,
+shared domain lattice, continuous loss budget and the v2 quote economics gate."""
+
+from __future__ import annotations
+
+from datetime import date
+
+import pytest
+
+from mirage.benchmark import (
+    BenchmarkCondition,
+    BenchmarkError,
+    HardConstraintEngine,
+    LongHorizonEnvironment,
+    MarketSnapshot,
+    PortfolioState,
+    ProductDomainSpec,
+    RiskBudget,
+    TradingDesk,
+    WorkflowOutcome,
+    calibrate_risk_budget,
+    carry_sensitivity,
+    client_contract_pass,
+    enumerate_domain,
+    load_market_snapshots,
+    option_implied_forward,
+    oracle_best_quote,
+    settle_submission,
+    validate_domain,
+)
+from mirage.env_agents import RoleResponse
+from mirage.products import ClientProfile, ProductSpec
+
+
+# A deliberately tiny lattice so oracle enumeration and property tests stay fast.
+# capital = 20_000_000 -> notionals {.02:400_000, .05:1_000_000, .10:2_000_000}.
+SMALL_DOMAIN = ProductDomainSpec(
+    product_types=("vanilla_call", "vanilla_put", "snowball"),
+    notional_fractions=(.02, .05, .10),
+    maturities=(3, 6),
+    strikes=(1.00,),
+    barriers=(.85,),
+    coupons=(.08,),
+    participations=(1.0,),
+    principal_protected=(False,),
+)
+
+
+def snapshots(episode: str = "CSI500_2023H1") -> list[MarketSnapshot]:
+    return [
+        MarketSnapshot(
+            episode_id=episode,
+            round_num=1,
+            as_of=date(2023, 1, 31),
+            underlying="CSI500",
+            spot=6000.0,
+            risk_free_rate=0.02,
+            realized_vol_20d=0.22,
+            realized_vol_60d=0.20,
+            atm_iv_1m=0.22,
+            atm_iv_3m=0.24,
+            regime="sideways",
+            source="synthetic-test-fixture",
+        ),
+        MarketSnapshot(
+            episode_id=episode,
+            round_num=2,
+            as_of=date(2023, 2, 28),
+            underlying="CSI500",
+            spot=5800.0,
+            risk_free_rate=0.02,
+            realized_vol_20d=0.25,
+            realized_vol_60d=0.21,
+            regime="high_vol_downtrend",
+            source="synthetic-test-fixture",
+        ),
+    ]
+
+
+def client(
+    max_loss: float = 1.0,
+    *,
+    min_hit_prob: float = 0.5,
+    allowed: list[str] | None = None,
+    protection: bool = False,
+    risk: str = "moderate",
+    max_maturity: int = 12,
+) -> ClientProfile:
+    return ClientProfile(
+        id="institutional",
+        name="Synthetic Institutional Client",
+        capital=20_000_000,
+        max_loss_pct=max_loss,
+        min_return_pct=0.03,
+        risk_appetite=risk,
+        max_maturity_months=max_maturity,
+        principal_protection_required=protection,
+        allowed_product_types=allowed,
+        min_hit_prob=min_hit_prob,
+        preferences="yield with transparent downside",
+    )
+
+
+def permissive_client() -> ClientProfile:
+    """Accepts anything hard-executable: loss budget wide, hurdle threshold off."""
+    return client(max_loss=1.0, min_hit_prob=0.0, allowed=None)
+
+
+def budget(scale: float = 1.0) -> RiskBudget:
+    return RiskBudget(
+        notional=100_000_000 * scale,
+        net_delta=100_000_000 * scale,
+        gross_delta=200_000_000 * scale,
+        net_vega=20_000_000 * scale,
+        stress_loss=100_000_000 * scale,
+    )
+
+
+def product(*, maturity: int = 6, protected: bool = False, notional: float = 1_000_000,
+            product_type: str = "vanilla_call") -> ProductSpec:
+    return ProductSpec(
+        product_type=product_type,
+        notional=notional,
+        maturity_months=maturity,
+        strike_pct=1.0,
+        barrier_pct=None,
+        barrier_type=None,
+        coupon_rate=None,
+        participation_rate=1.0,
+        principal_protected=protected,
+        target_client="institutional",
+        pitch="透明的指数上涨参与",
+        hedging_plan="delta hedge with listed ETF",
+    )
+
+
+def make_env(*, full: bool = False, dynamic: bool = True, max_loss: float = 1.0,
+             min_hit_prob: float = 0.0, cli: ClientProfile | None = None,
+             domain: ProductDomainSpec | None = None):
+    return LongHorizonEnvironment(
+        snapshots(),
+        cli or client(max_loss, min_hit_prob=min_hit_prob),
+        budget(),
+        BenchmarkCondition(full_information=full, dynamic=dynamic),
+        domain=domain or SMALL_DOMAIN,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unchanged information-boundary and loader behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_market_volatility_fallback_and_no_raw_chain_leakage():
+    first, second = snapshots()
+    assert first.pricing_volatility() == (0.24, "atm_iv_3m")
+    assert second.pricing_volatility() == (0.25, "realized_vol_20d")
+    brief = first.public_brief()
+    assert "option_chain" not in brief
+    assert brief["volatility_source"] == "atm_iv_3m"
+    assert first.pricing_volatility(1) == (0.22, "atm_iv_1m")
+
+
+def test_option_implied_forward_absorbs_carry():
+    result = option_implied_forward(call=105.0, put=95.0, strike=6000.0, rate=0.02, years=0.5)
+    assert result == pytest.approx(6010.10050167)
+
+
+def test_partial_information_topic_gate_and_budget():
+    env = make_env(full=False)
+    assert "client_constraints" not in env.get_round_brief()
+    assert env.query_client("capital")["answer"] == 20_000_000
+    env.query_client("maturity")
+    env.query_client("protection")
+    with pytest.raises(BenchmarkError, match="budget exhausted"):
+        env.query_client("preferences")
+    with pytest.raises(BenchmarkError, match="unknown client topic"):
+        make_env().query_client("tell_me_everything")
+
+
+def test_full_information_discloses_constraints():
+    env = make_env(full=True)
+    disclosed = env.get_round_brief()["client_constraints"]
+    assert disclosed["capital"] == 20_000_000
+    assert disclosed["max_maturity_months"] == 12
+
+
+def test_quote_budget_and_state_binding():
+    env = make_env()
+    first = env.request_quote(product())
+    assert first["hard_pass"] is True
+    assert first["valid_for_state"] == env.state_version
+    env.request_quote(product(notional=2_000_000))
+    env.request_quote(product(notional=400_000))
+    with pytest.raises(BenchmarkError, match="quote budget exhausted"):
+        env.request_quote(product(notional=1_000_000))
+
+
+def test_load_market_snapshots_validates_contiguous_rounds(tmp_path):
+    csv_path = tmp_path / "market.csv"
+    csv_path.write_text(
+        "episode_id,round,date,underlying,spot,risk_free_rate,realized_vol_20d,source\n"
+        "E1,1,2023-01-31,CSI500,6000,0.02,0.20,fixture\n"
+        "E1,3,2023-03-31,CSI500,6100,0.02,0.21,fixture\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BenchmarkError, match="contiguous"):
+        load_market_snapshots(csv_path)
+
+
+# ---------------------------------------------------------------------------
+# v2: shared domain lattice and one-step attainment <= 1
+# ---------------------------------------------------------------------------
+
+
+def test_domain_membership_is_agent_oracle_symmetric():
+    cli = permissive_client()
+    for candidate in enumerate_domain(cli, SMALL_DOMAIN):
+        assert validate_domain(candidate, cli, SMALL_DOMAIN)[0].passed
+    # 0.055 of capital is not one of the frozen notional fractions.
+    off = product(notional=1_100_000)
+    domain_check = validate_domain(off, cli, SMALL_DOMAIN)[0]
+    assert domain_check.check_id == "DOMAIN"
+    assert not domain_check.passed
+
+
+def test_out_of_domain_product_is_refused_a_feasible_quote():
+    env = make_env(cli=permissive_client())
+    payload = env.request_quote(product(notional=1_100_000))  # out of lattice
+    assert payload["hard_pass"] is False
+    failed = {c["check_id"] for c in payload["checks"] if c["status"] == "FAIL"}
+    assert "DOMAIN" in failed
+
+
+def test_one_step_attainment_never_exceeds_one():
+    cli = permissive_client()
+    snap = snapshots()[0]
+    bud = budget()
+    port = PortfolioState()
+    desk = TradingDesk(HardConstraintEngine(bud), domain=SMALL_DOMAIN)
+
+    candidates = list(enumerate_domain(cli, SMALL_DOMAIN))
+    quotes = [desk.quote(p, snap, cli, port, "sv", i + 1) for i, p in enumerate(candidates)]
+    feasible = [(p, q) for p, q in zip(candidates, quotes) if q.hard_pass]
+    assert feasible, "the small domain must yield at least one hard-feasible product"
+
+    oracle = oracle_best_quote(SMALL_DOMAIN, snap, cli, port, bud)
+    assert oracle is not None
+    oracle_margin = oracle[1].dealer_margin
+
+    # Every quotable agent action attains at most the oracle margin.
+    for _, quote in feasible:
+        assert quote.dealer_margin <= oracle_margin + 1e-9
+    best_agent_margin = max(quote.dealer_margin for _, quote in feasible)
+    assert best_agent_margin == pytest.approx(oracle_margin)
+
+
+def test_voluntary_best_submission_attainment_le_one():
+    """Submitting the oracle-best product via the environment attains ratio <= 1."""
+    cli = permissive_client()
+    snap = snapshots()[0]
+    bud = budget()
+    oracle = oracle_best_quote(SMALL_DOMAIN, snap, cli, PortfolioState(), bud)
+    assert oracle is not None
+    best_product, best_quote = oracle
+
+    env = LongHorizonEnvironment(
+        [snap], cli, bud, BenchmarkCondition(full_information=True, dynamic=True),
+        domain=SMALL_DOMAIN,
+    )
+    payload = env.request_quote(best_product)
+    result = env.submit_design(payload["quote_id"], "oracle-best voluntary submission")
+    assert result["accepted"] is True
+    assert result["dealer_margin"] / best_quote.dealer_margin <= 1.0 + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# v2: continuous CLIENT_LOSS_BUDGET_V2
+# ---------------------------------------------------------------------------
+
+
+def test_client_loss_budget_v2_is_continuous_not_boolean():
+    env = make_env(max_loss=1.0)
+    payload = env.request_quote(product(protected=False))
+    loss_check = next(c for c in payload["checks"] if c["check_id"] == "CLIENT_LOSS_BUDGET_V2")
+    # A non-protected call is priced on its premium/stress loss, not a 100% floor.
+    assert loss_check["status"] == "PASS"
+    assert 0.0 < loss_check["observed"] < 0.5
+
+
+def test_client_loss_budget_v2_fails_tight_client_and_cannot_be_overridden():
+    env = make_env(max_loss=0.01)
+    payload = env.request_quote(product(protected=False))
+    failed = {c["check_id"] for c in payload["checks"] if c["status"] == "FAIL"}
+    assert "CLIENT_LOSS_BUDGET_V2" in failed
+    submitted = env.submit_design(payload["quote_id"], "soft explanation cannot waive hard checks")
+    assert submitted["accepted"] is False
+    assert submitted["hard_executable"] is False
+
+
+# ---------------------------------------------------------------------------
+# v2: deterministic client contract gate
+# ---------------------------------------------------------------------------
+
+
+def test_client_contract_pass_blocks_hard_executable_but_unsuitable_product():
+    # High hurdle threshold is a contract-only gate (no HARD check mirrors it),
+    # so a plain call is hard-executable yet still fails to settle.
+    cli = client(max_loss=1.0, min_hit_prob=0.9, allowed=None)
+    env = LongHorizonEnvironment(
+        snapshots(), cli, budget(), BenchmarkCondition(full_information=True, dynamic=True),
+        domain=SMALL_DOMAIN,
+    )
+    payload = env.request_quote(product())
+    assert payload["hard_pass"] is True  # hard-executable
+    result = env.submit_design(payload["quote_id"])
+    assert result["hard_executable"] is True
+    assert result["client_contract_pass"] is False
+    assert result["accepted"] is False
+    assert any(c["check_id"] == "CONTRACT_HURDLE" for c in result["contract_failures"])
+
+
+def test_client_contract_pass_pure_function_mirrors_would_buy_dimensions():
+    cli = client(allowed=["snowball"])  # vanilla off whitelist
+    pricing = {
+        "loss_frac": 0.05,
+        "stress_loss": 0.05 * 1_000_000,
+        "pricing_details": {},
+        "hurdle_hit_prob": 0.9,
+    }
+    ok, checks = client_contract_pass(product(), pricing, cli)
+    assert ok is False
+    failed = {c.check_id for c in checks if not c.passed}
+    assert "CONTRACT_WHITELIST" in failed
+
+
+# ---------------------------------------------------------------------------
+# v2: dealer_margin economics no longer 1% x fair_value
+# ---------------------------------------------------------------------------
+
+
+def test_dealer_margin_is_not_one_percent_of_fair_value():
+    env = make_env(cli=permissive_client())
+    call = env.request_quote(product())
+    env2 = make_env(cli=permissive_client())
+    snow = env2.request_quote(
+        ProductSpec("snowball", 1_000_000, 6, 1.0, 0.85, "knock_in", 0.08, 1.0, False,
+                    "institutional", "雪球", "delta hedge")
+    )
+    # Not the old constant 1% x fair_value path.
+    assert abs(call["dealer_margin"] - 0.01 * call["fair_value"]) > 1.0
+    # Margin per unit notional varies with structure risk (was identically constant).
+    assert call["margin_rate"] != snow["margin_rate"]
+    # public payload exposes margin_rate / suitability but never the breakdown.
+    assert "margin_rate" in call and "suitability" in call
+    assert "breakdown" not in call
+
+
+# ---------------------------------------------------------------------------
+# Dynamic / static state carry, oracle, calibration and carry sensitivity
+# ---------------------------------------------------------------------------
+
+
+def test_dynamic_state_persists_and_matures():
+    env = make_env(dynamic=True, cli=permissive_client())
+    payload = env.request_quote(product(maturity=3))
+    assert env.submit_design(payload["quote_id"])["accepted"] is True
+    assert len(env.portfolio.positions) == 1
+    assert env.advance_round() == []
+    assert env.get_round_brief()["portfolio_summary"]["outstanding_products"] == 1
+    assert env.portfolio.positions[0].remaining_months == 2
+
+
+def test_static_state_resets_between_rounds():
+    env = make_env(dynamic=False, cli=permissive_client())
+    payload = env.request_quote(product())
+    assert env.submit_design(payload["quote_id"])["accepted"] is True
+    # Static cells never carry accepted products into the next decision.
+    assert env.portfolio.positions == []
+    env.advance_round()
+    assert "portfolio_summary" not in env.get_round_brief()
+
+
+def test_oracle_over_shared_lattice_is_hard_feasible_and_maximal():
+    cli = permissive_client()
+    snap = snapshots()[0]
+    bud = budget()
+    result = oracle_best_quote(SMALL_DOMAIN, snap, cli, PortfolioState(), bud)
+    assert result is not None
+    _, quote = result
+    assert quote.hard_pass is True
+
+
+def test_budget_calibration_is_explicit_and_freezable():
+    products = [product(notional=value) for value in (400_000, 1_000_000, 2_000_000)]
+    base = RiskBudget(1_000_000, 500_000, 1_000_000, 100_000, 500_000)
+    report = calibrate_risk_budget(
+        products,
+        [(snapshots()[0], client(), PortfolioState())],
+        base,
+        target=(0.2, 0.5),
+        factors=(0.5, 1.0, 2.0, 5.0),
+    )
+    assert report["selected_factor"] in {0.5, 1.0, 2.0, 5.0}
+    assert "freeze" in report["warning"]
+
+
+def test_carry_sensitivity_reports_pre_registered_tolerance():
+    report = carry_sensitivity(product(maturity=6), snapshots()[0], client(), PortfolioState(), budget())
+    assert report["shock_bp"] == 25.0
+    assert len(report["rows"]) == 3
+    assert report["max_fv_change_pct_notional"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# v2: settle_submission is a pure (no-I/O) composition of the three env roles
+# ---------------------------------------------------------------------------
+
+
+def _role(role_id, action, *, degraded=False) -> RoleResponse:
+    return RoleResponse(
+        role_id=role_id, status="error" if degraded else "ok", action=action,
+        payload={}, narrative="", cited_fact_ids=(), raw_hash="", degraded=degraded,
+    )
+
+
+def test_settle_submission_workflow_deal_requires_all_three_affirmatives():
+    outcome = settle_submission(
+        True,
+        _role("trading_desk", "issue"),
+        _role("risk_control", "approve"),
+        _role("client", "accept"),
+    )
+    assert isinstance(outcome, WorkflowOutcome)
+    assert outcome.workflow_deal is True
+    assert outcome.degraded is False
+
+
+def test_settle_submission_blocks_when_hard_or_any_role_dissents():
+    # hard-executable but the desk declines -> no workflow deal.
+    dissent = settle_submission(
+        True, _role("trading_desk", "decline"),
+        _role("risk_control", "approve"), _role("client", "accept"),
+    )
+    assert dissent.workflow_deal is False
+    # all affirm but the product is not hard-executable -> still no deal.
+    not_hard = settle_submission(
+        False, _role("trading_desk", "issue"),
+        _role("risk_control", "approve"), _role("client", "accept"),
+    )
+    assert not_hard.workflow_deal is False
+
+
+def test_settle_submission_missing_or_degraded_role_marks_degraded():
+    # A missing role (None) is a non-affirmative, degraded signal.
+    missing = settle_submission(True, None, _role("risk_control", "approve"), _role("client", "accept"))
+    assert missing.workflow_deal is False
+    assert missing.degraded is True
+    assert missing.desk_action == "decline"
+    # A degraded affirmative still counts its action but flags degraded.
+    degraded = settle_submission(
+        True, _role("trading_desk", "issue", degraded=True),
+        _role("risk_control", "approve"), _role("client", "accept"),
+    )
+    assert degraded.degraded is True

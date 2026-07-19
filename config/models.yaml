@@ -1,0 +1,53 @@
+# 模型注册表：defaults 定义各用途的默认模型名，models 定义各模型的接入配置。
+defaults:
+  test_model: deepseek-v4-flash
+  env_model: deepseek-v4-flash      # 环境智能体：角色扮演用便宜快的
+
+models:
+  deepseek-v4-flash:
+    provider: openai-compatible
+    base_url: https://api.deepseek.com/v1
+    model: deepseek-v4-flash
+    api_key_env: DEEPSEEK_API_KEY
+    max_tokens: 4000                # 缓冲：输出偏长的模型 2000 容易被截断
+  deepseek-v4-pro:
+    provider: openai-compatible
+    base_url: https://api.deepseek.com/v1
+    model: deepseek-v4-pro
+    api_key_env: DEEPSEEK_API_KEY
+    max_tokens: 4000
+  minimax:
+    provider: openai-compatible
+    base_url: https://api.minimaxi.com/v1
+    model: MiniMax-M2.5
+    api_key_env: MINIMAX_API_KEY
+    max_tokens: 8000                # 推理模型 <think> 很长，2000 默认值必截断
+  qwen-max:
+    provider: openai-compatible
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    model: qwen-max
+    api_key_env: DASHSCOPE_API_KEY
+  gpt-4o:
+    provider: openai-compatible
+    base_url: https://api.openai.com/v1
+    model: gpt-4o
+    api_key_env: OPENAI_API_KEY
+  claude-sonnet:
+    provider: anthropic
+    base_url: https://api.anthropic.com
+    model: claude-sonnet-5
+    api_key_env: ANTHROPIC_API_KEY
+  mock:
+    provider: mock
+
+# 备选聚合供应商模板（按需取消注释并核对模型名）：
+#  siliconflow-<name>:
+#    provider: openai-compatible
+#    base_url: https://api.siliconflow.cn/v1
+#    model: <模型名>
+#    api_key_env: SILICONFLOW_API_KEY
+#  openrouter-<name>:
+#    provider: openai-compatible
+#    base_url: https://openrouter.ai/api/v1
+#    model: <模型名>
+#    api_key_env: OPENROUTER_API_KEY

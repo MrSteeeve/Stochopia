@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mirage-bench"
+version = "0.1.0"
+description = "MIRAGE：中证指数结构化产品设计 LLM benchmark"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx",
+    "pyyaml",
+    "rich",
+    "python-dotenv",
+    "tushare",
+]
+
+[project.scripts]
+mirage-benchmark = "mirage.benchmark_cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["mirage"]

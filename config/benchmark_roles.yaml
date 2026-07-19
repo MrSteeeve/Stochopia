@@ -1,0 +1,84 @@
+# MIRAGE v2 角色行为配置（连接信息见 config/models.yaml）。
+# 冻结的主 NPC lineup：正式主榜只改变 structurer 的测试模型（model_ref=${job.model}），
+# client/risk/desk 三个环境角色的模型与参数固定，保证跨测试模型可归因。
+protocol_version: mirage-csi-v2.0
+main_npc_lineup_id: npc-fixed-v1
+
+roles:
+  structurer:
+    role: structurer
+    model_ref: ${job.model}          # 被测模型，建 job 时解析
+    system_prompt_file: scenarios/mirage_csi/prompts/structurer.md
+    temperature: 0.0
+    max_tokens: 1800
+    timeout_s: 60
+    seed_policy: derived
+    seed_offset: 1000
+    retry: {transport_retries: 2, format_retries: 1}
+    output_schema: structurer_action_v1
+    tools: [query_client, consult, request_quote, submit_design, skip_round]
+    max_calls_per_round: 9
+    history_scope: episode
+    numeric_authority: none
+    failure_policy: no_action
+
+  client_main:
+    role: client
+    model_ref: deepseek-v4-flash
+    system_prompt_file: scenarios/mirage_csi/prompts/client_main.md
+    temperature: 0.2
+    max_tokens: 500
+    timeout_s: 30
+    seed_policy: derived
+    seed_offset: 2000
+    retry: {transport_retries: 2, format_retries: 1}
+    output_schema: client_response_v1
+    tools: []
+    max_calls_per_round: 4
+    history_scope: episode
+    numeric_authority: supplied_facts_only
+    failure_policy: abstain
+
+  risk_control:
+    role: risk_control
+    model_ref: deepseek-v4-flash
+    system_prompt_file: scenarios/mirage_csi/prompts/risk_control.md
+    temperature: 0.0
+    max_tokens: 600
+    timeout_s: 30
+    seed_policy: derived
+    seed_offset: 3000
+    retry: {transport_retries: 2, format_retries: 1}
+    output_schema: risk_response_v1
+    tools: []
+    max_calls_per_round: 3
+    history_scope: round
+    numeric_authority: supplied_facts_only
+    failure_policy: escalate
+
+  trading_desk:
+    role: trading_desk
+    model_ref: qwen-max
+    system_prompt_file: scenarios/mirage_csi/prompts/trading_desk.md
+    temperature: 0.0
+    max_tokens: 600
+    timeout_s: 30
+    seed_policy: derived
+    seed_offset: 4000
+    retry: {transport_retries: 2, format_retries: 1}
+    output_schema: desk_response_v1
+    tools: []
+    max_calls_per_round: 3
+    history_scope: round
+    numeric_authority: supplied_facts_only
+    failure_policy: decline
+
+# 两个异构 judge 模型（不与主 NPC lineup 同一实例），离线批跑、禁自评。
+# 自评跳过按精确模型名比较实现（judge_model == item["model"]），不做模型
+# 家族推断，故不设 exclude_same_model_family 字段。
+judges:
+  models: [deepseek-v4-pro, qwen-max]
+  repeats: 3
+  temperature: 0.0
+  max_tokens: 1200
+  blind_model_identity: true
