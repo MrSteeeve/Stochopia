@@ -27,6 +27,10 @@ This README is a quick-start pointer, not the protocol of record.
   legacy **v2 benchmark** so frozen v2 runs can still be reproduced.
   Full/Static are not v3 task conditions and v2/v3 artifacts must not be
   pooled.
+- Every Agent request includes the complete machine-readable action contract.
+  Accepted positions update authoritative client/dealer accounts, lifecycle
+  outcomes enter the reward vector, and all open contracts are liquidated at
+  fair value at the episode horizon.
 - Issued v2 dynamic positions now retain issue fixing and absolute contract
   levels, process barrier/knock-in/autocall observations, and revalue FV,
   delta, vega and stress on the next market snapshot.
@@ -93,10 +97,12 @@ MIRAGE requires Python 3.10+.
 
 ```bash
 cd MIRAGE
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+uv sync --locked --all-extras --dev
 ```
+
+`uv.lock` is the reproducible development/CI dependency set. A conventional
+`python3 -m venv .venv && pip install -e ".[dev]"` install remains supported
+for local experimentation but is not the frozen environment.
 
 Configure API keys for real model runs:
 
@@ -136,6 +142,21 @@ transition = env.step(Skip("typed v3 smoke test"))
 print(observation.available_actions, transition.observation.round_num, info["seed_role"])
 ```
 
+### v3 contract: input -> interaction -> output -> evaluation
+
+| Stage | Frozen/public artifact | Hidden or evaluator-only truth |
+|---|---|---|
+| Input | a versioned `TaskSuite`, public market observation, public action schema and fixed public notional grid | client mandate, risk limits, quote policy and complete task manifest |
+| Interaction | `ask_client`, `request_quote`, `submit_design`, `submit_product`, `skip` | deterministic pricing, accounts, constraints and lifecycle state |
+| Output | one hash-chained trajectory with actions, observations, reward vector, constraint signals and run provenance | the same artifact also carries the sealed task manifest for replay, but it is never sent to the policy |
+| Evaluation | replay-verified per-task metrics and task-clustered policy aggregates | exact economic state is reconstructed independently from the sealed inputs |
+
+The last snapshot in every v3 task is terminal valuation truth, not another
+decision round. Thus a contract issued on the last decision snapshot must
+experience at least one market interval before maturity or horizon
+liquidation. Training code can opt into `ScalarizedMirageEnv` with an explicit
+versioned `ScalarizationSpec`; the core never silently chooses weights.
+
 Real agents use the v3-native `test-agent` command. A local executable receives
 one versioned JSON request on stdin per step and must print one action JSON on
 stdout:
@@ -167,10 +188,53 @@ mirage-benchmark test-agent scenarios/mirage_csi/market_snapshots.example.csv \
   --summary-output outputs/v3-api-agent.summary.json
 ```
 
+For a reproducible evaluation rather than a one-off smoke run, freeze a suite,
+run a policy over every task, then independently replay and aggregate:
+
+```bash
+mirage-benchmark make-v3-suite market_snapshots.csv \
+  --episodes CSI500_2024H1 CSI500_2024H2 \
+  --client-json client.json --risk-budget-json risk_budget.json \
+  --name mirage-dev --version 1 --split dev \
+  --output tasks/mirage-dev.v3.json
+
+mirage-benchmark run-v3-suite tasks/mirage-dev.v3.json \
+  --agent-command 'python my_agent.py' \
+  --replicates 3 \
+  --output-dir outputs/mirage-dev \
+  --bootstrap-resamples 10000
+
+mirage-benchmark evaluate-trajectory \
+  outputs/mirage-dev/0000-r000-TASKHASH.trajectory.json \
+  --suite tasks/mirage-dev.v3.json \
+  --output outputs/replayed.evaluation.json
+
+mirage-benchmark aggregate-v3 outputs/mirage-dev \
+  --output-json outputs/mirage-dev.aggregate.json \
+  --output-csv outputs/mirage-dev.aggregate.csv
+```
+
+`run-v3-suite` resumes only trajectories whose task, public run seed,
+environment configuration and policy configuration still match and whose
+economic replay succeeds. Partial or stale runs are rerun; use `--force` to
+rerun matching complete artifacts deliberately.
+
 The same boundary is available from Python through `CommandAgentPolicy`,
-`LLMAgentPolicy`/`create_api_agent_policy`, and `run_agent_episode`. Policy
-transport or schema failures become visible invalid actions and consume the
-normal step budget; hidden client state is never sent to the policy.
+`LLMAgentPolicy`/`create_api_agent_policy`, and `run_agent_episode`. Malformed
+model actions become visible invalid actions. Provider, transport, command and
+timeout failures stop as `infrastructure_error` without consuming an
+environment step or contaminating invalid-action counts; timed-out command
+process groups are cleaned up. Hidden client state is never sent to the
+policy.
+
+Saved trajectories include the public action schema, environment configuration,
+reset options and public run seed, prompt/model parameters, dependency
+versions, implementation hash and Git worktree provenance. Hash verification
+alone is not treated as economic verification: `evaluate-trajectory` rebuilds
+the task and requires every transition to match a fresh replay exactly. Agent
+summaries expose cumulative reward and constraint totals. These additions do
+not implement the still-planned TaskGenerator, repair teacher,
+counterfactual-pair exporter, payoff DSL/solve-for, or fast/reference pricer.
 
 The `mirage-benchmark` executable also retains the legacy v2 factorial
 commands below so frozen v2 runs can still be reproduced

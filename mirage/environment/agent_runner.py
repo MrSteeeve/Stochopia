@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import os
+import signal
 import shlex
 import shutil
 import time
@@ -25,6 +26,7 @@ from functools import lru_cache
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from ..benchmark_runner import extract_action_json
 from ..llm import BaseLLMClient, LLMError, ModelConfig, create_client
@@ -43,11 +45,51 @@ from .types import (
 )
 
 
-AGENT_REQUEST_SCHEMA = "mirage.agent-request.v1"
-AGENT_RUN_SCHEMA = "mirage.agent-run.v1"
+AGENT_REQUEST_SCHEMA = "mirage.agent-request.v3"
+AGENT_RUN_SCHEMA = "mirage.agent-run.v3"
+AGENT_PROMPT_VERSION = "mirage.agent-prompt.v3"
 DEFAULT_HISTORY_RECORDS = 32
 DEFAULT_HISTORY_CHARS = 96_000
 DEFAULT_COMMAND_OUTPUT_CHARS = 200_000
+
+
+@lru_cache(maxsize=256)
+def _file_sha256(
+    resolved_path: str,
+    size: int,
+    mtime_ns: int,
+) -> str:
+    """Hash one command artifact; stat fields make the cache change-aware."""
+
+    del size, mtime_ns
+    digest = hashlib.sha256()
+    with Path(resolved_path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _command_artifacts(argv: Sequence[str]) -> tuple[dict[str, Any], ...]:
+    artifacts: list[dict[str, Any]] = []
+    for index, argument in enumerate(argv):
+        candidate = Path(argument).expanduser()
+        if not candidate.is_file():
+            continue
+        resolved = candidate.resolve()
+        stat = resolved.stat()
+        artifacts.append(
+            {
+                "argument_index": index,
+                "path": str(resolved),
+                "size": stat.st_size,
+                "sha256": _file_sha256(
+                    str(resolved),
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                ),
+            }
+        )
+    return tuple(artifacts)
 
 
 @lru_cache(maxsize=1)
@@ -75,8 +117,8 @@ class AgentRequest:
     """
 
     request_id: str
-    task_hash: str
     run_seed: int
+    action_schema: Mapping[str, Any]
     observation: Mapping[str, Any]
     history: tuple[Mapping[str, Any], ...]
     history_omitted: int
@@ -87,8 +129,8 @@ class AgentRequest:
         payload = {
             "schema": self.schema,
             "request_id": self.request_id,
-            "task_hash": self.task_hash,
             "run_seed": self.run_seed,
+            "action_schema": to_jsonable(self.action_schema),
             "instruction": (
                 "Choose exactly one currently available action and return one "
                 "JSON object. Do not return prose outside the JSON object."
@@ -122,6 +164,9 @@ class AgentPolicy(Protocol):
     async def act(self, request: AgentRequest) -> AgentDecision:
         """Return one decision for the supplied public request."""
 
+    def reproducibility_metadata(self) -> Mapping[str, Any]:
+        """Return public configuration needed to interpret a run."""
+
 
 class AgentActionError(ValueError):
     """The policy response does not satisfy the v3 action contract."""
@@ -138,6 +183,15 @@ def _reject_unknown_fields(
         raise AgentActionError(
             f"{action} contains unknown fields: {sorted(unknown)}"
         )
+
+
+def _parse_level0_product(payload: Mapping[str, Any]):
+    product = parse_product_spec(dict(payload))
+    if product.product_type == "custom":
+        raise AgentActionError(
+            "custom is not part of the Level-0 finite action grammar"
+        )
+    return product
 
 
 def parse_environment_action(raw: str | Mapping[str, Any]) -> EnvironmentAction:
@@ -180,7 +234,7 @@ def parse_environment_action(raw: str | Mapping[str, Any]) -> EnvironmentAction:
             product = payload.get("product")
             if not isinstance(product, dict):
                 raise AgentActionError("request_quote.product must be an object")
-            return RequestQuote(product=parse_product_spec(product))
+            return RequestQuote(product=_parse_level0_product(product))
 
         if action == "submit_design":
             _reject_unknown_fields(
@@ -214,7 +268,7 @@ def parse_environment_action(raw: str | Mapping[str, Any]) -> EnvironmentAction:
             if not isinstance(explanation, str):
                 raise AgentActionError("submit_product.explanation must be a string")
             return SubmitProduct(
-                product=parse_product_spec(product),
+                product=_parse_level0_product(product),
                 explanation=explanation,
             )
 
@@ -288,6 +342,26 @@ class LLMAgentPolicy:
     @property
     def total_usage(self) -> Mapping[str, Any]:
         return dict(self.client.total_usage)
+
+    def reproducibility_metadata(self) -> Mapping[str, Any]:
+        config = getattr(self.client, "config", None)
+        provider = str(getattr(config, "provider", "mock"))
+        model = str(getattr(config, "model", "") or self.name)
+        base_url = _sanitized_base_url(
+            str(getattr(config, "base_url", ""))
+        )
+        return {
+            "policy_kind": self.kind,
+            "policy_name": self.name,
+            "provider": provider,
+            "model": model,
+            "base_url": base_url,
+            "api_key_env": str(getattr(config, "api_key_env", "")),
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "timeout_seconds": getattr(config, "timeout", None),
+            **_prompt_metadata(self.system_prompt),
+        }
 
     async def act(self, request: AgentRequest) -> AgentDecision:
         payload = request.to_dict(include_system_prompt=False)
@@ -418,7 +492,30 @@ class CommandAgentPolicy:
             argv[0] = resolved_name
 
         self.argv = tuple(argv)
-        self.name = " ".join(shlex.quote(item) for item in self.argv)
+        argv_hash = hashlib.sha256(
+            json.dumps(
+                self.argv,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self._artifacts = _command_artifacts(self.argv)
+        policy_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "argv_sha256": argv_hash,
+                    "artifacts": self._artifacts,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self.name = (
+            f"command:{Path(self.argv[0]).name}:{policy_hash[:12]}"
+        )
+        self._argv_hash = argv_hash
+        self._policy_hash = policy_hash
         self.timeout = float(timeout)
         self.max_output_chars = max_output_chars
         self.system_prompt = system_prompt or load_agent_system_prompt()
@@ -427,6 +524,20 @@ class CommandAgentPolicy:
     @property
     def total_usage(self) -> Mapping[str, Any]:
         return dict(self._usage)
+
+    def reproducibility_metadata(self) -> Mapping[str, Any]:
+        return {
+            "policy_kind": self.kind,
+            "policy_name": self.name,
+            "executable": self.argv[0],
+            "argv_sha256": self._argv_hash,
+            "policy_sha256": self._policy_hash,
+            "argument_files": self._artifacts,
+            "argument_count": len(self.argv),
+            "timeout_seconds": self.timeout,
+            "max_output_chars": self.max_output_chars,
+            **_prompt_metadata(self.system_prompt),
+        }
 
     async def act(self, request: AgentRequest) -> AgentDecision:
         request_bytes = (
@@ -441,11 +552,15 @@ class CommandAgentPolicy:
         ).encode("utf-8")
         started = time.monotonic()
         self._usage["calls"] += 1
+        process_kwargs: dict[str, Any] = {}
+        if os.name == "posix":
+            process_kwargs["start_new_session"] = True
         process = await asyncio.create_subprocess_exec(
             *self.argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **process_kwargs,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -453,11 +568,13 @@ class CommandAgentPolicy:
                 timeout=self.timeout,
             )
         except TimeoutError:
-            process.kill()
-            await process.wait()
+            await _terminate_process_tree(process)
             raise LLMError(
                 f"agent command exceeded {self.timeout:g}s timeout"
             ) from None
+        except asyncio.CancelledError:
+            await _terminate_process_tree(process)
+            raise
         duration_ms = round((time.monotonic() - started) * 1000, 3)
         stderr_text = stderr.decode("utf-8", errors="replace")
         stdout_text = stdout.decode("utf-8", errors="replace")
@@ -500,6 +617,9 @@ class AgentEpisodeResult:
     invalid_actions: int
     parser_errors: int
     invocation_errors: int
+    infrastructure_error: Mapping[str, Any] | None
+    reward_summary: Mapping[str, Any]
+    constraint_summary: Mapping[str, Any]
     usage: Mapping[str, Any]
     trajectory_verified: bool
     trajectory_path: str | None
@@ -519,6 +639,9 @@ class AgentEpisodeResult:
             "invalid_actions": self.invalid_actions,
             "parser_errors": self.parser_errors,
             "invocation_errors": self.invocation_errors,
+            "infrastructure_error": to_jsonable(self.infrastructure_error),
+            "reward_summary": to_jsonable(self.reward_summary),
+            "constraint_summary": to_jsonable(self.constraint_summary),
             "usage": to_jsonable(self.usage),
             "trajectory_verified": self.trajectory_verified,
             "trajectory_path": self.trajectory_path,
@@ -546,9 +669,80 @@ def _trim_history(
     return tuple(kept), len(history) - len(kept)
 
 
-def _request_id(task_hash: str, state_hash: str, step_index: int) -> str:
-    preimage = f"{task_hash}:{state_hash}:{step_index}".encode("utf-8")
+def _request_id(public_task_id: str, run_seed: int, step_index: int) -> str:
+    """Derive a reproducible request id from public policy inputs only."""
+
+    preimage = f"{public_task_id}:{run_seed}:{step_index}".encode("utf-8")
     return hashlib.sha256(preimage).hexdigest()[:24]
+
+
+def _sanitized_base_url(value: str) -> str:
+    """Remove credentials, query parameters, and fragments from a public URL."""
+
+    if not value:
+        return ""
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname or ""
+        if parsed.port is not None:
+            hostname = f"{hostname}:{parsed.port}"
+    except ValueError:
+        return "invalid-url-sha256:" + hashlib.sha256(
+            value.encode("utf-8")
+        ).hexdigest()
+    return urlunsplit(
+        (parsed.scheme, hostname, parsed.path.rstrip("/"), "", "")
+    )
+
+
+def _prompt_metadata(prompt: str) -> dict[str, str]:
+    return {
+        "system_prompt_version": AGENT_PROMPT_VERSION,
+        "system_prompt_sha256": hashlib.sha256(
+            prompt.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _policy_reproducibility_metadata(policy: AgentPolicy) -> dict[str, Any]:
+    provider = getattr(policy, "reproducibility_metadata", None)
+    if callable(provider):
+        metadata = provider()
+        if not isinstance(metadata, Mapping):
+            raise TypeError(
+                "policy.reproducibility_metadata() must return a mapping"
+            )
+        return dict(metadata)
+    prompt = str(getattr(policy, "system_prompt", load_agent_system_prompt()))
+    return {
+        "policy_kind": str(policy.kind),
+        "policy_name": str(policy.name),
+        **_prompt_metadata(prompt),
+    }
+
+
+async def _terminate_process_tree(
+    process: asyncio.subprocess.Process,
+) -> None:
+    """Best-effort cleanup of a command and every descendant in its session."""
+
+    if process.returncode is not None:
+        return
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            process.kill()
+    else:
+        process.kill()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+    except TimeoutError:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
 
 
 async def run_agent_episode(
@@ -563,11 +757,11 @@ async def run_agent_episode(
 ) -> AgentEpisodeResult:
     """Run one external policy against v3 and record every transition.
 
-    Policy transport/parse failures are converted into typed invalid actions,
-    not hidden retries.  They therefore consume the normal step budget and are
-    visible in the trajectory.  Missing credentials and invalid commands
-    should be rejected when the policy is constructed, before this function is
-    called.
+    Malformed policy output is a typed invalid action. Transport, provider,
+    executable, and timeout failures are infrastructure errors: the environment
+    is not stepped and the partial trajectory records the runner outcome.
+    Missing credentials and invalid commands should still be rejected when the
+    policy is constructed, before this function is called.
     """
 
     if not isinstance(environment, MirageStructurerEnv):
@@ -585,16 +779,22 @@ async def run_agent_episode(
     ):
         raise ValueError("max_history_chars must be a positive integer")
 
-    observation, info = environment.reset(seed=seed)
+    # The policy-facing run seed is public experiment configuration.  Never
+    # fall back to EpisodeTask.task_seed here because that field belongs to
+    # the hidden task manifest and could become a task-identity side channel.
+    effective_seed = 0 if seed is None else seed
+    observation, info = environment.reset(seed=effective_seed)
     recorder = TrajectoryRecorder(
         environment,
         initial_state_hash=str(info["state_hash"]),
+        run_metadata=_policy_reproducibility_metadata(policy),
     )
     history: list[Mapping[str, Any]] = []
     invalid_actions = 0
     parser_errors = 0
     invocation_errors = 0
     accepted_submissions = 0
+    infrastructure_error: dict[str, Any] | None = None
 
     while not environment.done:
         visible_history, history_omitted = _trim_history(
@@ -604,12 +804,12 @@ async def run_agent_episode(
         )
         request = AgentRequest(
             request_id=_request_id(
-                environment.task.task_hash,
-                environment.state_hash,
+                environment.task.public_task_id,
+                int(info["run_id_seed"]),
                 observation.step_index,
             ),
-            task_hash=environment.task.task_hash,
             run_seed=int(info["run_id_seed"]),
+            action_schema=environment.action_schema,
             observation=asdict(observation),
             history=visible_history,
             history_omitted=history_omitted,
@@ -627,18 +827,21 @@ async def run_agent_episode(
             decision = candidate
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # policy failure is an observed agent failure
+        except Exception as exc:
             invocation_errors += 1
             message = f"{type(exc).__name__}: {exc}"
-            decision = AgentDecision(
-                action=InvalidAction(
-                    reason=f"policy invocation failed: {message}",
-                    raw={"error": message},
-                ),
-                raw_output="",
-                parser_error=None,
-                metadata={"invocation_error": message},
+            infrastructure_error = {
+                "error_type": type(exc).__name__,
+                "message": message[:4000],
+                "request_id": request.request_id,
+                "round_num": observation.round_num,
+                "step_index": observation.step_index,
+            }
+            recorder.mark_run_outcome(
+                "infrastructure_error",
+                infrastructure_error,
             )
+            break
 
         action = decision.action
         if decision.parser_error is not None:
@@ -699,7 +902,23 @@ async def run_agent_episode(
         saved_path = str(recorder.save(trajectory_path))
     verified = recorder.verify_hash_chain()
     trajectory = recorder.to_dict()
-    status = "terminated" if environment.terminated else "truncated"
+    if infrastructure_error is not None:
+        status = "infrastructure_error"
+    else:
+        status = "terminated" if environment.terminated else "truncated"
+    episode_summary = info.get("episode_summary", {})
+    reward_summary = (
+        dict(episode_summary.get("reward", {}))
+        if isinstance(episode_summary, Mapping)
+        and isinstance(episode_summary.get("reward"), Mapping)
+        else {}
+    )
+    constraint_summary = (
+        dict(episode_summary.get("constraints", {}))
+        if isinstance(episode_summary, Mapping)
+        and isinstance(episode_summary.get("constraints"), Mapping)
+        else {}
+    )
     return AgentEpisodeResult(
         task_hash=environment.task.task_hash,
         policy_kind=policy.kind,
@@ -711,6 +930,9 @@ async def run_agent_episode(
         invalid_actions=invalid_actions,
         parser_errors=parser_errors,
         invocation_errors=invocation_errors,
+        infrastructure_error=infrastructure_error,
+        reward_summary=reward_summary,
+        constraint_summary=constraint_summary,
         usage=dict(policy.total_usage),
         trajectory_verified=verified,
         trajectory_path=saved_path,
@@ -719,6 +941,7 @@ async def run_agent_episode(
 
 
 __all__ = [
+    "AGENT_PROMPT_VERSION",
     "AGENT_REQUEST_SCHEMA",
     "AGENT_RUN_SCHEMA",
     "AgentActionError",

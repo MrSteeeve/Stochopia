@@ -52,11 +52,15 @@ The core contains no LLM call, prompt, strategy, forced completion or oracle.
 provenance, units and normalization metadata; downstream scalarization requires
 an explicit versioned `ScalarizationSpec`. `TrajectoryRecorder` canonicalizes
 and deep-freezes each transition at record time, embeds the complete task
-manifest, records package/git/pricing implementation provenance, verifies its
-own chain before saving and writes atomically with an end-of-file root hash.
-This is an architectural spine, not yet a claim that the planned payoff DSL,
-solve-for tools, task generator, teacher hierarchy, Pareto evaluator or
-realised hedge-P&L reward are complete.
+manifest, records the environment configuration payload, public action schema,
+policy/prompt configuration, dependency versions, Git/dirty-worktree state and
+a multi-module implementation hash, verifies its own chain before saving and
+writes atomically with an end-of-file root hash. This is an architectural
+spine, not yet a claim that the planned payoff DSL, solve-for tools, task
+generator, teacher hierarchy, Pareto evaluator, transaction-cost model or
+fast/reference pricer are complete. Until a versioned TaskGenerator exists,
+`reset(options={"curriculum": ...})` fails closed instead of accepting a label
+that would not alter the task distribution.
 
 Typed product actions are canonicalised through the same parser as JSON
 actions; policies cannot set `reference_spot`, barrier-history or elapsed-time
@@ -73,7 +77,7 @@ rollout layer for v3. It does not move LLM calls into the deterministic core:
 it converts an external response into a typed action and calls the same
 `MirageStructurerEnv.step()` entrypoint used by a training loop.
 
-Two adapters share the versioned `mirage.agent-request.v1` request:
+Two adapters share the versioned `mirage.agent-request.v3` request:
 
 - `CommandAgentPolicy` invokes a local executable directly, without a shell.
   Each step sends one JSON object on stdin and requires one action JSON on
@@ -91,15 +95,64 @@ exclusive. Literal secret values are not accepted; only the environment
 variable name is configured, and its value is neither serialized nor sent to
 the model.
 
-The Agent request includes `task_hash` but never the task manifest, hidden
-client profile or evaluator-only `privileged_state`. The complete task
-manifest remains in the evaluator's saved trajectory so the run can be
-verified. Transport failures, malformed JSON, unknown fields and unavailable
-actions become explicit `InvalidAction` transitions and consume the ordinary
-step limit rather than receiving hidden retries. Raw policy output is hashed
-and recorded by default; `--redact-raw-output` retains only its hash.
+Every Agent request contains the authoritative machine-readable
+`action_schema`: the nine exact client topics, product-domain version, target
+client, allowed types and scalar grids, legal field combinations and funding
+rules. It contains only a public task-family identifier and a public run seed;
+it never includes `task_hash`, source episode/client identifiers, the task
+manifest, hidden client profile or evaluator-only `privileged_state`. The
+complete task manifest remains in the evaluator's saved trajectory so the run
+can be verified. Malformed model output, unknown fields and unavailable actions
+become explicit `InvalidAction` transitions and consume the ordinary step limit.
+v3 also replaces internal quote keys with round-local public aliases and strips
+account snapshots plus internal position/event/cashflow identifiers from tool
+results; those values remain available only inside the sealed evaluator state.
+Provider, transport, command-exit and timeout failures instead stop the run as
+`infrastructure_error` without stepping the environment or incrementing Agent
+invalid-action counts. Command timeout/cancellation terminates its whole POSIX
+process group. Raw policy output is hashed and recorded by default;
+`--redact-raw-output` retains only its hash.
 
-## Frozen episode design
+### v3 input, interaction, output and evaluation contract
+
+- **Input**: `TaskSuite` freezes its split (`train/dev/test/private_test`), full
+  task manifests, task hashes and generator provenance under one suite hash.
+  The Level-0 importer builds suites from selected market episodes; it is not
+  yet a stochastic curriculum generator.
+- **Interaction**: only the public `Observation`, bounded public history and
+  action schema cross the policy boundary. The environment remains
+  partial-observation and dynamic for every task.
+- **Output**: `TrajectoryRecorder` commits the sealed task manifest,
+  environment configuration, reset options, public run seed, action schema,
+  transitions and policy provenance into one atomic, hash-chained artifact.
+- **Evaluation**: `evaluate-trajectory` first verifies the artifact chain, then
+  reconstructs the task and environment and requires every transition to match
+  a fresh economic replay exactly. `aggregate-v3` accepts only replay-verified
+  evaluation artifacts from one suite, first averages replicates within each
+  task, and reports equal-task-weighted bootstrap intervals by policy.
+
+`run-v3-suite` supports explicit replicates and resumes only complete
+trajectories whose task, public run seed, environment configuration and policy
+configuration still match and whose fresh economic replay succeeds. Partial or
+stale runs are rerun; `--force` disables reuse.
+
+The final market snapshot is terminal valuation truth, not a policy decision
+round. Each accepted contract therefore carries through at least one market
+interval. At the terminal snapshot, natural lifecycle events are processed
+first and any remaining position is liquidated at current deterministic fair
+value. This removes the degenerate strategy of issuing a product and
+immediately liquidating it in the same final action.
+
+The v3 evaluator reports termination, truncation, partial/infrastructure
+failure, step and invalid-action rates; submission, HARD-pass, conditional
+contract-acceptance and settlement-acceptance rates; lifecycle closure count;
+flow-adjusted client return; accepted ex-ante margin-per-face sum; realised
+hedged lifecycle P&L over dealer risk capital; capital-time and stress-time
+ratios; and explicit interaction costs. Quote-only HARD checks are not counted
+as submissions. Aggregation refuses mixed suite hashes and refuses to pool one
+policy name across different policy-configuration hashes.
+
+## Frozen legacy v2 episode design
 
 - Price-only warm-up: 2022.
 - Evaluation: 2023--2025.
@@ -107,8 +160,8 @@ and recorded by default; `--redact-raw-output` retains only its hash.
 - Twelve half-year episodes, six month-end rounds each.
 - Per round: up to 3 `query_client` calls, up to 3 `consult` calls, up to 3
   `request_quote` calls, then a submission or a skip.
-- Frozen finite product action lattice `csi-domain-v1` (below), shared by the
-  tested agent and the oracle.
+- Frozen finite product action lattice `csi-domain-v3-action-contract` (below),
+  shared by the tested agent and the oracle.
 
 The released example snapshot (`market_snapshots.example.csv`) is synthetic and
 cannot be used for reported results. A production snapshot row must carry
@@ -131,7 +184,7 @@ again from ETF spot/NAV. Dividend-related contract adjustments must be
 normalized or the affected row excluded. Carry is perturbed by plus/minus 25 bp
 as a sensitivity check (`mirage.benchmark.carry_sensitivity`).
 
-## Two-layer architecture
+## Legacy v2 two-layer architecture
 
 ```text
 StructurerRole (tested LLM)
@@ -166,17 +219,26 @@ returns a fixed degraded-fallback string, and `workflow_review` is never called.
 mechanism is the presence or absence of `--roles-config` on the CLI, not a
 config field.)
 
-## Frozen product action lattice and the oracle
+## Level-0 lattice and the legacy v2 oracle
 
-`mirage.benchmark.ProductDomainSpec` (`version="csi-domain-v1"`) is a frozen
+`mirage.benchmark.ProductDomainSpec`
+(`version="csi-domain-v3-action-contract"`) is a frozen
 finite grid: 6 product families (`vanilla_call/put`, `barrier_call/put`,
-`autocallable`, `snowball`), 14 notional fractions of client capital (0.5% to
-100%), maturities {3, 6, 12} months, strikes {0.95, 1.00, 1.05}, barriers
+`autocallable`, `snowball`), 14 notional fractions (0.5% to 100%), maturities
+{3, 6, 12} months, strikes {0.95, 1.00, 1.05}, barriers
 {0.75, 0.85, 1.10, 1.20}, coupons {4%, 8%}, participations {0.5, 1.0} and
 principal-protection {False, True}. `enumerate_domain` materializes every
 structurally valid combination (barrier direction is inferred from the barrier
 level; snowball always uses a lower knock-in barrier and never claims
-protection).
+protection). A protected autocall has no knock-in barrier. An unprotected
+autocall must use a lower knock-in barrier so its downside claim and payoff
+agree. `custom` remains a legacy parser value but is not in the Level-0 finite
+action grammar.
+
+Legacy v2 interprets the notional fractions against client capital. Every v3
+`EpisodeTask` instead freezes an explicit public notional base (CNY 10 million
+by default), so the action schema cannot leak hidden client capital through its
+allowed values.
 
 A single `DOMAIN` HARD check (`validate_domain`) rejects any quote request
 whose structural signature is not an exact element of this lattice. Because the
@@ -188,6 +250,10 @@ symmetry and a dedicated property test
 `test_voluntary_best_submission_attainment_le_one`) asserts the resulting
 attainment ratio can never exceed 1 + 1e-9.
 
+This oracle is retained only for frozen v2 reproduction. v3 task-suite
+evaluation does not treat it as a teacher or a unique correct answer; v3
+reports replay-derived outcome, constraint, efficiency and lifecycle metrics.
+
 `oracle_best_quote` is a **one-step** frontier: at the start of each round,
 before the agent acts, it prices every lattice candidate against the *current*
 portfolio state and returns the maximum-`dealer_margin` feasible one. It is not
@@ -196,7 +262,7 @@ hindsight oracle is future work. The runner passes the environment's exact
 `domain` and `quote_policy`; it no longer silently rebuilds a default grid or
 default pricing policy.
 
-## Information boundary, tools and per-round budgets
+## Legacy v2 information boundary, tools and per-round budgets
 
 The tested model sees `get_round_brief()` (including the public routing field
 `client_id`, required by `ProductSpec.target_client`) and can call:
@@ -214,9 +280,11 @@ The tested model sees `get_round_brief()` (including the public routing field
   cannot be submitted directly. Budget: 3 per round. Requires `--roles-config`;
   without it every `consult` call returns a fixed degraded-fallback string.
 - `request_quote(ProductSpec)` -- up to 3 per round; returns a full quote
-  bound to a `state_version` hash of `(episode_id, round_num,
-  portfolio.revision, condition.id)`. A stale quote (state changed since it was
-  issued) cannot be submitted.
+  bound internally to the complete economic state. v3 exposes only a public
+  state label and a round-local quote alias; the hidden episode-derived binding
+  key never crosses the Agent boundary. A stale quote cannot be submitted.
+  Structurally out-of-domain requests are rejected before the quote counter
+  increments.
 - `submit_design(quote_id, explanation)` -- settles an already-issued quote.
 - `submit_product(ProductSpec, explanation)` -- shorthand for
   `request_quote` immediately followed by `submit_design`.
@@ -255,10 +323,10 @@ structural payoff floor within `description_tolerance_bp`, default 1 bp),
 "保本"/"本金保障", must match the structural floor), and five post-trade
 portfolio budget checks (`PORTFOLIO_NOTIONAL`, `PORTFOLIO_NET_DELTA`,
 `PORTFOLIO_GROSS_DELTA`, `PORTFOLIO_NET_VEGA`,
-`PORTFOLIO_DEALER_STRESS_LOSS`) against
-the frozen `RiskBudget`, cumulative with the current dynamic-condition
-portfolio. Any HARD failure makes the quote non-executable; an LLM (structurer
-or any env role) cannot waive it.
+`PORTFOLIO_DEALER_STRESS_LOSS`) against the frozen exposure limits and the
+authoritative dealer risk-capital account. Dealer stress capacity is cumulative
+with the active portfolio and prior realised hedged P&L. Any HARD failure makes
+the quote non-executable; an LLM (structurer or any env role) cannot waive it.
 
 **Settlement-time CONTRACT checks** (`client_contract_pass`, `severity ==
 "CONTRACT"`, evaluated only at `submit_design`/`submit_product` against the
@@ -341,13 +409,25 @@ use `dealer_hedged_stress_loss`, whose provenance is explicitly
 `client_pnl + dealer_liability_pnl == 0`; the static-delta proxy is not called a
 realised hedge result.
 
-Accepted dynamic trades record an issuance cashflow. Maturity, knock-out and
-autocall closures move the contract into `closed_positions`, append a
-settlement cashflow and a `LifecycleEvent`, and calculate client realised P&L
-and the equal-and-opposite dealer-liability P&L. Actual hedge trades,
-transaction costs and `dealer_total_pnl` remain unavailable. Accordingly the
-v3 reward schema represents `terminal_lifecycle_pnl` as `value=null,
-available=false`, not as a measured zero.
+Accepted dynamic trades debit `ClientAccount.available_cash`, credit
+`locked_cash`, credit dealer issue proceeds and record an issuance cashflow.
+Maturity, knock-out and autocall closures release client capital, pay the
+contract settlement, update both accounts and append a `LifecycleEvent`.
+The lifecycle ledger reports client realised P&L, equal-and-opposite dealer
+liability P&L, and a monthly frozen-delta hedge P&L before transaction costs.
+Dealer equity is cash less the active liability fair value; realised hedged
+P&L adjusts future dealer risk-capital capacity. Explicit client-capital
+schedule changes are external account cashflows and do not erase prior P&L.
+
+Every transition measures client net-liquidation-wealth change, locked-capital
+release and dealer hedged-stress-capital release. A closure also makes
+`terminal_lifecycle_pnl` available using dealer realised hedged P&L before
+transaction costs. The last episode round liquidates every still-active
+contract at its current deterministic fair value; no position is silently
+dropped as `open_at_horizon`. `info["episode_summary"]` and the Agent run
+summary contain cumulative raw/normalized rewards and constraint counts.
+Actual hedge trades, slippage, transaction costs and `dealer_total_pnl` after
+costs remain unavailable and are not imputed as zero.
 
 ## Risk budget calibration
 
@@ -510,7 +590,7 @@ settlement or the portfolio; it is reported as `workflow_deal_rate` and
 with the deterministic `accepted` outcome) -- a divergence-rate diagnostic, not
 a correctness label, since neither side is ground truth for the other.
 
-## Canonical metrics (`compute_metrics`, `mirage.benchmark_cli.CANONICAL_METRICS`)
+## Legacy v2 canonical metrics (`compute_metrics`, `mirage.benchmark_cli.CANONICAL_METRICS`)
 
 Every round's submission has exactly one `submission_origin`:
 **voluntary** (submitted within the normal per-round action budget),
@@ -687,6 +767,34 @@ python -m mirage.benchmark_cli build-market daily.csv market_snapshots.csv
 # Validate schema, provenance and contiguous episode rounds.
 python -m mirage.benchmark_cli validate-market market_snapshots.csv
 
+# Freeze complete v3 inputs. The final row of every selected episode is the
+# terminal valuation snapshot rather than a policy decision.
+python -m mirage.benchmark_cli make-v3-suite market_snapshots.csv \
+  --episodes CSI500_2024H1 CSI500_2024H2 \
+  --client-json client.json --risk-budget-json risk_budget.json \
+  --name mirage-dev --version 1 --split dev \
+  --output tasks/mirage-dev.v3.json
+
+# Run one external policy over every frozen task. Each trajectory is
+# immediately hash-verified and economically replayed before aggregation.
+python -m mirage.benchmark_cli run-v3-suite tasks/mirage-dev.v3.json \
+  --agent-command 'python my_agent.py' \
+  --replicates 3 \
+  --output-dir outputs/mirage-dev \
+  --bootstrap-resamples 10000
+
+# A separately received trajectory can be checked against the same suite.
+python -m mirage.benchmark_cli evaluate-trajectory \
+  outputs/mirage-dev/0000-example.trajectory.json \
+  --suite tasks/mirage-dev.v3.json \
+  --output outputs/example.evaluation.json
+
+# Aggregate only replay-verified evaluations from one suite.
+python -m mirage.benchmark_cli aggregate-v3 outputs/mirage-dev \
+  --output-json outputs/mirage-dev.aggregate.json \
+  --output-csv outputs/mirage-dev.aggregate.csv
+
+# The remaining commands reproduce the legacy v2 benchmark.
 # Smoke-test the deterministic desk with the synthetic example.
 python -m mirage.benchmark_cli demo \
   scenarios/mirage_csi/market_snapshots.example.csv \

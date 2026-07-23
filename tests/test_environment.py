@@ -15,10 +15,13 @@ from mirage.environment import (
     InvalidAction,
     MirageStructurerEnv,
     RequestQuote,
+    ScalarizationSpec,
+    ScalarizedMirageEnv,
     Skip,
     SubmitDesign,
     SubmitProduct,
     TrajectoryRecorder,
+    V3_PUBLIC_CLIENT_ALIAS,
 )
 from mirage.pricing import QuotePolicy
 from mirage.products import ClientProfile, ProductSpec
@@ -44,6 +47,16 @@ def _task() -> EpisodeTask:
             6100.0,
             0.02,
             realized_vol_20d=0.21,
+            source="test",
+        ),
+        MarketSnapshot(
+            "v3-test",
+            3,
+            date(2023, 3, 31),
+            "CSI500",
+            6050.0,
+            0.02,
+            realized_vol_20d=0.22,
             source="test",
         ),
     )
@@ -86,7 +99,7 @@ def _product() -> ProductSpec:
         coupon_rate=None,
         participation_rate=1.0,
         principal_protected=True,
-        target_client="client-hidden",
+        target_client=V3_PUBLIC_CLIENT_ALIAS,
         pitch="clear risk disclosure",
         hedging_plan="listed futures delta hedge",
     )
@@ -104,6 +117,76 @@ def test_reset_is_deterministic_and_rebuilds_state():
     assert second_info["seed"] == 17
     assert second_observation.step_index == 0
     assert second_observation.disclosed_client == {}
+
+
+def test_public_action_schema_is_complete_and_matches_runtime_domain():
+    env = MirageStructurerEnv(_task())
+    observation, _ = env.reset()
+    schema = env.action_schema
+
+    assert schema["schema_version"] == "mirage.environment.action-schema.v3"
+    assert schema["product_domain_version"] == "csi-domain-v3-action-contract"
+    assert len(schema["client_topic_enum"]) == 9
+    assert set(schema["client_topic_enum"]) == {
+        "capital",
+        "loss_tolerance",
+        "maturity",
+        "product_types",
+        "protection",
+        "preferences",
+        "purchase_status",
+        "risk_appetite",
+        "return_hurdle",
+    }
+    assert "custom" not in schema["allowed_product_types"]
+    assert _product().notional in schema["notional_rule"]["allowed_values"]
+    assert _product().maturity_months in schema["maturities"]
+    assert _product().strike_pct in schema["strikes"]
+    assert schema["combination_rules"]["autocallable"]["protected"][
+        "barrier_pct"
+    ] == [None]
+    assert "request_quote" in observation.available_actions
+
+    transition = env.step(RequestQuote(_product()))
+    assert transition.constraint_signals.action_valid is True
+    assert transition.constraint_signals.hard_pass is True
+
+
+def test_public_action_schema_does_not_encode_hidden_client_capital():
+    first = _task()
+    rich_client = ClientProfile(
+        **{
+            **asdict(first.client),
+            "id": "another-hidden-client",
+            "capital": 40_000_000.0,
+        }
+    )
+    second = EpisodeTask(
+        snapshots=first.snapshots,
+        client=rich_client,
+        risk_budget=first.risk_budget,
+        domain=ProductDomainSpec(),
+        quote_policy=first.quote_policy,
+        task_seed=99,
+        schema=first.schema,
+        version=first.version,
+    )
+    first_env = MirageStructurerEnv(first)
+    second_env = MirageStructurerEnv(second)
+    first_observation, _ = first_env.reset()
+    second_observation, _ = second_env.reset()
+
+    assert first_env.action_schema == second_env.action_schema
+    assert first_env.action_schema["target_client"] == V3_PUBLIC_CLIENT_ALIAS
+    assert (
+        first_env.action_schema["notional_rule"]["base_amount"]
+        == second_env.action_schema["notional_rule"]["base_amount"]
+        == 10_000_000.0
+    )
+    assert first_observation.public_task_id == second_observation.public_task_id
+    encoded = json.dumps(asdict(second_observation), sort_keys=True)
+    assert "another-hidden-client" not in encoded
+    assert "40000000" not in encoded
 
 
 def test_task_manifest_detaches_reset_from_later_client_mutation():
@@ -126,16 +209,23 @@ def test_typed_quote_then_submit_auto_advances_round():
     quoted = env.step(RequestQuote(_product()))
     quote_id = quoted.tool_result["payload"]["quote_id"]
 
+    assert quote_id == "quote-r1-n1"
+    assert (
+        quoted.tool_result["payload"]["valid_for_state"]
+        == quoted.observation.state_version
+    )
     assert quoted.action.type == "request_quote"
     assert quoted.constraint_signals.hard_pass is True
     assert quoted.reward_components.quote_cost.value < 0
     assert quoted.reward_components.quote_cost.available is True
-    assert quoted.reward_components.client_utility.available is False
+    assert quoted.reward_components.client_utility.available is True
+    assert quoted.reward_components.client_utility.value == pytest.approx(0.0)
     assert quoted.terminated is False
 
     submitted = env.step(SubmitDesign(quote_id, "risks disclosed"))
 
     assert submitted.action.type == "submit_design"
+    assert submitted.tool_result["payload"]["quote_id"] == quote_id
     assert submitted.constraint_signals.accepted is True
     assert submitted.reward_components.dealer_economics.available is True
     assert submitted.reward_components.dealer_economics.value == pytest.approx(
@@ -157,6 +247,83 @@ def test_submit_product_is_atomic_typed_quote_and_submission():
     assert transition.constraint_signals.accepted is True
     assert transition.reward_components.quote_cost.value < 0
     assert transition.observation.round_num == 2
+    encoded = json.dumps(transition.tool_result, sort_keys=True)
+    assert "client_account" not in encoded
+    assert "dealer_account" not in encoded
+    assert "client-hidden" not in encoded
+
+
+def test_rejected_submission_cannot_earn_counterfactual_dealer_margin():
+    base = _task()
+    restrictive_budget = RiskBudget(
+        notional=100.0,
+        net_delta=base.risk_budget.net_delta,
+        gross_delta=base.risk_budget.gross_delta,
+        net_vega=base.risk_budget.net_vega,
+        stress_loss=base.risk_budget.stress_loss,
+    )
+    task = EpisodeTask(
+        snapshots=base.snapshots,
+        client=base.client,
+        risk_budget=restrictive_budget,
+        domain=base.domain,
+        quote_policy=base.quote_policy,
+        task_seed=base.task_seed,
+        schema=base.schema,
+        version=base.version,
+    )
+    env = MirageStructurerEnv(task)
+    env.reset()
+
+    transition = env.step(SubmitProduct(_product(), "not accepted"))
+
+    assert transition.constraint_signals.accepted is False
+    assert transition.tool_result["submission"]["dealer_margin"] == 0.0
+    assert transition.reward_components.dealer_economics.value == pytest.approx(
+        0.0
+    )
+    assert (
+        transition.reward_components.dealer_economics.provenance
+        == "accepted-inception-margin-v2"
+    )
+
+
+def test_horizon_liquidation_closes_accounts_and_enters_reward_summary():
+    env = MirageStructurerEnv(_task(), expose_privileged_info=True)
+    env.reset()
+
+    issued = env.step(SubmitProduct(_product(), "one-shot"))
+    terminal = env.step(Skip("finish horizon"))
+
+    assert issued.terminated is False
+    assert issued.reward_components.capital_efficiency.value < 0
+    assert issued.reward_components.risk_change.value <= 0
+    assert issued.reward_components.relationship_delta.available is False
+    assert terminal.terminated is True
+    assert terminal.tool_result["open_at_horizon"] == []
+    assert terminal.tool_result["horizon_liquidations"]
+    assert "horizon_liquidated_position_ids" not in terminal.tool_result
+    assert "position_id" not in json.dumps(terminal.tool_result)
+    assert "event_id" not in json.dumps(terminal.tool_result)
+    assert "v3-test" not in json.dumps(terminal.tool_result)
+    assert terminal.reward_components.terminal_lifecycle_pnl.available is True
+    assert terminal.reward_components.capital_efficiency.value < 0
+
+    portfolio = terminal.info["privileged_state"]["portfolio"]
+    assert portfolio["positions"] == []
+    assert portfolio["client_account"]["locked_cash"] == pytest.approx(0.0)
+    assert portfolio["dealer_account"]["realised_hedged_pnl"] == pytest.approx(
+        terminal.reward_components.terminal_lifecycle_pnl.value
+    )
+    summary = terminal.info["episode_summary"]
+    assert summary["reward"]["total_steps"] == 2
+    assert summary["reward"]["raw_totals"][
+        "terminal_lifecycle_pnl"
+    ] == pytest.approx(
+        terminal.reward_components.terminal_lifecycle_pnl.value
+    )
+    assert summary["constraints"]["steps"] == 2
+    assert summary["constraints"]["valid_actions"] == 2
 
 
 def test_query_cost_is_emitted_on_every_query_step():
@@ -305,15 +472,50 @@ def test_available_action_mask_removes_exhausted_query_and_quote_actions():
 def test_state_hash_commits_reward_config_and_reset_options():
     base = MirageStructurerEnv(_task(), query_cost=-0.01)
     costly = MirageStructurerEnv(_task(), query_cost=-99.0)
-    _, base_info = base.reset(options={"curriculum": "a"})
-    _, costly_info = costly.reset(options={"curriculum": "a"})
+    _, base_info = base.reset(options={"run_label": "a"})
+    _, costly_info = costly.reset(options={"run_label": "a"})
     assert base_info["state_hash"] != costly_info["state_hash"]
 
-    _, changed_options = base.reset(options={"curriculum": "b"})
+    _, changed_options = base.reset(options={"run_label": "b"})
     assert base_info["state_hash"] != changed_options["state_hash"]
     assert (
         TrajectoryRecorder(base).metadata.environment_config_hash
         != TrajectoryRecorder(costly).metadata.environment_config_hash
+    )
+
+
+def test_unimplemented_curriculum_option_fails_closed():
+    env = MirageStructurerEnv(_task())
+
+    with pytest.raises(ValueError, match="TaskGenerator"):
+        env.reset(options={"curriculum": "easy"})
+
+
+def test_scalarized_wrapper_requires_explicit_non_double_counting_spec():
+    with pytest.raises(ValueError, match="cannot combine"):
+        ScalarizationSpec(
+            {
+                "dealer_economics": 1.0,
+                "terminal_lifecycle_pnl": 1.0,
+            }
+        )
+
+    wrapped = ScalarizedMirageEnv(
+        MirageStructurerEnv(_task()),
+        ScalarizationSpec({"query_cost": 1.0}),
+    )
+    _, reset_info = wrapped.reset(seed=5)
+    observation, reward, terminated, truncated, info = wrapped.step(
+        AskClient("capital")
+    )
+
+    assert reward == pytest.approx(-0.01)
+    assert terminated is False
+    assert truncated is False
+    assert observation.disclosed_client["capital"] == 10_000_000.0
+    assert reset_info["scalarization_hash"] == info["scalarization_hash"]
+    assert info["reward_components"]["query_cost"]["value"] == pytest.approx(
+        -0.01
     )
 
 
@@ -336,7 +538,17 @@ def test_trajectory_records_full_transitions_and_verifies_chain(tmp_path):
     assert saved["metadata"]["environment_version"] == env.environment_version
     assert saved["metadata"]["pricing_version"]
     assert saved["metadata"]["task_version"] == "test-task-v1"
+    assert saved["metadata"]["package_version"] == "0.2.0"
+    assert saved["metadata"]["installed_distribution_version"]
     assert saved["metadata"]["environment_config_hash"]
+    assert saved["environment_configuration"] == env.configuration
+    assert saved["metadata"]["implementation_hash"]
+    assert isinstance(saved["metadata"]["worktree_dirty"], (bool, type(None)))
+    assert saved["metadata"]["worktree_state_hash"]
+    assert saved["dependency_versions"]["python"]
+    assert saved["metadata"]["dependency_versions_hash"]
+    assert saved["run_id_seed"] == 17
+    assert saved["public_action_schema"]["product_domain_version"]
     assert saved["entries"][0]["transition"]["info"]["privileged_state"]
 
     saved["entries"][1]["transition"]["state_hash_before"] = "tampered"

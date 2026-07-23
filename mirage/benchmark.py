@@ -308,6 +308,8 @@ class Position:
     premium: float | None
     protected_amount: float
     dealer_fee: float
+    hedge_last_spot: float | None = None
+    cumulative_hedge_pnl: float = 0.0
     trade_date: date | None = None
     initial_fixing: float | None = None
     absolute_strike: float | None = None
@@ -368,10 +370,195 @@ class LifecycleEvent:
     settlement_amount: float
     client_realized_pnl: float
     dealer_liability_realized_pnl: float
-    dealer_hedge_pnl: float | None
+    dealer_hedge_pnl: float
+    dealer_hedged_realized_pnl: float
     transaction_costs: float | None
     dealer_total_pnl: float | None
-    pnl_provenance: str = "contract-cashflow-ledger-v1"
+    pnl_provenance: str = "monthly-static-delta-before-costs-v1"
+
+
+@dataclass
+class ClientAccount:
+    """Authoritative client cash and wealth state across an episode."""
+
+    initial_cash: float
+    available_cash: float
+    scheduled_capital: float
+    locked_cash: float = 0.0
+    realised_pnl: float = 0.0
+    cumulative_issue_outflows: float = 0.0
+    cumulative_settlement_inflows: float = 0.0
+    external_inflows: float = 0.0
+    external_outflows: float = 0.0
+    pending_external_withdrawal: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in ("initial_cash", "available_cash", "scheduled_capital"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise BenchmarkError(
+                    f"ClientAccount.{name} must be finite and non-negative"
+                )
+
+    @property
+    def book_wealth(self) -> float:
+        """Cash plus active contracts carried at their original cash outlay."""
+
+        return self.available_cash + self.locked_cash
+
+    def net_liquidation_wealth(self, *, active_fair_value: float) -> float:
+        """Cash plus the observable liquidation value of active contracts."""
+
+        return self.available_cash + active_fair_value
+
+    def issue(self, amount: float) -> None:
+        if amount < 0 or not math.isfinite(amount):
+            raise BenchmarkError("client issue amount must be finite and non-negative")
+        if amount > self.available_cash + 1e-9:
+            raise BenchmarkError(
+                "client account has insufficient available cash for issuance"
+            )
+        self.available_cash = max(self.available_cash - amount, 0.0)
+        self.locked_cash += amount
+        self.cumulative_issue_outflows += amount
+
+    def settle(self, *, cash_outlay: float, settlement_amount: float) -> None:
+        if cash_outlay > self.locked_cash + 1e-7:
+            raise BenchmarkError(
+                "client settlement releases more cash than the account has locked"
+            )
+        self.locked_cash = max(self.locked_cash - cash_outlay, 0.0)
+        self.cumulative_settlement_inflows += settlement_amount
+        self.realised_pnl += settlement_amount - cash_outlay
+        residual = settlement_amount
+        if self.pending_external_withdrawal > 0:
+            applied = min(residual, self.pending_external_withdrawal)
+            self.pending_external_withdrawal -= applied
+            self.external_outflows += applied
+            residual -= applied
+        self.available_cash += residual
+
+    def reconcile_scheduled_capital(self, next_capital: float) -> None:
+        """Treat explicit round-to-round capital changes as external cashflows."""
+
+        if not math.isfinite(next_capital) or next_capital < 0:
+            raise BenchmarkError(
+                "scheduled client capital must be finite and non-negative"
+            )
+        change = next_capital - self.scheduled_capital
+        self.scheduled_capital = next_capital
+        if change >= 0:
+            self.available_cash += change
+            self.external_inflows += change
+            return
+        requested = -change
+        paid = min(self.available_cash, requested)
+        self.available_cash -= paid
+        self.external_outflows += paid
+        self.pending_external_withdrawal += requested - paid
+
+    def snapshot(self, *, active_fair_value: float) -> dict[str, float]:
+        wealth = self.net_liquidation_wealth(
+            active_fair_value=active_fair_value
+        )
+        return {
+            "initial_cash": self.initial_cash,
+            "available_cash": self.available_cash,
+            "locked_cash": self.locked_cash,
+            "realised_pnl": self.realised_pnl,
+            "book_wealth": self.book_wealth,
+            "active_fair_value": active_fair_value,
+            "wealth": wealth,
+            "net_liquidation_wealth": wealth,
+            "cumulative_issue_outflows": self.cumulative_issue_outflows,
+            "cumulative_settlement_inflows": self.cumulative_settlement_inflows,
+            "external_inflows": self.external_inflows,
+            "external_outflows": self.external_outflows,
+            "pending_external_withdrawal": self.pending_external_withdrawal,
+        }
+
+    def reset(self) -> None:
+        self.available_cash = self.initial_cash
+        self.scheduled_capital = self.initial_cash
+        self.locked_cash = 0.0
+        self.realised_pnl = 0.0
+        self.cumulative_issue_outflows = 0.0
+        self.cumulative_settlement_inflows = 0.0
+        self.external_inflows = 0.0
+        self.external_outflows = 0.0
+        self.pending_external_withdrawal = 0.0
+
+
+@dataclass
+class DealerAccount:
+    """Dealer cash, model P&L and remaining stress-capital state."""
+
+    risk_capital_limit: float
+    cash_balance: float = 0.0
+    issue_proceeds: float = 0.0
+    settlement_payments: float = 0.0
+    hedge_cash: float = 0.0
+    realised_liability_pnl: float = 0.0
+    realised_hedged_pnl: float = 0.0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.risk_capital_limit, bool)
+            or not isinstance(self.risk_capital_limit, (int, float))
+            or not math.isfinite(self.risk_capital_limit)
+            or self.risk_capital_limit <= 0
+        ):
+            raise BenchmarkError(
+                "DealerAccount.risk_capital_limit must be positive and finite"
+            )
+
+    def issue(self, amount: float) -> None:
+        self.issue_proceeds += amount
+        self.cash_balance += amount
+
+    def settle(self, event: LifecycleEvent) -> None:
+        self.settlement_payments += event.settlement_amount
+        self.hedge_cash += event.dealer_hedge_pnl
+        self.cash_balance += event.dealer_hedge_pnl - event.settlement_amount
+        self.realised_liability_pnl += event.dealer_liability_realized_pnl
+        self.realised_hedged_pnl += event.dealer_hedged_realized_pnl
+
+    def snapshot(
+        self,
+        *,
+        active_liability_fair_value: float,
+        active_stress: float,
+    ) -> dict[str, float]:
+        model_equity = self.cash_balance - active_liability_fair_value
+        risk_capital_equity = self.risk_capital_limit + self.realised_hedged_pnl
+        return {
+            "cash_balance": self.cash_balance,
+            "issue_proceeds": self.issue_proceeds,
+            "settlement_payments": self.settlement_payments,
+            "hedge_cash": self.hedge_cash,
+            "realised_liability_pnl": self.realised_liability_pnl,
+            "realised_hedged_pnl": self.realised_hedged_pnl,
+            "realised_pnl": self.realised_hedged_pnl,
+            "model_equity": model_equity,
+            "active_liability_fair_value": active_liability_fair_value,
+            "risk_capital_limit": self.risk_capital_limit,
+            "risk_capital_equity": risk_capital_equity,
+            "risk_capital_used": active_stress,
+            "risk_capital_available": risk_capital_equity - active_stress,
+        }
+
+    def reset(self) -> None:
+        self.cash_balance = 0.0
+        self.issue_proceeds = 0.0
+        self.settlement_payments = 0.0
+        self.hedge_cash = 0.0
+        self.realised_liability_pnl = 0.0
+        self.realised_hedged_pnl = 0.0
 
 
 _CLIENT_OVERRIDE_FIELDS = frozenset({
@@ -536,6 +723,19 @@ def _revalue_position(position: Position, snapshot: MarketSnapshot) -> None:
     position.last_valuation_round = snapshot.round_num
 
 
+def _accrue_static_delta_hedge(
+    position: Position,
+    snapshot: MarketSnapshot,
+) -> None:
+    """Realise one monthly frozen-delta hedge interval before rehedging."""
+
+    previous_spot = position.hedge_last_spot
+    if previous_spot is not None and previous_spot > 0:
+        spot_return = snapshot.spot / previous_spot - 1.0
+        position.cumulative_hedge_pnl += position.delta_dollars * spot_return
+    position.hedge_last_spot = snapshot.spot
+
+
 def _position_settlement_amount(position: Position, snapshot: MarketSnapshot) -> float:
     """Deterministic contractual settlement at an observed close event."""
 
@@ -621,17 +821,29 @@ def _position_settlement_amount(position: Position, snapshot: MarketSnapshot) ->
 def _close_position(
     position: Position,
     snapshot: MarketSnapshot,
+    *,
+    settlement_override: float | None = None,
+    pnl_provenance: str = "monthly-static-delta-before-costs-v1",
 ) -> LifecycleEvent:
-    settlement = max(_position_settlement_amount(position, snapshot), 0.0)
+    settlement = max(
+        (
+            _position_settlement_amount(position, snapshot)
+            if settlement_override is None
+            else settlement_override
+        ),
+        0.0,
+    )
     client_pnl = settlement - position.issue_cash_outlay
     dealer_liability_pnl = -client_pnl
+    dealer_hedge_pnl = position.cumulative_hedge_pnl
+    dealer_hedged_pnl = dealer_liability_pnl + dealer_hedge_pnl
     event_id = hashlib.sha256(
         (
             f"{position.position_id}|{position.status}|"
             f"{snapshot.as_of.isoformat()}|{snapshot.round_num}"
         ).encode("utf-8")
     ).hexdigest()[:16]
-    cashflow = CashflowRecord(
+    settlement_cashflow = CashflowRecord(
         cashflow_id=f"CF-{event_id}",
         position_id=position.position_id,
         event_type="settlement",
@@ -645,9 +857,26 @@ def _close_position(
             if position.status == "autocalled"
             else "barrier_close_payment"
             if position.status == "knocked_out"
+            else "horizon_liquidation_value"
+            if position.status == "horizon_liquidated"
             else "maturity_redemption"
         ),
     )
+    cashflows = [settlement_cashflow]
+    if abs(dealer_hedge_pnl) > 1e-12:
+        cashflows.append(
+            CashflowRecord(
+                cashflow_id=f"CF-{event_id}-H",
+                position_id=position.position_id,
+                event_type="hedge_unwind",
+                as_of=snapshot.as_of,
+                round_num=snapshot.round_num,
+                payer="market" if dealer_hedge_pnl >= 0 else "dealer",
+                receiver="dealer" if dealer_hedge_pnl >= 0 else "market",
+                amount=abs(dealer_hedge_pnl),
+                component="monthly_static_delta_hedge_pnl",
+            )
+        )
     position.close_event_id = f"LE-{event_id}"
     position.settlement_amount = settlement
     position.client_realized_pnl = client_pnl
@@ -660,16 +889,18 @@ def _close_position(
         as_of=snapshot.as_of,
         round_num=snapshot.round_num,
         spot=snapshot.spot,
-        cashflows=(cashflow,),
+        cashflows=tuple(cashflows),
         client_cash_outlay=position.issue_cash_outlay,
         settlement_amount=settlement,
         client_realized_pnl=client_pnl,
         dealer_liability_realized_pnl=dealer_liability_pnl,
-        # A static-delta stress proxy is not a realised hedge ledger.  These
-        # remain unavailable until actual hedge trades and unwind costs exist.
-        dealer_hedge_pnl=None,
+        dealer_hedge_pnl=dealer_hedge_pnl,
+        dealer_hedged_realized_pnl=dealer_hedged_pnl,
         transaction_costs=None,
+        # Total after transaction costs remains unavailable. The separate
+        # before-cost hedged P&L above is an explicit Level-0 model result.
         dealer_total_pnl=None,
+        pnl_provenance=pnl_provenance,
     )
 
 
@@ -682,6 +913,8 @@ class PortfolioState:
     cashflow_ledger: list[CashflowRecord] = field(default_factory=list)
     lifecycle_events: list[LifecycleEvent] = field(default_factory=list)
     last_lifecycle_events: list[LifecycleEvent] = field(default_factory=list)
+    client_account: ClientAccount | None = None
+    dealer_account: DealerAccount | None = None
     revision: int = 0
 
     def totals(self) -> dict[str, float]:
@@ -726,6 +959,7 @@ class PortfolioState:
                 if position.remaining_months <= 0 and position.status == "active":
                     position.status = "matured"
             else:
+                _accrue_static_delta_hedge(position, snapshot)
                 _process_position_observation(position, snapshot)
                 _revalue_position(position, snapshot)
             if position.remaining_months <= 0 or position.status != "active":
@@ -735,6 +969,13 @@ class PortfolioState:
                     events.append(event)
                     self.lifecycle_events.append(event)
                     self.cashflow_ledger.extend(event.cashflows)
+                    if self.client_account is not None:
+                        self.client_account.settle(
+                            cash_outlay=event.client_cash_outlay,
+                            settlement_amount=event.settlement_amount,
+                        )
+                    if self.dealer_account is not None:
+                        self.dealer_account.settle(event)
                 self.closed_positions.append(position)
             else:
                 active.append(position)
@@ -744,6 +985,10 @@ class PortfolioState:
         return closed
 
     def add(self, position: Position) -> None:
+        if self.client_account is not None:
+            self.client_account.issue(position.issue_cash_outlay)
+        if self.dealer_account is not None:
+            self.dealer_account.issue(position.issue_cash_outlay)
         self.positions.append(position)
         if position.trade_date is not None:
             digest = hashlib.sha256(
@@ -771,12 +1016,46 @@ class PortfolioState:
             )
         self.revision += 1
 
+    def liquidate_horizon(self, snapshot: MarketSnapshot) -> list[str]:
+        """Close every active contract at its observable mark-to-market value."""
+
+        closed: list[str] = []
+        events: list[LifecycleEvent] = []
+        for position in self.positions:
+            position.status = "horizon_liquidated"
+            event = _close_position(
+                position,
+                snapshot,
+                settlement_override=position.current_fair_value,
+                pnl_provenance="horizon-mark-to-market-static-delta-before-costs-v1",
+            )
+            closed.append(position.position_id)
+            events.append(event)
+            self.closed_positions.append(position)
+            self.lifecycle_events.append(event)
+            self.cashflow_ledger.extend(event.cashflows)
+            if self.client_account is not None:
+                self.client_account.settle(
+                    cash_outlay=event.client_cash_outlay,
+                    settlement_amount=event.settlement_amount,
+                )
+            if self.dealer_account is not None:
+                self.dealer_account.settle(event)
+        self.positions = []
+        self.last_lifecycle_events = events
+        self.revision += 1
+        return closed
+
     def reset(self) -> None:
         self.positions.clear()
         self.closed_positions.clear()
         self.cashflow_ledger.clear()
         self.lifecycle_events.clear()
         self.last_lifecycle_events.clear()
+        if self.client_account is not None:
+            self.client_account.reset()
+        if self.dealer_account is not None:
+            self.dealer_account.reset()
         self.revision += 1
 
 
@@ -927,8 +1206,7 @@ def worst_case_payoff_ratio(product: ProductSpec) -> float:
     floor is one; otherwise the conservative payoff floor is zero.
     """
     if product.principal_protected and product.product_type not in {"snowball"}:
-        if product.product_type != "autocallable" or product.barrier_pct is None:
-            return 1.0
+        return 1.0
     return 0.0
 
 
@@ -937,9 +1215,10 @@ class ProductDomainSpec:
     """Frozen finite action lattice shared by the tested agent and the oracle.
 
     Any change to these tuples is a protocol change and must be re-frozen before
-    evaluation. ``notional_fractions`` are expressed relative to client capital so
-    the same lattice transfers across clients; the absolute notional for a
-    candidate is ``round(client.capital * fraction)``.
+    evaluation.  Legacy v2 domains leave ``public_notional_base`` unset and
+    express ``notional_fractions`` relative to client capital.  A v3
+    :class:`EpisodeTask` freezes an explicit public base, so constructing the
+    action lattice never reveals a hidden client-capital value.
     """
 
     product_types: tuple[str, ...] = (
@@ -955,7 +1234,8 @@ class ProductDomainSpec:
     coupons: tuple[float, ...] = (.04, .08)
     participations: tuple[float, ...] = (.5, 1.0)
     principal_protected: tuple[bool, ...] = (False, True)
-    version: str = "csi-domain-v2-funding"
+    public_notional_base: float | None = None
+    version: str = "csi-domain-v3-action-contract"
 
     def __post_init__(self) -> None:
         tuple_fields = (
@@ -1038,12 +1318,28 @@ class ProductDomainSpec:
             raise BenchmarkError("ProductDomainSpec.maturities must be positive integers")
         if not all(isinstance(value, bool) for value in self.principal_protected):
             raise BenchmarkError("ProductDomainSpec.principal_protected must be booleans")
+        if self.public_notional_base is not None and (
+            isinstance(self.public_notional_base, bool)
+            or not isinstance(self.public_notional_base, (int, float))
+            or not math.isfinite(self.public_notional_base)
+            or self.public_notional_base <= 0
+        ):
+            raise BenchmarkError(
+                "ProductDomainSpec.public_notional_base must be positive and finite"
+            )
         if not isinstance(self.version, str) or not self.version.strip():
             raise BenchmarkError("ProductDomainSpec.version must be non-empty")
 
 
 def _domain_notionals(client: ClientProfile, domain: ProductDomainSpec) -> list[int]:
-    return sorted({int(round(client.capital * f)) for f in domain.notional_fractions if f > 0})
+    base = (
+        client.capital
+        if domain.public_notional_base is None
+        else domain.public_notional_base
+    )
+    return sorted(
+        {int(round(base * f)) for f in domain.notional_fractions if f > 0}
+    )
 
 
 def _domain_signature(product: ProductSpec) -> tuple:
@@ -1122,10 +1418,33 @@ def enumerate_domain(client: ClientProfile, domain: ProductDomainSpec | None = N
                 elif ptype == "autocallable":
                     for coupon in domain.coupons:
                         for pp in domain.principal_protected:
-                            yield _spec(ptype, notional, maturity, coupon=coupon, protected=pp)
-                            for barrier in lower_barriers:
-                                yield _spec(ptype, notional, maturity, coupon=coupon,
-                                            barrier=barrier, barrier_type="knock_in", protected=pp)
+                            if pp:
+                                # A protected autocall has an unconditional
+                                # principal floor. A knock-in flag would have
+                                # no payoff effect and is therefore excluded
+                                # from the finite grammar.
+                                yield _spec(
+                                    ptype,
+                                    notional,
+                                    maturity,
+                                    coupon=coupon,
+                                    protected=True,
+                                )
+                            else:
+                                # An unprotected autocall must contain an
+                                # actual loss-bearing knock-in branch. Without
+                                # it the payoff has a principal floor and the
+                                # "unprotected" label would be false.
+                                for barrier in lower_barriers:
+                                    yield _spec(
+                                        ptype,
+                                        notional,
+                                        maturity,
+                                        coupon=coupon,
+                                        barrier=barrier,
+                                        barrier_type="knock_in",
+                                        protected=False,
+                                    )
                 elif ptype == "snowball":
                     for coupon in domain.coupons:
                         for barrier in lower_barriers:
@@ -1137,8 +1456,13 @@ _DOMAIN_SET_CACHE: BoundedLRUCache[tuple, frozenset] = BoundedLRUCache(maxsize=1
 
 
 def _domain_signature_set(client: ClientProfile, domain: ProductDomainSpec) -> frozenset:
-    """Cached set of in-lattice structural signatures for this (capital, domain)."""
-    key = (int(round(client.capital)), domain)
+    """Cached set of in-lattice structural signatures for this public domain."""
+    base = (
+        client.capital
+        if domain.public_notional_base is None
+        else domain.public_notional_base
+    )
+    key = (int(round(base)), domain)
     cached = _DOMAIN_SET_CACHE.get(key)
     if cached is None:
         cached = frozenset(_domain_signature(candidate) for candidate in enumerate_domain(client, domain))
@@ -1165,7 +1489,11 @@ def validate_domain(
 
 
 def client_contract_pass(
-    product: ProductSpec, quote_pricing: dict, client: ClientProfile
+    product: ProductSpec,
+    quote_pricing: dict,
+    client: ClientProfile,
+    *,
+    available_cash: float | None = None,
 ) -> tuple[bool, list[CheckResult]]:
     """Deterministic client contract gate (the settlement counterpart of would_buy).
 
@@ -1184,6 +1512,7 @@ def client_contract_pass(
         worst_stress_id=worst_stress_id,
     )
     cash_outlay = float(quote_pricing.get("cash_outlay", product.notional))
+    cash_limit = client.capital if available_cash is None else available_cash
     allowed = client.allowed_product_types is None or product.product_type in client.allowed_product_types
     needs_protection = client.principal_protection_required or client.risk_appetite == "conservative"
     protection_ok = not needs_protection or product.principal_protected
@@ -1197,8 +1526,8 @@ def client_contract_pass(
         _check("CONTRACT_ACCEPTING", client.accepting_new_products,
                client.accepting_new_products, True,
                "client must be accepting new products", "CONTRACT"),
-        _check("CONTRACT_CAPITAL", cash_outlay <= client.capital + 1e-9,
-               cash_outlay, client.capital,
+        _check("CONTRACT_CAPITAL", cash_outlay <= cash_limit + 1e-9,
+               cash_outlay, cash_limit,
                "cash outlay must not exceed available capital", "CONTRACT"),
         _check("CONTRACT_MATURITY", product.maturity_months <= client.max_maturity_months,
                product.maturity_months, client.max_maturity_months,
@@ -1244,6 +1573,11 @@ class HardConstraintEngine:
         dealer_hedged_worst_stress_id: str = "",
     ) -> list[CheckResult]:
         current = portfolio.totals()
+        available_cash = (
+            portfolio.client_account.available_cash
+            if portfolio.client_account is not None
+            else client.capital
+        )
         protection_tolerance = self.description_tolerance_bp / 10_000.0
         floor = worst_case_payoff_ratio(product)
         floor_amount = floor * product.effective_face_value
@@ -1256,13 +1590,18 @@ class HardConstraintEngine:
             worst_stress_id=client_worst_stress_id,
         )
         post_notional = current["notional"] + product.notional
-        post_cash_outlay = current["cash_outlay"] + cash_outlay
         post_net_delta = current["net_delta"] + delta_dollars
         post_gross_delta = current["gross_delta"] + abs(delta_dollars)
         post_net_vega = current["net_vega"] + vega_dollars
         post_stress = (
             current["dealer_hedged_stress_loss"]
             + max(dealer_hedged_stress_loss, 0.0)
+        )
+        dealer_risk_capital = (
+            portfolio.dealer_account.risk_capital_limit
+            + portfolio.dealer_account.realised_hedged_pnl
+            if portfolio.dealer_account is not None
+            else self.risk_budget.dealer_stress_loss
         )
 
         allowed = client.allowed_product_types is None or product.product_type in client.allowed_product_types
@@ -1287,9 +1626,9 @@ class HardConstraintEngine:
                    "term-sheet target client must match the current client"),
             _check("CLIENT_ACCEPTING", client.accepting_new_products, client.accepting_new_products, True,
                    "client must be accepting new products"),
-            _check("CLIENT_CAPITAL", post_cash_outlay <= client.capital + 1e-9,
-                   post_cash_outlay, client.capital,
-                   "active client cash outlay plus this trade must fit available capital"),
+            _check("CLIENT_CAPITAL", cash_outlay <= available_cash + 1e-9,
+                   cash_outlay, available_cash,
+                   "this trade's cash outlay must fit authoritative available cash"),
             _check("CLIENT_MATURITY", product.maturity_months <= client.max_maturity_months,
                    product.maturity_months, client.max_maturity_months, "maturity must fit the client mandate"),
             _check("CLIENT_PRODUCT_WHITELIST", allowed, product.product_type,
@@ -1319,9 +1658,10 @@ class HardConstraintEngine:
             _check("PORTFOLIO_NET_VEGA", abs(post_net_vega) <= self.risk_budget.net_vega + 1e-9,
                    abs(post_net_vega), self.risk_budget.net_vega, "post-trade absolute vega budget"),
             _check("PORTFOLIO_DEALER_STRESS_LOSS",
-                   post_stress <= self.risk_budget.dealer_stress_loss + 1e-9,
-                   post_stress, self.risk_budget.dealer_stress_loss,
+                   post_stress <= dealer_risk_capital + 1e-9,
+                   post_stress, dealer_risk_capital,
                    "post-trade static-delta-hedged dealer stress budget "
+                   "after cumulative realised hedged P&L "
                    f"(worst={dealer_hedged_worst_stress_id or 'n/a'})"),
         ]
 
@@ -1713,6 +2053,7 @@ class LongHorizonEnvironment:
         "return_hurdle": ("min_return_pct", "min_hit_prob"),
     }
     CLIENT_TOPICS = frozenset(CLIENT_TOPIC_FIELDS)
+    ACTION_SCHEMA_VERSION = "mirage.environment.action-schema.v3"
 
     def __init__(
         self,
@@ -1744,7 +2085,16 @@ class LongHorizonEnvironment:
         self.base_client = client
         self.client = resolve_client_profile(client, self.snapshots[0].round_num)
         self.condition = condition
-        self.portfolio = PortfolioState()
+        self.portfolio = PortfolioState(
+            client_account=ClientAccount(
+                initial_cash=float(self.client.capital),
+                available_cash=float(self.client.capital),
+                scheduled_capital=float(self.client.capital),
+            ),
+            dealer_account=DealerAccount(
+                risk_capital_limit=float(risk_budget.dealer_stress_loss)
+            ),
+        )
         self.client_memory = ClientMemory()
         self.quote_policy = quote_policy or QuotePolicy()
         self.domain = domain or ProductDomainSpec()
@@ -1771,11 +2121,38 @@ class LongHorizonEnvironment:
 
     @property
     def state_version(self) -> str:
+        account_state = self.economic_state()
         raw = (
             f"{self.snapshot.episode_id}|{self.snapshot.round_num}|"
-            f"{self.portfolio.revision}|{self.condition.id}"
+            f"{self.portfolio.revision}|{self.condition.id}|"
+            f"{json.dumps(account_state, sort_keys=True, separators=(',', ':'))}"
         )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def economic_state(self) -> dict:
+        """Authoritative account and active-risk state for reward deltas."""
+
+        totals = self.portfolio.totals()
+        client_account = self.portfolio.client_account
+        dealer_account = self.portfolio.dealer_account
+        return {
+            "client": (
+                client_account.snapshot(active_fair_value=totals["fair_value"])
+                if client_account is not None
+                else {}
+            ),
+            "dealer": (
+                dealer_account.snapshot(
+                    active_liability_fair_value=totals["fair_value"],
+                    active_stress=totals["dealer_hedged_stress_loss"],
+                )
+                if dealer_account is not None
+                else {}
+            ),
+            "active_risk": totals,
+            "relationship": asdict(self.client_memory),
+            "lifecycle_event_count": len(self.portfolio.lifecycle_events),
+        }
 
     def get_round_brief(self) -> dict:
         brief = self.snapshot.public_brief()
@@ -1796,9 +2173,123 @@ class LongHorizonEnvironment:
             brief["client_history"] = asdict(self.client_memory)
         return brief
 
-    def _full_client_payload(self) -> dict:
+    def policy_action_schema(self) -> dict:
+        """Return the complete machine-readable action contract for this round.
+
+        The schema is derived from the same ``ProductDomainSpec`` and topic
+        enum enforced by runtime checks. It contains no hidden mandate values;
+        the public notional base exists solely to make the finite action lattice
+        constructible by a policy.
+        """
+
+        domain = self.domain
+        notionals = _domain_notionals(self.client, domain)
+        public_notional_base = (
+            self.client.capital
+            if domain.public_notional_base is None
+            else domain.public_notional_base
+        )
+        lower_barriers = [value for value in domain.barriers if value < 1.0]
         return {
-            "capital": self.client.capital,
+            "schema_version": self.ACTION_SCHEMA_VERSION,
+            "client_topic_enum": sorted(self.CLIENT_TOPICS),
+            "product_domain_version": domain.version,
+            "target_client": self.client.id,
+            "allowed_product_types": list(domain.product_types),
+            "notional_rule": {
+                "kind": "fraction_of_public_domain_base",
+                "base_amount": public_notional_base,
+                "fractions": list(domain.notional_fractions),
+                "allowed_values": notionals,
+                "units": "CNY",
+            },
+            "maturities": list(domain.maturities),
+            "strikes": list(domain.strikes),
+            "barriers": list(domain.barriers),
+            "coupons": list(domain.coupons),
+            "participations": list(domain.participations),
+            "principal_protected": list(domain.principal_protected),
+            "combination_rules": {
+                "vanilla_call|vanilla_put": {
+                    "barrier_pct": [None],
+                    "barrier_type": [None],
+                    "coupon_rate": [None],
+                    "strike_pct": list(domain.strikes),
+                    "participation_rate": list(domain.participations),
+                    "principal_protected": list(domain.principal_protected),
+                },
+                "barrier_call|barrier_put": {
+                    "barrier_pct": list(domain.barriers),
+                    "barrier_type_rule": (
+                        "knock_in when barrier_pct <= 1; "
+                        "knock_out when barrier_pct > 1"
+                    ),
+                    "coupon_rate": [None],
+                    "strike_pct": list(domain.strikes),
+                    "participation_rate": list(domain.participations),
+                    "principal_protected": list(domain.principal_protected),
+                },
+                "autocallable": {
+                    "protected": {
+                        "principal_protected": True,
+                        "barrier_pct": [None],
+                        "barrier_type": [None],
+                    },
+                    "unprotected": {
+                        "principal_protected": False,
+                        "barrier_pct": lower_barriers,
+                        "barrier_type": ["knock_in"],
+                    },
+                    "coupon_rate": list(domain.coupons),
+                    "participation_rate": [1.0],
+                    "strike_pct": [1.0],
+                },
+                "snowball": {
+                    "principal_protected": [False],
+                    "barrier_pct": lower_barriers,
+                    "barrier_type": ["knock_in"],
+                    "coupon_rate": list(domain.coupons),
+                    "participation_rate": [1.0],
+                    "strike_pct": [1.0],
+                },
+            },
+            "funding_constraints": {
+                "premium_paid": {
+                    "applies_to": [
+                        "vanilla_call",
+                        "vanilla_put",
+                        "barrier_call",
+                        "barrier_put",
+                    ],
+                    "issue_price_pct": None,
+                    "protected_amount_rule": (
+                        "face_value when principal_protected else 0"
+                    ),
+                },
+                "funded_note": {
+                    "applies_to": ["autocallable", "snowball"],
+                    "issue_price_pct": 1.0,
+                    "face_value_rule": "equals notional at Level-0",
+                    "protected_amount_rule": (
+                        "face_value when principal_protected else 0"
+                    ),
+                },
+            },
+            "quoteability": (
+                "A product is quotable iff its structural fields match one "
+                "combination above and every scalar is in the listed domain. "
+                "Client mandate and portfolio checks are evaluated separately."
+            ),
+        }
+
+    def _full_client_payload(self) -> dict:
+        available_cash = (
+            self.portfolio.client_account.available_cash
+            if self.portfolio.client_account is not None
+            else self.client.capital
+        )
+        return {
+            "capital": available_cash,
             "max_loss_pct": self.client.max_loss_pct,
             "min_return_pct": self.client.min_return_pct,
             "min_hit_prob": self.client.min_hit_prob,
@@ -1861,6 +2352,9 @@ class LongHorizonEnvironment:
             raise BenchmarkError(
                 "new quote requests cannot set environment-maintained lifecycle state"
             )
+        domain_check = validate_domain(product, self.client, self.domain)[0]
+        if not domain_check.passed:
+            raise BenchmarkError(f"DOMAIN: {domain_check.reason}")
         self.quote_count += 1
         # ProductSpec is mutable for v2 compatibility.  Bind the quote to an
         # immutable-by-convention value snapshot so a caller cannot mutate the
@@ -1883,7 +2377,17 @@ class LongHorizonEnvironment:
             raise BenchmarkError("quote expired because the environment state changed")
         self.submitted = True
         hard_executable = quote.hard_pass
-        contract_ok, contract_checks = client_contract_pass(product, quote.pricing, self.client)
+        available_cash = (
+            self.portfolio.client_account.available_cash
+            if self.portfolio.client_account is not None
+            else self.client.capital
+        )
+        contract_ok, contract_checks = client_contract_pass(
+            product,
+            quote.pricing,
+            self.client,
+            available_cash=available_cash,
+        )
         accepted = hard_executable and contract_ok
         if accepted:
             if self.condition.dynamic:
@@ -1918,6 +2422,7 @@ class LongHorizonEnvironment:
                     premium=quote.premium,
                     protected_amount=quote.protected_amount,
                     dealer_fee=quote.dealer_fee,
+                    hedge_last_spot=fixing,
                     trade_date=self.snapshot.as_of,
                     initial_fixing=fixing,
                     absolute_strike=product.strike_pct * fixing,
@@ -1954,6 +2459,23 @@ class LongHorizonEnvironment:
             "cash_outlay": quote.cash_outlay,
             "premium": quote.premium,
             "protected_amount": quote.protected_amount,
+            "client_account": (
+                self.portfolio.client_account.snapshot(
+                    active_fair_value=self.portfolio.totals()["fair_value"]
+                )
+                if self.portfolio.client_account is not None
+                else None
+            ),
+            "dealer_account": (
+                self.portfolio.dealer_account.snapshot(
+                    active_liability_fair_value=self.portfolio.totals()["fair_value"],
+                    active_stress=self.portfolio.totals()[
+                        "dealer_hedged_stress_loss"
+                    ],
+                )
+                if self.portfolio.dealer_account is not None
+                else None
+            ),
             "explanation": explanation,
         }
 
@@ -2213,13 +2735,28 @@ class LongHorizonEnvironment:
             self.portfolio.reset()
             self.client_memory = ClientMemory()
         self.round_index += 1
-        self.client = resolve_client_profile(self.base_client, self.snapshot.round_num)
+        next_client = resolve_client_profile(
+            self.base_client,
+            self.snapshot.round_num,
+        )
+        if self.portfolio.client_account is not None:
+            self.portfolio.client_account.reconcile_scheduled_capital(
+                float(next_client.capital)
+            )
+        self.client = next_client
         self.quote_count = 0
         self.query_count = 0
         self.consult_count = 0
         self.quotes.clear()
         self.submitted = False
         return matured
+
+    def liquidate_horizon(self) -> list[str]:
+        """Deterministically close all remaining positions at current fair value."""
+
+        if not self.condition.dynamic:
+            return []
+        return self.portfolio.liquidate_horizon(self.snapshot)
 
 
 @dataclass

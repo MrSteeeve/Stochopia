@@ -34,12 +34,18 @@ from .market_builder import build_monthly_snapshots, load_daily_closes, write_ma
 from .benchmark_runner import STRATEGIES, compute_metrics, run_episode, trace_to_dict
 from .env_agents import EnvResponseCache, FrozenEnvAgent
 from .environment import (
+    TaskSuite,
+    aggregate_evaluations,
     CommandAgentPolicy,
     EpisodeTask,
     LLMAgentPolicy,
     MirageStructurerEnv,
+    TrajectoryRecorder,
     create_api_agent_policy,
+    load_evaluations,
+    replay_and_evaluate,
     run_agent_episode as run_v3_agent_episode,
+    save_evaluation_aggregate,
 )
 from .role_config import RoleConfigError, load_judges_config, load_role_specs
 from .llm import BaseLLMClient, LLMError, create_client, load_model_registry
@@ -228,6 +234,43 @@ def _env_cache(env_cache_dir: Path | None) -> EnvResponseCache | None:
     return EnvResponseCache(env_cache_dir / "env_cache.jsonl")
 
 
+def _add_v3_policy_arguments(parser: argparse.ArgumentParser) -> None:
+    backend = parser.add_mutually_exclusive_group(required=True)
+    backend.add_argument(
+        "--agent-command",
+        help="local executable command; receives one JSON request on stdin per step",
+    )
+    backend.add_argument(
+        "--model",
+        help="registered model name from --models-config",
+    )
+    backend.add_argument(
+        "--api-model",
+        help="direct API model id; does not require editing models.yaml",
+    )
+    parser.add_argument(
+        "--models-config",
+        type=Path,
+        default=Path("config/models.yaml"),
+    )
+    parser.add_argument(
+        "--api-provider",
+        choices=("openai-compatible", "anthropic"),
+        default="openai-compatible",
+    )
+    parser.add_argument("--api-base-url")
+    parser.add_argument("--api-key-env")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--api-timeout", type=float, default=120.0)
+    parser.add_argument("--command-timeout", type=float, default=180.0)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--max-steps-per-round", type=int, default=12)
+    parser.add_argument("--history-records", type=int, default=32)
+    parser.add_argument("--history-chars", type=int, default=96_000)
+    parser.add_argument("--redact-raw-output", action="store_true")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MIRAGE long-horizon benchmark utilities")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -353,6 +396,64 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional compact run-summary JSON",
     )
+    suite = sub.add_parser(
+        "make-v3-suite",
+        help="freeze selected episodes and hidden truth into a versioned v3 task suite",
+    )
+    suite.add_argument("csv", type=Path)
+    suite.add_argument("--episodes", nargs="+", required=True)
+    suite.add_argument("--client-json", type=Path, required=True)
+    suite.add_argument("--risk-budget-json", type=Path, required=True)
+    suite.add_argument("--quote-policy-json", type=Path, default=None)
+    suite.add_argument("--name", required=True)
+    suite.add_argument("--version", required=True)
+    suite.add_argument(
+        "--split",
+        choices=("train", "dev", "test", "private_test"),
+        required=True,
+    )
+    suite.add_argument(
+        "--public-notional-base",
+        type=float,
+        default=10_000_000.0,
+    )
+    suite.add_argument("--seed", type=int, default=0)
+    suite.add_argument("--output", type=Path, required=True)
+
+    run_suite = sub.add_parser(
+        "run-v3-suite",
+        help="run one external policy over every task and replay-evaluate each trajectory",
+    )
+    run_suite.add_argument("suite", type=Path)
+    run_suite.add_argument("--output-dir", type=Path, required=True)
+    run_suite.add_argument("--replicates", type=int, default=1)
+    run_suite.add_argument(
+        "--force",
+        action="store_true",
+        help="rerun matching complete trajectories instead of resuming them",
+    )
+    run_suite.add_argument("--bootstrap-resamples", type=int, default=10_000)
+    run_suite.add_argument("--aggregate-seed", type=int, default=20260802)
+    _add_v3_policy_arguments(run_suite)
+
+    evaluate = sub.add_parser(
+        "evaluate-trajectory",
+        help="cryptographically verify and economically replay one v3 trajectory",
+    )
+    evaluate.add_argument("trajectory", type=Path)
+    evaluate.add_argument("--suite", type=Path, default=None)
+    evaluate.add_argument("--output", type=Path, required=True)
+
+    aggregate_v3 = sub.add_parser(
+        "aggregate-v3",
+        help="aggregate replay-verified v3 evaluation artifacts by policy",
+    )
+    aggregate_v3.add_argument("results_dir", type=Path)
+    aggregate_v3.add_argument("--output-json", type=Path, required=True)
+    aggregate_v3.add_argument("--output-csv", type=Path, default=None)
+    aggregate_v3.add_argument("--bootstrap-resamples", type=int, default=10_000)
+    aggregate_v3.add_argument("--seed", type=int, default=20260802)
+
     manifest = sub.add_parser("make-manifest", help="freeze the factorial experiment job list")
     manifest.add_argument("--episodes", nargs="+", required=True)
     manifest.add_argument("--models", nargs="+", required=True)
@@ -480,6 +581,34 @@ def _registered_v3_policy(args: argparse.Namespace) -> LLMAgentPolicy:
     )
 
 
+def _create_v3_policy(args: argparse.Namespace):
+    """Construct any supported v3 policy with identical validation."""
+
+    try:
+        if args.agent_command is not None:
+            return CommandAgentPolicy(
+                args.agent_command,
+                timeout=args.command_timeout,
+            )
+        if args.model is not None:
+            return _registered_v3_policy(args)
+        if not args.api_base_url:
+            raise SystemExit("--api-base-url is required with --api-model")
+        if not args.api_key_env:
+            raise SystemExit("--api-key-env is required with --api-model")
+        return create_api_agent_policy(
+            provider=args.api_provider,
+            base_url=args.api_base_url,
+            model=args.api_model,
+            api_key_env=args.api_key_env,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens or 4000,
+            timeout=args.api_timeout,
+        )
+    except (LLMError, ValueError) as exc:
+        raise SystemExit(f"failed to configure v3 agent: {exc}") from exc
+
+
 def _cmd_test_agent(args: argparse.Namespace, snapshots: list) -> int:
     """Run one external policy through the canonical v3 reset/step boundary."""
 
@@ -509,30 +638,7 @@ def _cmd_test_agent(args: argparse.Namespace, snapshots: list) -> int:
         expose_privileged_info=False,
     )
 
-    try:
-        if args.agent_command is not None:
-            policy = CommandAgentPolicy(
-                args.agent_command,
-                timeout=args.command_timeout,
-            )
-        elif args.model is not None:
-            policy = _registered_v3_policy(args)
-        else:
-            if not args.api_base_url:
-                raise SystemExit("--api-base-url is required with --api-model")
-            if not args.api_key_env:
-                raise SystemExit("--api-key-env is required with --api-model")
-            policy = create_api_agent_policy(
-                provider=args.api_provider,
-                base_url=args.api_base_url,
-                model=args.api_model,
-                api_key_env=args.api_key_env,
-                temperature=args.temperature,
-                max_tokens=args.max_tokens or 4000,
-                timeout=args.api_timeout,
-            )
-    except (LLMError, ValueError) as exc:
-        raise SystemExit(f"failed to configure v3 agent: {exc}") from exc
+    policy = _create_v3_policy(args)
 
     result = asyncio.run(
         run_v3_agent_episode(
@@ -549,7 +655,321 @@ def _cmd_test_agent(args: argparse.Namespace, snapshots: list) -> int:
     if args.summary_output is not None:
         _atomic_write_json(args.summary_output, summary)
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    return 2 if result.status == "infrastructure_error" else 0
+
+
+def _cmd_make_v3_suite(args: argparse.Namespace) -> int:
+    snapshots = load_market_snapshots(args.csv)
+    requested = list(dict.fromkeys(args.episodes))
+    grouped = {
+        episode: tuple(
+            item for item in snapshots if item.episode_id == episode
+        )
+        for episode in requested
+    }
+    missing = [episode for episode, rows in grouped.items() if not rows]
+    if missing:
+        raise SystemExit(f"unknown episodes: {missing}")
+    client_payload = json.loads(args.client_json.read_text(encoding="utf-8"))
+    budget_payload = json.loads(
+        args.risk_budget_json.read_text(encoding="utf-8")
+    )
+    client = ClientProfile(**client_payload)
+    budget = RiskBudget(**budget_payload)
+    policy = _load_quote_policy(args.quote_policy_json) or QuotePolicy()
+    domain = ProductDomainSpec(
+        public_notional_base=args.public_notional_base
+    )
+    tasks = tuple(
+        EpisodeTask(
+            snapshots=rows,
+            client=client,
+            risk_budget=budget,
+            domain=domain,
+            quote_policy=policy,
+            task_seed=derive_seed(
+                "mirage.v3.task-suite",
+                args.name,
+                args.version,
+                episode,
+                args.seed,
+            ),
+        )
+        for episode, rows in grouped.items()
+    )
+    suite = TaskSuite(
+        name=args.name,
+        version=args.version,
+        split=args.split,
+        tasks=tasks,
+        metadata={
+            "market_csv_sha256": _file_sha256(args.csv),
+            "client_json_sha256": _file_sha256(args.client_json),
+            "risk_budget_json_sha256": _file_sha256(args.risk_budget_json),
+            "quote_policy_json_sha256": _file_sha256(
+                args.quote_policy_json
+            ),
+            "episode_ids": requested,
+            "generator": "frozen-market-episode-import-v1",
+            "generator_seed": args.seed,
+        },
+    )
+    suite.save(args.output)
+    print(
+        json.dumps(
+            {
+                "format": suite.format,
+                "suite_hash": suite.suite_hash,
+                "tasks": len(suite.tasks),
+                "split": suite.split,
+                "output": str(args.output),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
     return 0
+
+
+def _write_v3_aggregate_csv(
+    path: Path,
+    aggregate: dict,
+) -> None:
+    rows: list[dict] = []
+    for policy, policy_payload in aggregate["policies"].items():
+        for metric, values in policy_payload["metrics"].items():
+            rows.append(
+                {
+                    "policy": policy,
+                    "policy_config_hash": policy_payload[
+                        "policy_config_hash"
+                    ],
+                    "metric": metric,
+                    **values,
+                    "suite_hash": aggregate["suite_hash"],
+                }
+            )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        fieldnames = [
+            "policy",
+            "policy_config_hash",
+            "metric",
+            "mean",
+            "ci_low",
+            "ci_high",
+            "n_runs",
+            "n_tasks",
+            "suite_hash",
+        ]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _cmd_evaluate_trajectory(args: argparse.Namespace) -> int:
+    suite_hash = None
+    suite = None
+    if args.suite is not None:
+        suite = TaskSuite.load(args.suite)
+        suite_hash = suite.suite_hash
+    result = replay_and_evaluate(
+        args.trajectory,
+        suite_hash=suite_hash,
+    )
+    if suite is not None and result["task_hash"] not in {
+        task.task_hash for task in suite.tasks
+    }:
+        raise SystemExit(
+            "trajectory task is not a member of the supplied v3 task suite"
+        )
+    _atomic_write_json(args.output, result)
+    print(
+        json.dumps(
+            {
+                "replay_verified": True,
+                "evaluation_hash": result["evaluation_hash"],
+                "task_hash": result["task_hash"],
+                "output": str(args.output),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _cmd_aggregate_v3(args: argparse.Namespace) -> int:
+    paths = sorted(args.results_dir.rglob("*.evaluation.json"))
+    if not paths:
+        raise SystemExit(
+            f"no *.evaluation.json files found in {args.results_dir}"
+        )
+    aggregate = aggregate_evaluations(
+        load_evaluations(paths),
+        n_resamples=args.bootstrap_resamples,
+        seed=args.seed,
+    )
+    save_evaluation_aggregate(args.output_json, aggregate)
+    if args.output_csv is not None:
+        _write_v3_aggregate_csv(args.output_csv, aggregate)
+    print(
+        json.dumps(
+            {
+                "evaluations": aggregate["evaluation_count"],
+                "policies": aggregate["policy_count"],
+                "suite_hash": aggregate["suite_hash"],
+                "output": str(args.output_json),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _cmd_run_v3_suite(args: argparse.Namespace) -> int:
+    suite = TaskSuite.load(args.suite)
+    if (
+        isinstance(args.replicates, bool)
+        or not isinstance(args.replicates, int)
+        or args.replicates < 1
+    ):
+        raise SystemExit("--replicates must be a positive integer")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    evaluations: list[dict] = []
+    failures = 0
+    resumed = 0
+    for index, task in enumerate(suite.tasks):
+        for replicate in range(args.replicates):
+            stem = (
+                f"{index:04d}-r{replicate:03d}-{task.task_hash[:12]}"
+            )
+            trajectory_path = args.output_dir / f"{stem}.trajectory.json"
+            summary_path = args.output_dir / f"{stem}.summary.json"
+            evaluation_path = args.output_dir / f"{stem}.evaluation.json"
+            environment = MirageStructurerEnv(
+                task,
+                max_steps_per_round=args.max_steps_per_round,
+                expose_privileged_info=False,
+            )
+            policy = _create_v3_policy(args)
+            # Replicate seeds are public experiment configuration and are
+            # intentionally shared across tasks. Deriving them from hidden
+            # task hashes would create a policy-input side channel.
+            run_seed = derive_seed(
+                "mirage.v3.suite-policy-replicate",
+                0 if args.seed is None else args.seed,
+                replicate,
+            )
+            if (
+                not args.force
+                and trajectory_path.exists()
+                and summary_path.exists()
+                and TrajectoryRecorder.verify(trajectory_path)
+            ):
+                try:
+                    existing = json.loads(
+                        trajectory_path.read_text(encoding="utf-8")
+                    )
+                    existing_summary = json.loads(
+                        summary_path.read_text(encoding="utf-8")
+                    )
+                    expected_policy = dict(
+                        policy.reproducibility_metadata()
+                    )
+                    matches = (
+                        existing.get("status") == "complete"
+                        and existing.get("run_id_seed") == run_seed
+                        and existing.get("metadata", {}).get("task_hash")
+                        == task.task_hash
+                        and existing.get("environment_configuration")
+                        == environment.configuration
+                        and _sha256_json(
+                            existing.get("policy_run_metadata")
+                        )
+                        == _sha256_json(expected_policy)
+                        and existing_summary.get("suite_hash")
+                        == suite.suite_hash
+                        and existing_summary.get("replicate") == replicate
+                    )
+                    if matches:
+                        evaluation = replay_and_evaluate(
+                            trajectory_path,
+                            output_path=evaluation_path,
+                            suite_hash=suite.suite_hash,
+                        )
+                        evaluations.append(evaluation)
+                        resumed += 1
+                        continue
+                except (
+                    OSError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    pass
+            result = asyncio.run(
+                run_v3_agent_episode(
+                    environment,
+                    policy,
+                    seed=run_seed,
+                    trajectory_path=trajectory_path,
+                    max_history_records=args.history_records,
+                    max_history_chars=args.history_chars,
+                    record_raw_output=not args.redact_raw_output,
+                )
+            )
+            summary = {
+                **result.summary(),
+                "suite_hash": suite.suite_hash,
+                "suite_name": suite.name,
+                "suite_version": suite.version,
+                "suite_split": suite.split,
+                "replicate": replicate,
+                "run_seed": run_seed,
+            }
+            _atomic_write_json(summary_path, summary)
+            evaluation = replay_and_evaluate(
+                trajectory_path,
+                output_path=evaluation_path,
+                suite_hash=suite.suite_hash,
+            )
+            evaluations.append(evaluation)
+            if result.status == "infrastructure_error":
+                failures += 1
+
+    aggregate = aggregate_evaluations(
+        evaluations,
+        n_resamples=args.bootstrap_resamples,
+        seed=args.aggregate_seed,
+    )
+    aggregate_path = args.output_dir / "aggregate.v3.json"
+    save_evaluation_aggregate(aggregate_path, aggregate)
+    _write_v3_aggregate_csv(
+        args.output_dir / "aggregate.v3.csv",
+        aggregate,
+    )
+    run_manifest = {
+        "format": "mirage-suite-run.v3",
+        "suite_hash": suite.suite_hash,
+        "task_count": len(suite.tasks),
+        "replicates": args.replicates,
+        "run_count": len(suite.tasks) * args.replicates,
+        "evaluation_count": len(evaluations),
+        "infrastructure_failures": failures,
+        "resumed_runs": resumed,
+        "aggregate_hash": aggregate["aggregate_hash"],
+        "aggregate_path": str(aggregate_path),
+    }
+    _atomic_write_json(args.output_dir / "run-manifest.v3.json", run_manifest)
+    print(json.dumps(run_manifest, ensure_ascii=False, sort_keys=True))
+    return 2 if failures else 0
 
 
 def _condition_from_id(condition_id: str) -> BenchmarkCondition:
@@ -1437,6 +1857,14 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_aggregate(args)
     if args.command == "judge-runs":
         return _cmd_judge_runs(args)
+    if args.command == "make-v3-suite":
+        return _cmd_make_v3_suite(args)
+    if args.command == "run-v3-suite":
+        return _cmd_run_v3_suite(args)
+    if args.command == "evaluate-trajectory":
+        return _cmd_evaluate_trajectory(args)
+    if args.command == "aggregate-v3":
+        return _cmd_aggregate_v3(args)
     if args.command == "make-manifest":
         payload = manifest_payload(
             build_experiment_manifest(args.episodes, args.models, strategies=tuple(args.strategies))

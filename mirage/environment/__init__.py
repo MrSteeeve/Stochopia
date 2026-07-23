@@ -8,6 +8,7 @@ consume the same typed public boundary.
 
 from .core import ENVIRONMENT_VERSION, PRICING_VERSION, MirageStructurerEnv
 from .agent_runner import (
+    AGENT_PROMPT_VERSION,
     AGENT_REQUEST_SCHEMA,
     AGENT_RUN_SCHEMA,
     AgentActionError,
@@ -29,11 +30,25 @@ from .trajectory import (
     TrajectoryRecorder,
     verify_trajectory,
 )
+from .wrappers import ScalarizedMirageEnv
+from .evaluation import (
+    AGGREGATE_FORMAT,
+    EVALUATION_FORMAT,
+    TASK_SUITE_FORMAT,
+    TaskSuite,
+    aggregate_evaluations,
+    load_evaluations,
+    replay_and_evaluate,
+    replay_and_evaluate_payload,
+    save_evaluation_aggregate,
+)
 from .types import (
     REWARD_SCHEMA_VERSION,
     SCALARIZATION_VERSION,
     TASK_SCHEMA,
     TASK_VERSION,
+    V3_PUBLIC_CLIENT_ALIAS,
+    V3_PUBLIC_NOTIONAL_BASE,
     Action,
     AskClient,
     ConstraintSignals,
@@ -55,13 +70,19 @@ from .types import (
 __all__ = [
     "AGENT_REQUEST_SCHEMA",
     "AGENT_RUN_SCHEMA",
+    "AGENT_PROMPT_VERSION",
     "ENVIRONMENT_VERSION",
+    "EVALUATION_FORMAT",
     "PRICING_VERSION",
     "REWARD_SCHEMA_VERSION",
+    "AGGREGATE_FORMAT",
     "SCALARIZATION_VERSION",
     "TASK_SCHEMA",
+    "TASK_SUITE_FORMAT",
     "TASK_VERSION",
     "TRAJECTORY_FORMAT",
+    "V3_PUBLIC_CLIENT_ALIAS",
+    "V3_PUBLIC_NOTIONAL_BASE",
     "Action",
     "AgentActionError",
     "AgentDecision",
@@ -81,6 +102,7 @@ __all__ = [
     "RewardComponents",
     "RewardTerm",
     "ScalarizationSpec",
+    "ScalarizedMirageEnv",
     "Skip",
     "StepTransition",
     "SubmitDesign",
@@ -88,10 +110,16 @@ __all__ = [
     "TrajectoryEntry",
     "TrajectoryMetadata",
     "TrajectoryRecorder",
+    "TaskSuite",
     "verify_trajectory",
     "create_api_agent_policy",
     "load_agent_system_prompt",
     "parse_environment_action",
     "run_agent_episode",
+    "aggregate_evaluations",
+    "load_evaluations",
+    "replay_and_evaluate",
+    "replay_and_evaluate_payload",
+    "save_evaluation_aggregate",
     "scalarize_reward",
 ]

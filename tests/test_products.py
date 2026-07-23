@@ -338,14 +338,56 @@ def test_parse_product_spec_rejects_barrier_direction_on_non_barrier_product():
 def test_parse_product_spec_autocallable_needs_coupon():
     """autocallable / snowball 类型必须提供 coupon_rate。"""
     with pytest.raises(ProductError, match="coupon_rate"):
-        parse_product_spec(_valid_payload(product_type="autocallable"))
-    spec = parse_product_spec(_valid_payload(product_type="autocallable", coupon_rate=0.08))
+        parse_product_spec(
+            _valid_payload(product_type="autocallable", principal_protected=True)
+        )
+    spec = parse_product_spec(
+        _valid_payload(
+            product_type="autocallable",
+            coupon_rate=0.08,
+            principal_protected=True,
+        )
+    )
     assert spec.coupon_rate == 0.08
 
     with pytest.raises(ProductError, match="coupon_rate"):
         parse_product_spec(_valid_payload(product_type="snowball"))
     spec = parse_product_spec(_valid_payload(product_type="snowball", coupon_rate=0.12))
     assert spec.coupon_rate == 0.12
+
+
+def test_parse_product_spec_autocallable_requires_coherent_loss_semantics():
+    with pytest.raises(ProductError, match="非保本 autocallable"):
+        parse_product_spec(
+            _valid_payload(
+                product_type="autocallable",
+                coupon_rate=0.08,
+                principal_protected=False,
+            )
+        )
+
+    with pytest.raises(ProductError, match="保本 autocallable"):
+        parse_product_spec(
+            _valid_payload(
+                product_type="autocallable",
+                coupon_rate=0.08,
+                principal_protected=True,
+                barrier_pct=0.85,
+                barrier_type="knock_in",
+            )
+        )
+
+    spec = parse_product_spec(
+        _valid_payload(
+            product_type="autocallable",
+            coupon_rate=0.08,
+            principal_protected=False,
+            barrier_pct=0.85,
+            barrier_type="knock_in",
+        )
+    )
+    assert spec.principal_protected is False
+    assert spec.barrier_pct == pytest.approx(0.85)
 
 
 def test_parse_product_spec_rejects_non_dict():

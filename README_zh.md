@@ -10,6 +10,7 @@ MIRAGE 评估 LLM 能否在部分可观测、有限的交易台/客户/风控交
 
 - `mirage.environment` 是新的 **v3-spine / Level-0** 训练接口：部分可观测与动态状态是环境不变量，动作和转移都有类型，`MirageStructurerEnv.reset()/step()` 内不调用 LLM，也不包含 forced prompt、策略规则或 oracle。默认不返回 evaluator 特权状态，并以有限的每轮 step 上限阻止 rollout 无限挂起。
 - CLI 现在提供 v3 原生的`test-agent`入口；其余析因命令与`LongHorizonEnvironment`明确保留为 **v2 遗留 benchmark**，用于复现已经冻结的 v2 运行。Full/Static 不再是 v3 任务条件，v2 与 v3 产物不得混合汇总。
+- 每个 Agent 请求现在都携带完整、机器可读的动作契约。成交头寸会更新权威的客户/dealer账户，生命周期结果会进入 reward vector，episode 结束时所有未平仓合约都会按当前公允价值清算。
 - v2 的动态头寸也已改为保存发行定盘价与绝对合约水平，处理障碍/敲入/自动赎回观察，并在下一市场快照重新计算 FV、delta、vega 与压力损失。
 
 > 早期的纳斯达克100“Structurer Playground”原型（`run.py`、`mirage.cli`、`mirage.engine`）已下线，这条入口在当前仓库中已不存在。`scenarios/structurer_nasdaq/`目录仅作为历史场景数据保留，无法通过任何现有命令运行。
@@ -50,10 +51,12 @@ MIRAGE 需要 Python 3.10 或更高版本。
 
 ```bash
 cd MIRAGE
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+uv sync --locked --all-extras --dev
 ```
+
+`uv.lock`是开发与 CI 使用的可复现依赖集合。传统的
+`python3 -m venv .venv && pip install -e ".[dev]"`仍可用于本地实验，但不属于
+冻结环境。
 
 真实调用模型前，先配置 API key：
 
@@ -93,6 +96,20 @@ transition = env.step(Skip("typed v3 smoke test"))
 print(observation.available_actions, transition.observation.round_num, info["seed_role"])
 ```
 
+### v3 的可信结构：input -> interaction -> output -> evaluation
+
+| 阶段 | 冻结或公开的对象 | 仅环境/evaluator 可见的真值 |
+|---|---|---|
+| Input | 带版本的`TaskSuite`、公开市场 observation、公开 action schema、固定公开名义本金网格 | 客户 mandate、风险限额、报价 policy 和完整 task manifest |
+| Interaction | `ask_client`、`request_quote`、`submit_design`、`submit_product`、`skip` | 确定性定价、账户、约束和生命周期状态 |
+| Output | 一条带哈希链的 trajectory，含动作、观察、reward vector、constraint signals 与运行来源 | 同一产物密封保存完整 task manifest 供重放，但绝不发送给策略 |
+| Evaluation | 经重放验证的逐 task 指标，以及按 task 聚类的 policy 汇总 | evaluator 从密封输入独立重建精确经济状态 |
+
+每个 v3 task 的最后一张快照是终端估值真值，不是新的决策轮。因此在最后
+决策快照发行的合约，至少会经历一个市场区间，之后才到期或在 horizon
+清算。训练代码必须通过`ScalarizedMirageEnv`和带版本的
+`ScalarizationSpec`显式选择标量奖励；核心环境不会暗中决定权重。
+
 真实 Agent 通过 v3 原生的`test-agent`命令测试。本地可执行程序每一步从
 stdin 接收一个带版本的 JSON 请求，并向 stdout 输出一个动作 JSON：
 
@@ -122,10 +139,49 @@ mirage-benchmark test-agent scenarios/mirage_csi/market_snapshots.example.csv \
   --summary-output outputs/v3-api-agent.summary.json
 ```
 
+正式评测不应只跑单个冒烟 episode。先冻结 task suite，再让同一策略跑完整
+suite，最后独立经济重放与汇总：
+
+```bash
+mirage-benchmark make-v3-suite market_snapshots.csv \
+  --episodes CSI500_2024H1 CSI500_2024H2 \
+  --client-json client.json --risk-budget-json risk_budget.json \
+  --name mirage-dev --version 1 --split dev \
+  --output tasks/mirage-dev.v3.json
+
+mirage-benchmark run-v3-suite tasks/mirage-dev.v3.json \
+  --agent-command 'python my_agent.py' \
+  --replicates 3 \
+  --output-dir outputs/mirage-dev \
+  --bootstrap-resamples 10000
+
+mirage-benchmark evaluate-trajectory \
+  outputs/mirage-dev/0000-r000-TASKHASH.trajectory.json \
+  --suite tasks/mirage-dev.v3.json \
+  --output outputs/replayed.evaluation.json
+
+mirage-benchmark aggregate-v3 outputs/mirage-dev \
+  --output-json outputs/mirage-dev.aggregate.json \
+  --output-csv outputs/mirage-dev.aggregate.csv
+```
+
+`run-v3-suite`只会复用 task、公开 run seed、环境配置和策略配置仍一致，并且
+能够通过经济重放的完整轨迹；partial 或陈旧运行会重新执行。需要主动重跑
+匹配产物时使用`--force`。
+
 Python 侧使用`CommandAgentPolicy`、`LLMAgentPolicy`/
-`create_api_agent_policy`和`run_agent_episode`走同一边界。传输或 schema
-错误会成为轨迹中可见的 invalid action，并消耗正常 step 预算；隐藏客户状态
-永远不会发给策略。
+`create_api_agent_policy`和`run_agent_episode`走同一边界。模型输出的动作
+格式错误会成为轨迹中可见的 invalid action；供应商、网络、命令退出与超时
+故障则以`infrastructure_error`终止，不推进环境、不消耗 step，也不污染
+invalid-action 计数。超时命令的整个进程组都会被清理。隐藏客户状态永远不会
+发给策略。
+
+保存的轨迹包含公开动作 schema、环境配置、reset options、公开 run seed、
+prompt/model 参数、依赖版本、实现哈希和 Git 工作树状态。哈希通过不等于经济
+验证通过：`evaluate-trajectory`会重建 task，并要求每一个 transition 与
+全新重放逐项一致。Agent summary 直接给出累计 reward/constraint 统计。
+这不代表尚未实现的 TaskGenerator、repair teacher、counterfactual pair
+exporter、payoff DSL/solve-for 或 fast/reference pricer 已经完成。
 
 `mirage-benchmark`还保留了下面的 legacy v2 析因命令，以便复现冻结的 v2
 实验（`python -m mirage.benchmark_cli`效果相同）：

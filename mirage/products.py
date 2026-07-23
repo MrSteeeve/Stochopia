@@ -436,6 +436,24 @@ def parse_product_spec(data: dict) -> ProductSpec:
     if not isinstance(principal_protected, bool):
         errors.append(f"principal_protected 必须是布尔值，实际为 {principal_protected!r}")
 
+    if product_type == "autocallable" and isinstance(principal_protected, bool):
+        if principal_protected and barrier_pct is not None:
+            errors.append(
+                "Level-0 保本 autocallable 不接受无经济作用的 knock-in barrier"
+            )
+        if not principal_protected and barrier_pct is None:
+            errors.append(
+                "Level-0 非保本 autocallable 必须设置实际承担损失的 knock-in barrier"
+            )
+        if barrier_pct is not None and (
+            barrier_type != "knock_in"
+            or not _is_finite_number(barrier_pct)
+            or barrier_pct >= 1.0
+        ):
+            errors.append(
+                "Level-0 autocallable barrier 必须是低于 1.0 的 knock_in"
+            )
+
     inferred_funding_style = (
         "funded_note"
         if principal_protected is True or product_type in {"autocallable", "snowball"}

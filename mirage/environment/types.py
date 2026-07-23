@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date
 from typing import Any, Literal, Mapping, TypeAlias
 
@@ -25,9 +25,11 @@ from ..products import ClientProfile, ProductSpec
 
 
 TASK_SCHEMA = "mirage.environment.task.v3"
-TASK_VERSION = "v3-spine-level0.1-economic-ledger"
-REWARD_SCHEMA_VERSION = "mirage.reward-vector.v2"
+TASK_VERSION = "v3-spine-level0.3-terminal-evaluation"
+REWARD_SCHEMA_VERSION = "mirage.reward-vector.v4"
 SCALARIZATION_VERSION = "mirage.scalarization.explicit.v1"
+V3_PUBLIC_NOTIONAL_BASE = 10_000_000.0
+V3_PUBLIC_CLIENT_ALIAS = "current_client"
 
 
 def _manifest_default(value: Any) -> Any:
@@ -59,8 +61,20 @@ class EpisodeTask:
         # A tuple prevents callers from changing episode length/order through a
         # list after construction.  Nested v2 values are copied by reset().
         object.__setattr__(self, "snapshots", tuple(self.snapshots))
-        if not self.snapshots:
-            raise ValueError("EpisodeTask.snapshots must not be empty")
+        if len(self.snapshots) < 2:
+            raise ValueError(
+                "EpisodeTask requires at least one decision snapshot and one "
+                "terminal valuation snapshot"
+            )
+        if self.domain.public_notional_base is None:
+            object.__setattr__(
+                self,
+                "domain",
+                replace(
+                    self.domain,
+                    public_notional_base=V3_PUBLIC_NOTIONAL_BASE,
+                ),
+            )
         if isinstance(self.task_seed, bool) or not isinstance(self.task_seed, int):
             raise TypeError("EpisodeTask.task_seed must be an int")
         if not isinstance(self.schema, str) or not self.schema.strip():
@@ -73,6 +87,11 @@ class EpisodeTask:
         rounds = [snapshot.round_num for snapshot in self.snapshots]
         if rounds != list(range(1, len(rounds) + 1)):
             raise ValueError("EpisodeTask snapshot rounds must be contiguous from one")
+        dates = [snapshot.as_of for snapshot in self.snapshots]
+        if any(right <= left for left, right in zip(dates, dates[1:])):
+            raise ValueError(
+                "EpisodeTask snapshot dates must be strictly increasing"
+            )
         for snapshot in self.snapshots:
             required = (
                 snapshot.spot,
@@ -139,6 +158,26 @@ class EpisodeTask:
     def task_hash(self) -> str:
         return hashlib.sha256(self._manifest_json.encode("utf-8")).hexdigest()
 
+    @property
+    def public_task_id(self) -> str:
+        """Non-privileged task-family identifier safe to expose to a policy."""
+
+        payload = {
+            "schema": self.schema,
+            "version": self.version,
+            "underlyings": sorted({item.underlying for item in self.snapshots}),
+            "decision_intervals": len(self.snapshots) - 1,
+            "domain_version": self.domain.version,
+            "public_notional_base": self.domain.public_notional_base,
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"public-{hashlib.sha256(encoded).hexdigest()[:16]}"
+
     def materialize(self) -> tuple[
         tuple[MarketSnapshot, ...],
         ClientProfile,
@@ -176,6 +215,57 @@ class EpisodeTask:
         quote_policy = QuotePolicy(**payload["quote_policy"])
         return snapshots, client, risk_budget, domain, quote_policy
 
+    @classmethod
+    def from_manifest(cls, manifest: Mapping[str, Any]) -> "EpisodeTask":
+        """Reconstruct and revalidate a task from a stored canonical manifest."""
+
+        payload = json.loads(
+            json.dumps(
+                dict(manifest),
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
+        try:
+            snapshots = tuple(
+                MarketSnapshot(
+                    **{
+                        **row,
+                        "as_of": date.fromisoformat(row["as_of"]),
+                    }
+                )
+                for row in payload["snapshots"]
+            )
+            client = ClientProfile(**payload["client"])
+            risk_budget = RiskBudget(**payload["risk_budget"])
+            domain_payload = payload["domain"]
+            for name in (
+                "product_types",
+                "notional_fractions",
+                "maturities",
+                "strikes",
+                "barriers",
+                "coupons",
+                "participations",
+                "principal_protected",
+            ):
+                domain_payload[name] = tuple(domain_payload[name])
+            domain = ProductDomainSpec(**domain_payload)
+            quote_policy = QuotePolicy(**payload["quote_policy"])
+            return cls(
+                snapshots=snapshots,
+                client=client,
+                risk_budget=risk_budget,
+                domain=domain,
+                quote_policy=quote_policy,
+                task_seed=payload["task_seed"],
+                schema=payload["schema"],
+                version=payload["version"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid EpisodeTask manifest: {exc}") from exc
+
 
 @dataclass(frozen=True)
 class Observation:
@@ -190,7 +280,7 @@ class Observation:
 
     schema: str
     task_version: str
-    episode_id: str
+    public_task_id: str
     round_num: int
     step_index: int
     state_version: str
@@ -393,7 +483,7 @@ class RewardComponents:
     operational_cost: RewardTerm = field(default_factory=_unavailable_reward)
     terminal_lifecycle_pnl: RewardTerm = field(
         default_factory=lambda: RewardTerm.unavailable(
-            "requires-realised-hedge-and-transaction-cost-ledger",
+            "no-lifecycle-event-this-step",
             units="CNY",
         )
     )
@@ -463,6 +553,14 @@ class ScalarizationSpec:
             for value in self.weights.values()
         ):
             raise ValueError("scalarization weights must be finite")
+        if (
+            self.weights.get("dealer_economics", 0.0) != 0.0
+            and self.weights.get("terminal_lifecycle_pnl", 0.0) != 0.0
+        ):
+            raise ValueError(
+                "one scalarization cannot combine ex-ante dealer_economics "
+                "with ex-post terminal_lifecycle_pnl"
+            )
 
 
 def scalarize_reward(
@@ -475,6 +573,8 @@ def scalarize_reward(
     for name, weight in spec.weights.items():
         term = getattr(reward, name)
         if not term.available:
+            if term.provenance == "no-lifecycle-event-this-step":
+                continue
             raise ValueError(f"cannot scalarize unavailable component {name!r}")
         value = (
             term.normalized_value

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mirage-bench"
-version = "0.1.0"
-description = "MIRAGE：中证指数结构化产品设计 LLM benchmark"
+version = "0.2.0"
+description = "MIRAGE：面向 LLM Agent 的结构化衍生品动态训练与评测环境"
 requires-python = ">=3.10"
 dependencies = [
     "httpx",

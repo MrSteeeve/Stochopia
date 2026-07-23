@@ -192,8 +192,10 @@ def test_partial_information_topic_gate_and_budget():
     env.query_client("protection")
     with pytest.raises(BenchmarkError, match="budget exhausted"):
         env.query_client("preferences")
+    invalid = make_env()
     with pytest.raises(BenchmarkError, match="unknown client topic"):
-        make_env().query_client("tell_me_everything")
+        invalid.query_client("What is your loss tolerance?")
+    assert invalid.query_count == 0
 
 
 def test_full_information_discloses_constraints():
@@ -285,12 +287,13 @@ def test_domain_membership_is_agent_oracle_symmetric():
     assert not domain_check.passed
 
 
-def test_out_of_domain_product_is_refused_a_feasible_quote():
+def test_out_of_domain_product_is_rejected_without_spending_quote_budget():
     env = make_env(cli=permissive_client())
-    payload = env.request_quote(product(notional=1_100_000))  # out of lattice
-    assert payload["hard_pass"] is False
-    failed = {c["check_id"] for c in payload["checks"] if c["status"] == "FAIL"}
-    assert "DOMAIN" in failed
+    with pytest.raises(BenchmarkError, match="DOMAIN"):
+        env.request_quote(product(notional=1_100_000))  # out of lattice
+
+    assert env.quote_count == 0
+    assert env.quotes == {}
 
 
 def test_one_step_attainment_never_exceeds_one():
@@ -578,6 +581,15 @@ def test_maturity_closes_position_into_cashflow_and_zero_sum_pnl_ledger():
     assert result["accepted"] is True
     assert len(env.portfolio.cashflow_ledger) == 1
     assert env.portfolio.cashflow_ledger[0].event_type == "issuance"
+    assert result["client_account"]["available_cash"] == pytest.approx(
+        result["client_account"]["initial_cash"] - quote["cash_outlay"]
+    )
+    assert result["client_account"]["locked_cash"] == pytest.approx(
+        quote["cash_outlay"]
+    )
+    assert result["dealer_account"]["model_equity"] == pytest.approx(
+        quote["dealer_fee"]
+    )
 
     closed = env.advance_round()
 
@@ -585,15 +597,85 @@ def test_maturity_closes_position_into_cashflow_and_zero_sum_pnl_ledger():
     assert env.portfolio.positions == []
     assert len(env.portfolio.closed_positions) == 1
     assert len(env.portfolio.lifecycle_events) == 1
-    assert len(env.portfolio.cashflow_ledger) == 2
     event = env.portfolio.lifecycle_events[0]
+    expected_cashflows = 2 + int(abs(event.dealer_hedge_pnl) > 1e-12)
+    assert len(env.portfolio.cashflow_ledger) == expected_cashflows
     assert event.close_reason == "matured"
     assert event.client_realized_pnl + event.dealer_liability_realized_pnl == pytest.approx(
         0.0, abs=1e-12
     )
-    assert event.dealer_hedge_pnl is None
+    assert event.dealer_hedged_realized_pnl == pytest.approx(
+        event.dealer_liability_realized_pnl + event.dealer_hedge_pnl
+    )
     assert event.transaction_costs is None
     assert event.dealer_total_pnl is None
+
+    client_account = env.portfolio.client_account
+    assert client_account is not None
+    assert client_account.locked_cash == pytest.approx(0.0)
+    assert client_account.realised_pnl == pytest.approx(event.client_realized_pnl)
+    assert client_account.available_cash == pytest.approx(
+        client_account.initial_cash + event.client_realized_pnl
+    )
+
+    dealer_account = env.portfolio.dealer_account
+    assert dealer_account is not None
+    assert dealer_account.realised_liability_pnl == pytest.approx(
+        event.dealer_liability_realized_pnl
+    )
+    assert dealer_account.realised_hedged_pnl == pytest.approx(
+        event.dealer_hedged_realized_pnl
+    )
+    dealer_snapshot = dealer_account.snapshot(
+        active_liability_fair_value=0.0,
+        active_stress=0.0,
+    )
+    assert dealer_snapshot["model_equity"] == pytest.approx(
+        event.dealer_hedged_realized_pnl
+    )
+    assert dealer_snapshot["risk_capital_equity"] == pytest.approx(
+        dealer_account.risk_capital_limit + event.dealer_hedged_realized_pnl
+    )
+
+
+def test_realised_client_loss_reduces_next_round_investable_cash():
+    account_domain = ProductDomainSpec(
+        product_types=("vanilla_call",),
+        notional_fractions=(.05, 1.0),
+        maturities=(1,),
+        strikes=(1.0,),
+        barriers=(.85,),
+        coupons=(.08,),
+        participations=(1.0,),
+        principal_protected=(False, True),
+    )
+    env = make_env(
+        full=True,
+        dynamic=True,
+        cli=permissive_client(),
+        domain=account_domain,
+    )
+    loss_quote = env.request_quote(
+        product(maturity=1, protected=False, notional=1_000_000)
+    )
+    assert env.submit_design(loss_quote["quote_id"])["accepted"] is True
+    env.advance_round()
+    assert env.portfolio.client_account is not None
+    assert env.portfolio.client_account.available_cash < 20_000_000
+
+    next_quote = env.request_quote(
+        product(maturity=1, protected=True, notional=20_000_000)
+    )
+    capital_check = next(
+        item
+        for item in next_quote["checks"]
+        if item["check_id"] == "CLIENT_CAPITAL"
+    )
+    assert capital_check["status"] == "FAIL"
+    assert capital_check["observed"] == pytest.approx(20_000_000)
+    assert capital_check["limit"] == pytest.approx(
+        env.portfolio.client_account.available_cash
+    )
 
 
 def test_round_overrides_are_resolved_on_every_benchmark_round():

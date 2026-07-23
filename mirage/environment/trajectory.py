@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import subprocess
 import tempfile
 from dataclasses import dataclass, fields, is_dataclass
@@ -24,9 +25,28 @@ from .types import (
 )
 
 
-TRAJECTORY_FORMAT = "mirage-trajectory-json-v2"
+TRAJECTORY_FORMAT = "mirage-trajectory-json-v3"
 ACTION_SCHEMA_VERSION = "mirage.environment.action.v3"
 CONSTRAINT_SCHEMA_VERSION = "mirage.constraint-signals.v1"
+_RUNTIME_DISTRIBUTIONS = (
+    "httpx",
+    "PyYAML",
+    "rich",
+    "python-dotenv",
+    "tushare",
+)
+_IMPLEMENTATION_FILES = (
+    "benchmark.py",
+    "benchmark_cli.py",
+    "pricing.py",
+    "products.py",
+    "environment/agent_runner.py",
+    "environment/core.py",
+    "environment/evaluation.py",
+    "environment/trajectory.py",
+    "environment/types.py",
+    "environment/wrappers.py",
+)
 
 
 def to_jsonable(value: Any) -> Any:
@@ -105,12 +125,58 @@ def _installed_package_version() -> str:
         return source_package_version
 
 
+def _dependency_versions() -> dict[str, str]:
+    versions = {
+        "python": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+    }
+    for distribution in _RUNTIME_DISTRIBUTIONS:
+        try:
+            versions[distribution] = package_version(distribution)
+        except PackageNotFoundError:
+            versions[distribution] = "not-installed"
+    return versions
+
+
 def _implementation_hash() -> str:
-    pricing_path = Path(__file__).resolve().parents[1] / "pricing.py"
+    package_root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
     try:
-        return hashlib.sha256(pricing_path.read_bytes()).hexdigest()
+        for relative in _IMPLEMENTATION_FILES:
+            path = package_root / relative
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        return digest.hexdigest()
     except OSError:
         return "unavailable"
+
+
+def _git_worktree_state() -> tuple[bool | None, str]:
+    """Hash tracked worktree/index changes without reading untracked files."""
+
+    root = Path(__file__).resolve().parents[2]
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=no"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            timeout=3,
+        ).stdout
+        diff = subprocess.run(
+            ["git", "diff", "--binary", "HEAD", "--"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            timeout=5,
+        ).stdout
+        return bool(status.strip()), hashlib.sha256(
+            status + b"\0" + diff
+        ).hexdigest()
+    except (OSError, subprocess.SubprocessError):
+        return None, "unavailable"
 
 
 @dataclass(frozen=True)
@@ -124,12 +190,19 @@ class TrajectoryMetadata:
     level: str
     task_hash: str
     environment_config_hash: str
+    reset_options_hash: str
     action_schema_version: str
     reward_schema_version: str
     constraint_schema_version: str
     package_version: str
+    installed_distribution_version: str
     git_sha: str
-    pricing_implementation_hash: str
+    implementation_hash: str
+    worktree_dirty: bool | None
+    worktree_state_hash: str
+    dependency_versions_hash: str
+    policy_run_metadata_hash: str
+    public_action_schema_hash: str
 
 
 @dataclass(frozen=True)
@@ -159,6 +232,7 @@ class TrajectoryRecorder:
         initial_state_hash: str | None = None,
         environment_version: str | None = None,
         pricing_version: str | None = None,
+        run_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         if isinstance(task_or_env, EpisodeTask):
             task = task_or_env
@@ -174,6 +248,24 @@ class TrajectoryRecorder:
         )
         price_version = pricing_version or getattr(env, "pricing_version", PRICING_VERSION)
         environment_config = getattr(env, "configuration", {"unbound_environment": True})
+        reset_options = (
+            getattr(env, "reset_options", {})
+            if env is not None and getattr(env, "is_reset", False)
+            else {}
+        )
+        run_id_seed = (
+            getattr(env, "run_id_seed", task.task_seed)
+            if env is not None and getattr(env, "is_reset", False)
+            else task.task_seed
+        )
+        dependencies = _dependency_versions()
+        policy_run_metadata = dict(run_metadata or {})
+        public_action_schema = (
+            getattr(env, "action_schema", {"unbound_environment": True})
+            if env is not None and getattr(env, "is_reset", False)
+            else {"unbound_environment": True}
+        )
+        worktree_dirty, worktree_state_hash = _git_worktree_state()
         self.metadata = TrajectoryMetadata(
             schema_version=task.schema,
             environment_version=str(env_version),
@@ -182,14 +274,36 @@ class TrajectoryRecorder:
             level=str(getattr(env, "level", "Level0")),
             task_hash=task.task_hash,
             environment_config_hash=_digest(environment_config),
+            reset_options_hash=_digest(reset_options),
             action_schema_version=ACTION_SCHEMA_VERSION,
             reward_schema_version=REWARD_SCHEMA_VERSION,
             constraint_schema_version=CONSTRAINT_SCHEMA_VERSION,
-            package_version=_installed_package_version(),
+            package_version=source_package_version,
+            installed_distribution_version=_installed_package_version(),
             git_sha=_git_sha(),
-            pricing_implementation_hash=_implementation_hash(),
+            implementation_hash=_implementation_hash(),
+            worktree_dirty=worktree_dirty,
+            worktree_state_hash=worktree_state_hash,
+            dependency_versions_hash=_digest(dependencies),
+            policy_run_metadata_hash=_digest(policy_run_metadata),
+            public_action_schema_hash=_digest(public_action_schema),
         )
         self._task_manifest = _freeze_json(_json_snapshot(task.manifest))
+        self._environment_configuration = _freeze_json(
+            _json_snapshot(environment_config)
+        )
+        self._reset_options = _freeze_json(_json_snapshot(reset_options))
+        self._run_id_seed = int(run_id_seed)
+        self._dependency_versions = _freeze_json(
+            _json_snapshot(dependencies)
+        )
+        self._policy_run_metadata = _freeze_json(
+            _json_snapshot(policy_run_metadata)
+        )
+        self._public_action_schema = _freeze_json(
+            _json_snapshot(public_action_schema)
+        )
+        self._run_outcome: Mapping[str, Any] | None = None
         if initial_state_hash is None and env is not None and getattr(env, "is_reset", False):
             initial_state_hash = str(env.state_hash)
         self._initial_state_hash = initial_state_hash
@@ -237,6 +351,8 @@ class TrajectoryRecorder:
         info = transition_snapshot.get("info")
         if not isinstance(info, Mapping):
             raise ValueError("transition.info must serialize to an object")
+        if info.get("run_id_seed") != self._run_id_seed:
+            raise ValueError("transition run_id_seed disagrees with trajectory")
         info_hash = info.get("state_hash")
         if (
             info_hash is not None
@@ -266,11 +382,35 @@ class TrajectoryRecorder:
 
     append = record
 
+    def mark_run_outcome(
+        self,
+        status: str,
+        details: Mapping[str, Any],
+    ) -> None:
+        """Commit a non-environment terminal runner outcome to the trajectory."""
+
+        if status != "infrastructure_error":
+            raise ValueError("unsupported partial run outcome")
+        if self._entries and (
+            self._entries[-1].transition.get("terminated")
+            or self._entries[-1].transition.get("truncated")
+        ):
+            raise ValueError("cannot attach a partial outcome after environment end")
+        self._run_outcome = _freeze_json(
+            _json_snapshot(
+                {
+                    "status": status,
+                    "details": dict(details),
+                }
+            )
+        )
+
     def _genesis_hash(self) -> str:
         return _digest(
             {
                 "format": TRAJECTORY_FORMAT,
                 "metadata": self.metadata,
+                "run_id_seed": self._run_id_seed,
                 "initial_state_hash": self._initial_state_hash,
             }
         )
@@ -312,6 +452,15 @@ class TrajectoryRecorder:
             "format": TRAJECTORY_FORMAT,
             "metadata": to_jsonable(self.metadata),
             "task_manifest": to_jsonable(self._task_manifest),
+            "environment_configuration": to_jsonable(
+                self._environment_configuration
+            ),
+            "reset_options": to_jsonable(self._reset_options),
+            "dependency_versions": to_jsonable(self._dependency_versions),
+            "policy_run_metadata": to_jsonable(self._policy_run_metadata),
+            "public_action_schema": to_jsonable(self._public_action_schema),
+            "run_outcome": to_jsonable(self._run_outcome),
+            "run_id_seed": self._run_id_seed,
             "initial_state_hash": self._initial_state_hash,
             "genesis_hash": self._genesis_hash(),
             "status": "complete" if terminal else "partial",
@@ -386,17 +535,26 @@ class TrajectoryRecorder:
                 "level",
                 "task_hash",
                 "environment_config_hash",
+                "reset_options_hash",
                 "action_schema_version",
                 "reward_schema_version",
                 "constraint_schema_version",
                 "package_version",
+                "installed_distribution_version",
                 "git_sha",
-                "pricing_implementation_hash",
+                "implementation_hash",
+                "worktree_state_hash",
+                "dependency_versions_hash",
+                "policy_run_metadata_hash",
+                "public_action_schema_hash",
             )
             if any(not isinstance(metadata.get(key), str) or not metadata[key] for key in required_versions):
                 return False
             initial_state_hash = payload.get("initial_state_hash")
             if not isinstance(initial_state_hash, str) or not initial_state_hash:
+                return False
+            run_id_seed = payload.get("run_id_seed")
+            if isinstance(run_id_seed, bool) or not isinstance(run_id_seed, int):
                 return False
             task_manifest = payload.get("task_manifest")
             if not isinstance(task_manifest, Mapping):
@@ -405,10 +563,54 @@ class TrajectoryRecorder:
                 return False
             if metadata.get("schema_version") != task_manifest.get("schema"):
                 return False
+            environment_configuration = payload.get(
+                "environment_configuration"
+            )
+            reset_options = payload.get("reset_options")
+            dependency_versions = payload.get("dependency_versions")
+            policy_run_metadata = payload.get("policy_run_metadata")
+            public_action_schema = payload.get("public_action_schema")
+            if not all(
+                isinstance(value, Mapping)
+                for value in (
+                    environment_configuration,
+                    reset_options,
+                    dependency_versions,
+                    policy_run_metadata,
+                    public_action_schema,
+                )
+            ):
+                return False
+            if (
+                _digest(environment_configuration)
+                != metadata["environment_config_hash"]
+                or _digest(reset_options) != metadata["reset_options_hash"]
+                or _digest(dependency_versions)
+                != metadata["dependency_versions_hash"]
+                or _digest(policy_run_metadata)
+                != metadata["policy_run_metadata_hash"]
+                or _digest(public_action_schema)
+                != metadata["public_action_schema_hash"]
+            ):
+                return False
+            worktree_dirty = metadata.get("worktree_dirty")
+            if worktree_dirty is not None and not isinstance(
+                worktree_dirty, bool
+            ):
+                return False
+            run_outcome = payload.get("run_outcome")
+            if run_outcome is not None:
+                if (
+                    not isinstance(run_outcome, Mapping)
+                    or run_outcome.get("status") != "infrastructure_error"
+                    or not isinstance(run_outcome.get("details"), Mapping)
+                ):
+                    return False
             genesis = _digest(
                 {
                     "format": TRAJECTORY_FORMAT,
                     "metadata": metadata,
+                    "run_id_seed": run_id_seed,
                     "initial_state_hash": initial_state_hash,
                 }
             )
@@ -445,6 +647,8 @@ class TrajectoryRecorder:
                 info = transition.get("info")
                 if not isinstance(info, Mapping) or info.get("state_hash") != state_hash_after:
                     return False
+                if info.get("run_id_seed") != run_id_seed:
+                    return False
                 expected_record_hash = _digest(
                     {
                         "metadata": to_jsonable(metadata),
@@ -464,6 +668,8 @@ class TrajectoryRecorder:
             if status == "complete" and (not entries or not terminal_seen):
                 return False
             if status == "partial" and terminal_seen:
+                return False
+            if status == "complete" and run_outcome is not None:
                 return False
             expected_final_record = (
                 previous_record_hash if entries else genesis
