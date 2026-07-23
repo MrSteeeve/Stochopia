@@ -1,5 +1,11 @@
 name: "MIRAGE CSI Long-Horizon Benchmark"
 status: "research protocol; public historical snapshots pending provenance audit"
+protocol_version: "mirage-v2-legacy"
+successor_environment:
+  version: "v3-spine-level0"
+  implementation: "mirage.environment"
+  invariants: [partial_observability, dynamic_state]
+  artifact_policy: "do not pool v2 and v3 trajectories or metrics"
 warmup_period: ["2022-01-01", "2022-12-31"]
 evaluation_period: ["2023-01-01", "2025-12-31"]
 round_frequency: "month_end"
@@ -13,7 +19,7 @@ product_families:
   - barrier_put
   - autocallable
   - snowball
-conditions:
+conditions:  # v2 legacy factorial cells; not v3 task conditions
   - full_static
   - full_dynamic
   - partial_static
@@ -43,4 +49,3 @@ risk_budget_calibration:
 private_data_policy: >-
   Workflow informed by institutional practices; all released scenarios, clients,
   limits and rules are synthetic and contain no identifiable institution or client data.
-

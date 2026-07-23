@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from itertools import product
 from typing import Mapping
@@ -97,7 +98,11 @@ def manifest_payload(jobs: list[ExperimentJob]) -> dict:
             # other metric is exploratory. Names are the v2 canonical fields
             # (see REDESIGN_PLAN.md §4): hard_executable feasibility plus the
             # margin-family economic outcome.
-            "primary_outcomes": ["hard_feasibility_rate", "total_dealer_margin"],
+            "primary_outcomes": [
+                "hard_execution_rate",
+                "settlement_acceptance_rate",
+                "total_dealer_margin",
+            ],
         },
     }
 
@@ -115,10 +120,11 @@ def paired_condition_contrasts(
     Episode is the primary replication/clustering unit (temperature=0 makes
     within-cell replicate seeds near-redundant; see REDESIGN_PLAN.md §4).
     Rows are first collapsed to one mean per (episode, model, strategy,
-    condition) cell (averaging across replicates), then matched into paired
-    differences across conditions within each (episode, model, strategy)
-    base -- these paired differences are the unit fed to bootstrap/Wilcoxon/
-    permutation tests. The two named contrasts (dynamic degradation, partial
+    condition) cell (averaging across replicates), then matched within each
+    (episode, model, strategy).  All model/strategy/information-level contrasts
+    sharing an episode are averaged again, leaving exactly one independent
+    value per episode for bootstrap/Wilcoxon/permutation tests. The two named
+    contrasts (dynamic degradation, partial
     observability degradation) form the pre-registered family that gets
     Holm correction; anything else computed from this function's output is
     exploratory.
@@ -129,13 +135,29 @@ def paired_condition_contrasts(
         if not required <= set(row):
             raise BenchmarkError(f"result row missing fields: {sorted(required - set(row))}")
         key = (row["episode_id"], row["model"], row["strategy"], row["condition"])
-        keyed.setdefault(key, []).append(float(row[metric]))
+        value = row[metric]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise BenchmarkError(
+                f"result row metric {metric!r} must be a finite numeric value; "
+                f"got {value!r}"
+            )
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise BenchmarkError(
+                f"result row metric {metric!r} must be finite; got {value!r}"
+            )
+        keyed.setdefault(key, []).append(numeric)
 
     def mean(values: list[float]) -> float:
         return sum(values) / len(values)
 
-    dynamic_drops: list[float] = []
-    partial_drops: list[float] = []
+    # The episode, not each model/strategy contrast inside an episode, is the
+    # replication unit.  Accumulate all within-episode matched contrasts first
+    # and collapse them to one value per episode before any inference.  The old
+    # implementation appended every strategy contrast directly and therefore
+    # treated correlated observations from the same market path as independent.
+    dynamic_by_episode: dict[str, list[float]] = {}
+    partial_by_episode: dict[str, list[float]] = {}
     bases = {(e, m, s) for e, m, s, _ in keyed}
     for episode, model, strategy in sorted(bases):
         cells = {
@@ -144,13 +166,24 @@ def paired_condition_contrasts(
             if (episode, model, strategy, condition) in keyed
         }
         if {"full_static", "full_dynamic"} <= cells.keys():
-            dynamic_drops.append(cells["full_static"] - cells["full_dynamic"])
+            dynamic_by_episode.setdefault(episode, []).append(
+                cells["full_static"] - cells["full_dynamic"]
+            )
         if {"partial_static", "partial_dynamic"} <= cells.keys():
-            dynamic_drops.append(cells["partial_static"] - cells["partial_dynamic"])
+            dynamic_by_episode.setdefault(episode, []).append(
+                cells["partial_static"] - cells["partial_dynamic"]
+            )
         if {"full_static", "partial_static"} <= cells.keys():
-            partial_drops.append(cells["full_static"] - cells["partial_static"])
+            partial_by_episode.setdefault(episode, []).append(
+                cells["full_static"] - cells["partial_static"]
+            )
         if {"full_dynamic", "partial_dynamic"} <= cells.keys():
-            partial_drops.append(cells["full_dynamic"] - cells["partial_dynamic"])
+            partial_by_episode.setdefault(episode, []).append(
+                cells["full_dynamic"] - cells["partial_dynamic"]
+            )
+
+    dynamic_drops = [mean(values) for _, values in sorted(dynamic_by_episode.items())]
+    partial_drops = [mean(values) for _, values in sorted(partial_by_episode.items())]
 
     def _contrast_stats(name: str, diffs: list[float]) -> dict:
         if not diffs:

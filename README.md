@@ -14,6 +14,21 @@ engine, the LLM-native environment roles, the offline judge, and the
 statistics -- is frozen in [docs/BENCHMARK_PROTOCOL.md](docs/BENCHMARK_PROTOCOL.md).
 This README is a quick-start pointer, not the protocol of record.
 
+## Protocol status
+
+- `mirage.environment` is the new **v3-spine / Level-0** training interface:
+  partial observability and dynamic state are invariants, actions and
+  transitions are typed, and `MirageStructurerEnv.reset()/step()` contains no
+  LLM calls, forced prompt, strategy logic or oracle. Privileged evaluator
+  state is off by default, and finite per-round step limits prevent hanging
+  rollouts.
+- The existing CLI and `LongHorizonEnvironment` remain the explicitly legacy
+  **v2 benchmark** so frozen v2 runs can still be reproduced. Full/Static are
+  not v3 task conditions and v2/v3 artifacts must not be pooled.
+- Issued v2 dynamic positions now retain issue fixing and absolute contract
+  levels, process barrier/knock-in/autocall observations, and revalue FV,
+  delta, vega and stress on the next market snapshot.
+
 > An earlier NASDAQ-100 "Structurer Playground" prototype (`run.py`,
 > `mirage.cli`, `mirage.engine`) has been retired; that entry point no longer
 > exists in this repository. `scenarios/structurer_nasdaq/` remains only as
@@ -29,9 +44,8 @@ This README is a quick-start pointer, not the protocol of record.
   client's hard thresholds (capital, loss tolerance, maturity, product
   whitelist, protection requirement) are never disclosed directly; they must
   be drawn out through `query_client`.
-- **Carrying risk across decisions.** Dynamic rounds retain outstanding
-  notional, delta, vega, stress loss and client trust across the six
-  month-end rounds of an episode; Static rounds reset between rounds.
+- **Carrying risk across decisions.** The v3 environment is always dynamic.
+  The v2 compatibility runner still exposes its historical Static ablation.
 - **Not gaming a fixed markup.** `dealer_margin` is a cost-plus function of
   moneyness, vega exposure, path dependence, Monte Carlo pricing uncertainty,
   stress loss and capacity utilization, further scaled by a client-suitability
@@ -53,7 +67,9 @@ DeterministicCore: pricing -> hard constraint checks -> client contract gate
                     -> settlement (never calls an LLM)
    v
 Primary settlement (always computed, deterministic):
-  hard_executable, client_contract_pass, dealer_margin, hard_feasibility_rate, ...
+  hard_execution_rate, hard_execution_rate_given_submission,
+  contract_acceptance_rate_given_hard_pass, settlement_acceptance_rate,
+  dealer_margin, ...
 Secondary WorkflowOutcome (only with --roles-config and a submission):
   workflow_deal, desk/risk/client actions
 Offline: judge-runs (blind, two-judge, batched; never feeds back into a run)
@@ -152,6 +168,7 @@ MIRAGE/
 |   |-- models.yaml                 # model registry: connection info per model
 |   `-- benchmark_roles.yaml        # v2 role behaviour: structurer + 3 env NPCs + judges
 |-- mirage/
+|   |-- environment/                 # v3-spine typed reset/step + trajectory records
 |   |-- benchmark.py                # MarketSnapshot, RiskBudget, ProductDomainSpec,
 |   |                               #   TradingDesk, HardConstraintEngine, settlement
 |   |-- benchmark_runner.py         # run_episode loop, compute_metrics

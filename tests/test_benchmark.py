@@ -3,6 +3,7 @@ shared domain lattice, continuous loss budget and the v2 quote economics gate.""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 
 import pytest
@@ -169,6 +170,7 @@ def test_option_implied_forward_absorbs_carry():
 def test_partial_information_topic_gate_and_budget():
     env = make_env(full=False)
     assert "client_constraints" not in env.get_round_brief()
+    assert env.get_round_brief()["client_id"] == "institutional"
     assert env.query_client("capital")["answer"] == 20_000_000
     env.query_client("maturity")
     env.query_client("protection")
@@ -179,10 +181,53 @@ def test_partial_information_topic_gate_and_budget():
 
 
 def test_full_information_discloses_constraints():
-    env = make_env(full=True)
+    env = make_env(full=True, min_hit_prob=0.5)
     disclosed = env.get_round_brief()["client_constraints"]
     assert disclosed["capital"] == 20_000_000
     assert disclosed["max_maturity_months"] == 12
+    # Full legacy cells must at least include every field that can change
+    # deterministic settlement; otherwise Full is not a superset of Partial.
+    assert disclosed["accepting_new_products"] is True
+    assert disclosed["risk_appetite"] == "moderate"
+    assert disclosed["min_return_pct"] == pytest.approx(0.03)
+    assert disclosed["min_hit_prob"] == pytest.approx(0.5)
+
+
+def test_partial_quote_redacts_exact_client_mandate_values():
+    partial = make_env(full=False)
+    payload = partial.request_quote(product())
+    checks = {item["check_id"]: item for item in payload["checks"]}
+
+    for check_id in (
+        "CLIENT_ACCEPTING",
+        "CLIENT_CAPITAL",
+        "CLIENT_MATURITY",
+        "CLIENT_PRODUCT_WHITELIST",
+        "CLIENT_LOSS_BUDGET_V2",
+        "CLIENT_PROTECTION",
+    ):
+        assert checks[check_id]["observed"] is None
+        assert checks[check_id]["limit"] is None
+        assert "query" in checks[check_id]["reason"]
+
+    # Product/domain and desk-risk checks are not hidden client preferences.
+    assert checks["DOMAIN"]["limit"] == SMALL_DOMAIN.version
+    assert checks["PORTFOLIO_NOTIONAL"]["limit"] == budget().notional
+
+    full = make_env(full=True)
+    full_checks = {
+        item["check_id"]: item for item in full.request_quote(product())["checks"]
+    }
+    assert full_checks["CLIENT_CAPITAL"]["limit"] == 20_000_000
+    assert full_checks["CLIENT_MATURITY"]["limit"] == 12
+
+
+def test_partial_client_topics_cover_settlement_truth_without_bulk_disclosure():
+    env = make_env(full=False)
+    assert env.query_client("purchase_status")["answer"] is True
+    assert env.query_client("risk_appetite")["answer"] == "moderate"
+    hurdle = env.query_client("return_hurdle")["answer"]
+    assert hurdle == {"min_return_pct": 0.03, "min_hit_prob": 0.0}
 
 
 def test_quote_budget_and_state_binding():
@@ -280,7 +325,7 @@ def test_voluntary_best_submission_attainment_le_one():
 
 
 def test_client_loss_budget_v2_is_continuous_not_boolean():
-    env = make_env(max_loss=1.0)
+    env = make_env(full=True, max_loss=1.0)
     payload = env.request_quote(product(protected=False))
     loss_check = next(c for c in payload["checks"] if c["check_id"] == "CLIENT_LOSS_BUDGET_V2")
     # A non-protected call is priced on its premium/stress loss, not a 100% floor.
@@ -318,6 +363,23 @@ def test_client_contract_pass_blocks_hard_executable_but_unsuitable_product():
     assert result["client_contract_pass"] is False
     assert result["accepted"] is False
     assert any(c["check_id"] == "CONTRACT_HURDLE" for c in result["contract_failures"])
+
+
+def test_partial_settlement_redacts_contract_thresholds():
+    cli = client(max_loss=1.0, min_hit_prob=0.9, allowed=None)
+    env = LongHorizonEnvironment(
+        snapshots(), cli, budget(), BenchmarkCondition(False, True),
+        domain=SMALL_DOMAIN,
+    )
+    payload = env.request_quote(product())
+    result = env.submit_design(payload["quote_id"])
+    hurdle = next(
+        item for item in result["contract_failures"]
+        if item["check_id"] == "CONTRACT_HURDLE"
+    )
+    assert hurdle["observed"] is None
+    assert hurdle["limit"] is None
+    assert "query" in hurdle["reason"]
 
 
 def test_client_contract_pass_pure_function_mirrors_would_buy_dimensions():
@@ -369,6 +431,130 @@ def test_dynamic_state_persists_and_matures():
     assert env.advance_round() == []
     assert env.get_round_brief()["portfolio_summary"]["outstanding_products"] == 1
     assert env.portfolio.positions[0].remaining_months == 2
+
+
+def test_dynamic_state_revalues_against_next_market_snapshot():
+    env = make_env(dynamic=True, cli=permissive_client())
+    payload = env.request_quote(product(maturity=3))
+    assert env.submit_design(payload["quote_id"])["accepted"] is True
+    position = env.portfolio.positions[0]
+    issue_delta = position.delta_dollars
+    issue_fv = position.current_fair_value
+    assert position.absolute_strike == pytest.approx(6000.0)
+
+    env.advance_round()
+
+    assert position.remaining_months == 2
+    assert position.elapsed_months == 1
+    assert position.last_valuation_round == 2
+    assert position.current_fair_value != pytest.approx(issue_fv)
+    assert position.delta_dollars != pytest.approx(issue_delta)
+    # Contract levels remain anchored to the issue fixing, not the new 5800 spot.
+    assert position.absolute_strike == pytest.approx(6000.0)
+
+
+def test_dynamic_barrier_knockout_closes_position_after_spot_crossing():
+    states = snapshots()
+    states[1] = replace(states[1], spot=7000.0)
+    env = LongHorizonEnvironment(
+        states, permissive_client(), budget(), BenchmarkCondition(False, True),
+    )
+    barrier = ProductSpec(
+        "barrier_call", 1_000_000, 3, 1.0, 1.10, "knock_out", None, 1.0,
+        False, "institutional", "up-and-out", "delta hedge",
+        barrier_direction="up",
+    )
+    payload = env.request_quote(barrier)
+    assert env.submit_design(payload["quote_id"])["accepted"] is True
+    position = env.portfolio.positions[0]
+
+    closed = env.advance_round()
+
+    assert closed == [position.position_id]
+    assert position.knock_out_state is True
+    assert position.status == "knocked_out"
+    assert env.portfolio.positions == []
+
+
+def test_protected_barrier_knockout_keeps_bond_floor_liability():
+    states = snapshots()
+    states[1] = replace(states[1], spot=7000.0)
+    env = LongHorizonEnvironment(
+        states, permissive_client(), budget(), BenchmarkCondition(False, True),
+    )
+    protected = ProductSpec(
+        "barrier_call", 1_000_000, 3, 1.0, 1.10, "knock_out", None, 1.0,
+        True, "institutional", "protected up-and-out", "delta hedge",
+        barrier_direction="up",
+    )
+    payload = env.request_quote(protected)
+    assert env.submit_design(payload["quote_id"])["accepted"] is True
+    position = env.portfolio.positions[0]
+
+    closed = env.advance_round()
+
+    assert closed == []
+    assert position.knock_out_state is True
+    assert position.status == "active"
+    assert position.current_fair_value > 0.9 * protected.notional
+    assert position.delta_dollars == pytest.approx(0.0)
+    assert env.portfolio.totals()["notional"] == protected.notional
+
+
+def test_quote_product_is_snapshotted_against_mutation_before_submit():
+    env = make_env(dynamic=True, cli=permissive_client())
+    mutable = product(maturity=3)
+    payload = env.request_quote(mutable)
+
+    mutable.notional = 9_000_000
+    mutable.maturity_months = 60
+    mutable.strike_pct = 10.0
+    result = env.submit_design(payload["quote_id"])
+
+    assert result["accepted"] is True
+    issued = env.portfolio.positions[0].product
+    assert issued.notional == 1_000_000
+    assert issued.maturity_months == 3
+    assert issued.strike_pct == 1.0
+
+
+def test_quote_boundary_rejects_forged_lifecycle_state():
+    env = make_env(cli=permissive_client())
+    forged = replace(product(maturity=3), elapsed_months=3, reference_spot=6000.0)
+
+    with pytest.raises(BenchmarkError, match="environment-maintained"):
+        env.request_quote(forged)
+
+    assert env.quote_count == 0
+
+
+def test_round_overrides_are_resolved_on_every_benchmark_round():
+    scheduled = replace(
+        permissive_client(),
+        round_overrides=[{
+            "rounds": [2],
+            "accepting_new_products": False,
+            "max_maturity_months": 3,
+            "current_focus": "liquidity",
+        }],
+    )
+    env = make_env(cli=scheduled)
+    assert env.client.accepting_new_products is True
+
+    env.advance_round()
+
+    assert env.client.accepting_new_products is False
+    assert env.client.max_maturity_months == 3
+    assert env.client.current_focus == "liquidity"
+
+
+def test_invalid_round_override_fails_before_episode_starts():
+    malformed = replace(
+        permissive_client(),
+        round_overrides=[{"rounds": [2], "not_a_client_field": 1}],
+    )
+    with pytest.raises(BenchmarkError, match="unsupported fields"):
+        make_env(cli=malformed)
 
 
 def test_static_state_resets_between_rounds():

@@ -6,6 +6,8 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
 
 from .agents import _find_balanced_end
 
@@ -64,31 +66,93 @@ from .benchmark import (
     WorkflowOutcome,
     constraint_ledger,
     oracle_best_quote,
-    oracle_candidate_grid,
 )
 from .llm import BaseLLMClient
+from .pricing import PricingError
 from .products import ProductError, parse_product_spec
 
 
-STRATEGIES = ("one_shot", "quote_and_revise", "ledger_archive")
+@dataclass(frozen=True)
+class ProtocolPolicy:
+    """Immutable interaction contract for one benchmark strategy.
+
+    ``action_budget`` is an absolute override when set; ``None`` preserves the
+    caller-supplied ``max_actions_per_round``. Protocol repair means that a
+    malformed/forbidden response is returned to the model within that normal
+    budget. The forced prompt, when enabled, is one additional last-chance turn
+    after the normal budget is exhausted.
+    """
+
+    strategy: str
+    allowed_actions: frozenset[str]
+    action_budget: int | None
+    protocol_repair: bool
+    forced_prompt: bool
+    include_ledger_archive: bool
+    prompt: str
+
+
+_INTERACTIVE_ACTIONS = frozenset({
+    "query_client", "consult", "request_quote", "submit_design",
+    "submit_product", "skip_round",
+})
+
+PROTOCOL_POLICIES: Mapping[str, ProtocolPolicy] = MappingProxyType({
+    "one_shot": ProtocolPolicy(
+        strategy="one_shot",
+        allowed_actions=frozenset({"submit_product", "skip_round"}),
+        action_budget=1,
+        protocol_repair=False,
+        forced_prompt=False,
+        include_ledger_archive=False,
+        prompt=(
+            "基线限制：本轮只有一次动作，只能用 submit_product 一次性提交，"
+            "或用 skip_round 放弃；不会提供协议纠错轮或最后机会。"
+        ),
+    ),
+    "quote_and_revise": ProtocolPolicy(
+        strategy="quote_and_revise",
+        allowed_actions=_INTERACTIVE_ACTIONS,
+        action_budget=None,
+        protocol_repair=True,
+        forced_prompt=True,
+        include_ledger_archive=False,
+        prompt="你可以查询客户，并在每轮最多三次询价中修改产品。",
+    ),
+    "ledger_archive": ProtocolPolicy(
+        strategy="ledger_archive",
+        allowed_actions=_INTERACTIVE_ACTIONS,
+        action_budget=None,
+        protocol_repair=True,
+        forced_prompt=True,
+        include_ledger_archive=True,
+        prompt=(
+            "你可以查询和迭代。每次报价后环境会额外提供 constraint_ledger 与 "
+            "candidate_archive，请显式利用这些记忆。"
+        ),
+    ),
+})
+
+STRATEGIES = tuple(PROTOCOL_POLICIES)
 
 RUNNER_SYSTEM_PROMPT = """你是受测的结构化产品设计智能体。市场数据、定价和硬检查只可
 通过环境工具获得。每次只输出一个 JSON 对象，可用动作：
-{"action":"query_client","topic":"capital|loss_tolerance|maturity|product_types|protection|preferences"}
+{"action":"query_client","topic":"capital|loss_tolerance|maturity|product_types|protection|preferences|purchase_status|risk_appetite|return_hurdle"}
 {"action":"request_quote","product":{...ProductSpec...}}
 {"action":"submit_design","quote_id":"Q-...","explanation":"..."}
 {"action":"submit_product","product":{...ProductSpec...},"explanation":"..."}
 {"action":"skip_round"}
 
-ProductSpec 字段规范（所有字段必填，可空字段用 null）：
+ProductSpec 字段规范（除注明可选外，所有字段必填；可空字段用 null）：
 - product_type: 只能取 "vanilla_call" | "vanilla_put" | "barrier_call" | "barrier_put" | "autocallable" | "snowball"
 - notional: 名义本金（人民币，正数）
 - maturity_months: 期限（整数，1-60 个月）
 - strike_pct: 行权价/期初价比例，1.0 表示平价（不要填 100）
 - barrier_pct: 障碍价比例，null 或正数；必须与 barrier_type 同时设置或同时为 null
 - barrier_type: null 或 "knock_in" | "knock_out"（没有其他取值）
+- barrier_direction: 可选，null 或 "up" | "down"；缺省时按发行时 barrier_pct 相对 1.0 的 moneyness 固定推断
 - coupon_rate: 年化票息，null 或 [0,5]；autocallable/snowball 必须设置
-- participation_rate: 参与率 [0,10]；autocallable/snowball 必须为 1.0
+- participation_rate: 参与率 (0,10]；autocallable/snowball 必须为 1.0
 - principal_protected: 布尔值；声明保本但结构不支持会被判违规
 - target_client: 客户 id（用回合简报中给出的 id）
 - pitch: 一句话推介（字符串）
@@ -139,6 +203,8 @@ class RoundTrace:
     hard_failures: list[str] = field(default_factory=list)
     all_quote_failures: list[str] = field(default_factory=list)
     quote_failures_before_success: int = 0
+    # Deprecated serialized compatibility alias. New code should read
+    # one_step_frontier_margin; run_episode writes the same value to both.
     oracle_margin: float | None = None
     # Diagnostic only: best archived feasible quote's margin, never executed
     # (never calls environment.submit_design, never touches portfolio/client state,
@@ -155,6 +221,16 @@ class RoundTrace:
     consult_count: int = 0
     degraded_consult_count: int = 0
     workflow: WorkflowOutcome | None = None
+    # New fields are appended to preserve the positional constructor layout of
+    # legacy RoundTrace consumers.
+    # Deterministic best hard-executable margin over the exact environment
+    # domain and quote policy at the start of this round.
+    one_step_frontier_margin: float | None = None
+    # Two-gate deterministic settlement decomposition. These remain False when
+    # there was no submission; accepted is their conjunction after submission.
+    hard_executable: bool = False
+    client_contract_pass: bool = False
+    contract_failures: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -167,15 +243,8 @@ class EpisodeTrace:
     seed: int | None = None
 
 
-def _protocol_prompt(strategy: str) -> str:
-    if strategy == "one_shot":
-        return "基线限制：不要查询客户或迭代；用 submit_product 一次性提交。"
-    if strategy == "quote_and_revise":
-        return "你可以查询客户，并在每轮最多三次询价中修改产品。"
-    return (
-        "你可以查询和迭代。每次报价后环境会额外提供 constraint_ledger 与 "
-        "candidate_archive，请显式利用这些记忆。"
-    )
+def _protocol_prompt(policy: ProtocolPolicy) -> str:
+    return policy.prompt
 
 
 def _forced_prompt_payload(environment: LongHorizonEnvironment) -> dict:
@@ -183,7 +252,10 @@ def _forced_prompt_payload(environment: LongHorizonEnvironment) -> dict:
         "notice": "本轮动作预算已用尽，你还未提交本轮设计。",
         "final_chance": True,
         "allowed_actions": ["submit_design", "skip_round"],
-        "available_quotes": [quote.public_payload() for quote, _ in environment.quotes.values()],
+        "available_quotes": [
+            environment.public_quote_payload(quote)
+            for quote, _ in environment.quotes.values()
+        ],
         "instruction": (
             "这是本轮最后一次机会，只能返回以下两种 JSON 之一："
             '{"action":"submit_design","quote_id":"...","explanation":"..."}'
@@ -192,6 +264,31 @@ def _forced_prompt_payload(environment: LongHorizonEnvironment) -> dict:
             "其他任何动作都无效，本轮将不会成交。"
         ),
     }
+
+
+def _record_submission_result(
+    trace: RoundTrace,
+    result: dict,
+    *,
+    origin: str,
+    product: dict,
+    explanation: str,
+    brief: dict,
+    quote_id: str,
+) -> None:
+    """Copy the deterministic two-gate settlement into a round trace."""
+    trace.submitted = True
+    trace.accepted = bool(result["accepted"])
+    trace.hard_executable = bool(result["hard_executable"])
+    trace.client_contract_pass = bool(result["client_contract_pass"])
+    trace.dealer_margin = float(result["dealer_margin"])
+    trace.hard_failures = [item["check_id"] for item in result["hard_failures"]]
+    trace.contract_failures = [item["check_id"] for item in result["contract_failures"]]
+    trace.submission_origin = origin
+    trace.submitted_product = product
+    trace.submitted_explanation = explanation
+    trace.client_brief_snapshot = brief
+    trace.submitted_quote_id = quote_id
 
 
 async def _run_forced_prompt(
@@ -234,15 +331,15 @@ async def _run_forced_prompt(
             result = environment.submit_design(quote_id, explanation)
             _, submitted_product = environment.quotes[quote_id]
             response = result
-            trace.submitted = True
-            trace.accepted = result["accepted"]
-            trace.dealer_margin = result["dealer_margin"]
-            trace.hard_failures = [item["check_id"] for item in result["hard_failures"]]
-            trace.submission_origin = "forced_prompt"
-            trace.submitted_product = asdict(submitted_product)
-            trace.submitted_explanation = explanation
-            trace.client_brief_snapshot = brief
-            trace.submitted_quote_id = quote_id
+            _record_submission_result(
+                trace,
+                result,
+                origin="forced_prompt",
+                product=asdict(submitted_product),
+                explanation=explanation,
+                brief=brief,
+                quote_id=quote_id,
+            )
         else:
             response = {"skipped": True}
             trace.submitted = False
@@ -256,7 +353,7 @@ async def _run_forced_prompt(
             request=action,
             response=response,
         ))
-    except (BenchmarkError, ProductError, ValueError, TypeError) as exc:
+    except (BenchmarkError, ProductError, PricingError, ArithmeticError, ValueError, TypeError) as exc:
         response = {"error": str(exc)}
         trace.actions.append(ActionTrace(
             round_num=trace.round_num,
@@ -277,22 +374,28 @@ async def run_episode(
     seed: int | None = None,
 ) -> EpisodeTrace:
     """Run one frozen episode against the strict tool protocol."""
-    if strategy not in STRATEGIES:
+    policy = PROTOCOL_POLICIES.get(strategy)
+    if policy is None:
         raise BenchmarkError(f"unknown strategy {strategy!r}; expected one of {STRATEGIES}")
-    messages = [{"role": "system", "content": STRUCTURER_SYSTEM_PROMPT + "\n" + _protocol_prompt(strategy)}]
+    action_budget = policy.action_budget if policy.action_budget is not None else max_actions_per_round
+    messages = [{"role": "system", "content": STRUCTURER_SYSTEM_PROMPT + "\n" + _protocol_prompt(policy)}]
     round_traces: list[RoundTrace] = []
 
     for round_offset in range(len(environment.snapshots)):
         trace = RoundTrace(round_num=environment.snapshot.round_num)
-        # 冻结网格 oracle：在智能体行动前、以当前组合状态计算本轮 margin 上界。
-        oracle = oracle_best_quote(
-            oracle_candidate_grid(environment.client),
+        # One-step frontier: compute before the model acts, over exactly the same
+        # frozen domain and quote economics used by this environment.
+        frontier = oracle_best_quote(
+            environment.domain,
             environment.snapshot,
             environment.client,
             environment.portfolio,
             environment.desk.hard_checks.risk_budget,
+            policy=environment.quote_policy,
         )
-        trace.oracle_margin = oracle[1].dealer_margin if oracle is not None else None
+        frontier_margin = frontier[1].dealer_margin if frontier is not None else None
+        trace.one_step_frontier_margin = frontier_margin
+        trace.oracle_margin = frontier_margin  # deprecated compatibility alias
         archive = CandidateArchive()
         brief = environment.get_round_brief()
         messages.append({
@@ -301,7 +404,7 @@ async def run_episode(
         })
         last_quote: Quote | None = None
 
-        for action_index in range(1, max_actions_per_round + 1):
+        for action_index in range(1, action_budget + 1):
             raw = await client.chat(messages, temperature=0.0, seed=seed)
             messages.append({"role": "assistant", "content": raw})
             try:
@@ -311,9 +414,13 @@ async def run_episode(
                 action_type = action.get("action")
                 response: dict
 
+                if action_type not in policy.allowed_actions:
+                    allowed = ", ".join(sorted(policy.allowed_actions))
+                    raise BenchmarkError(
+                        f"{policy.strategy} protocol only allows [{allowed}], got {action_type!r}"
+                    )
+
                 if action_type == "query_client":
-                    if strategy == "one_shot":
-                        raise BenchmarkError("one_shot baseline cannot query the client")
                     topic = str(action.get("topic", ""))
                     if environment.has_client_llm():
                         response = await environment.query_client_llm(topic)
@@ -321,8 +428,6 @@ async def run_episode(
                         response = environment.query_client(topic)
 
                 elif action_type == "consult":
-                    if strategy == "one_shot":
-                        raise BenchmarkError("one_shot baseline cannot consult env roles")
                     draft = action.get("draft")
                     response = await environment.consult(
                         str(action.get("role", "")),
@@ -349,15 +454,15 @@ async def run_episode(
                         explanation = str(action.get("explanation", product.pitch))
                         result = environment.submit_design(quote.quote_id, explanation)
                         response = {"quote": quote_payload, "submission": result}
-                        trace.submitted = True
-                        trace.accepted = result["accepted"]
-                        trace.dealer_margin = result["dealer_margin"]
-                        trace.hard_failures = [item["check_id"] for item in result["hard_failures"]]
-                        trace.submission_origin = "voluntary"
-                        trace.submitted_product = asdict(product)
-                        trace.submitted_explanation = explanation
-                        trace.client_brief_snapshot = brief
-                        trace.submitted_quote_id = quote.quote_id
+                        _record_submission_result(
+                            trace,
+                            result,
+                            origin="voluntary",
+                            product=asdict(product),
+                            explanation=explanation,
+                            brief=brief,
+                            quote_id=quote.quote_id,
+                        )
 
                 elif action_type == "submit_design":
                     quote_id = str(action.get("quote_id", ""))
@@ -365,15 +470,15 @@ async def run_episode(
                     result = environment.submit_design(quote_id, explanation)
                     _, submitted_product = environment.quotes[quote_id]
                     response = result
-                    trace.submitted = True
-                    trace.accepted = result["accepted"]
-                    trace.dealer_margin = result["dealer_margin"]
-                    trace.hard_failures = [item["check_id"] for item in result["hard_failures"]]
-                    trace.submission_origin = "voluntary"
-                    trace.submitted_product = asdict(submitted_product)
-                    trace.submitted_explanation = explanation
-                    trace.client_brief_snapshot = brief
-                    trace.submitted_quote_id = quote_id
+                    _record_submission_result(
+                        trace,
+                        result,
+                        origin="voluntary",
+                        product=asdict(submitted_product),
+                        explanation=explanation,
+                        brief=brief,
+                        quote_id=quote_id,
+                    )
 
                 elif action_type == "skip_round":
                     response = {"skipped": True}
@@ -393,7 +498,7 @@ async def run_episode(
                     response=response,
                 ))
                 tool_payload: dict = {"tool_result": response}
-                if strategy == "ledger_archive" and last_quote is not None:
+                if policy.include_ledger_archive and last_quote is not None:
                     tool_payload["constraint_ledger"] = constraint_ledger(
                         last_quote, environment.portfolio, environment.desk.hard_checks.risk_budget
                     )
@@ -404,7 +509,14 @@ async def run_episode(
                 })
                 if action_type in {"submit_design", "submit_product", "skip_round"}:
                     break
-            except (BenchmarkError, ProductError, ValueError, TypeError) as exc:
+            except (
+                BenchmarkError,
+                ProductError,
+                PricingError,
+                ArithmeticError,
+                ValueError,
+                TypeError,
+            ) as exc:
                 response = {"error": str(exc)}
                 trace.actions.append(ActionTrace(
                     round_num=trace.round_num,
@@ -413,7 +525,8 @@ async def run_episode(
                     request={"raw": raw[:2000]},
                     response=response,
                 ))
-                messages.append({"role": "user", "content": json.dumps(response, ensure_ascii=False)})
+                if policy.protocol_repair:
+                    messages.append({"role": "user", "content": json.dumps(response, ensure_ascii=False)})
 
         # Imputed counterfactual diagnostic only: read-only over this round's
         # archive of previously requested quotes. Never calls submit_design,
@@ -421,10 +534,10 @@ async def run_episode(
         best = archive.best_feasible()
         trace.imputed_counterfactual_margin = best.quote.dealer_margin if best is not None else None
 
-        if not environment.submitted:
+        if policy.forced_prompt and not environment.submitted:
             await _run_forced_prompt(
                 environment, client, messages, trace,
-                brief=brief, seed=seed, max_actions_per_round=max_actions_per_round,
+                brief=brief, seed=seed, max_actions_per_round=action_budget,
             )
         if not environment.submitted:
             environment.submitted = True
@@ -464,6 +577,14 @@ def compute_metrics(trace: EpisodeTrace, oracle_margins: list[float | None] | No
     # and none (no valid submission at all) are reported separately and never pooled in.
     voluntary_accepted = [item for item in accepted if item.submission_origin == "voluntary"]
     forced_prompt_accepted = [item for item in accepted if item.submission_origin == "forced_prompt"]
+    submitted_rounds = [item for item in rounds if item.submitted]
+    hard_passed_submissions = [item for item in submitted_rounds if item.hard_executable]
+    settlement_acceptance_rate = len(accepted) / n if n else 0.0
+    hard_execution_rate = len(hard_passed_submissions) / n if n else 0.0
+    mean_voluntary_accepted_margin = (
+        sum(item.dealer_margin for item in voluntary_accepted) / len(voluntary_accepted)
+        if voluntary_accepted else 0.0
+    )
     all_failures = [failure for item in rounds for failure in item.all_quote_failures + item.hard_failures]
     repeated = sum(
         failure in (rounds[index - 1].all_quote_failures + rounds[index - 1].hard_failures)
@@ -477,17 +598,27 @@ def compute_metrics(trace: EpisodeTrace, oracle_margins: list[float | None] | No
         "condition": trace.condition,
         "strategy": trace.strategy,
         "rounds": n,
-        # hard_feasibility_rate keeps its existing semantics: share of rounds that
-        # settled accepted (hard_pass), regardless of submission_origin. It does NOT
-        # separate voluntary from forced_prompt; use voluntary/forced_prompt/no
-        # submission rates below for that breakdown.
-        "hard_feasibility_rate": len(accepted) / n if n else 0.0,
+        # Always-defined primary estimand: a round with no submission is not a
+        # hard-executable outcome. The conditional companion below is diagnostic.
+        "hard_execution_rate": hard_execution_rate,
+        "hard_execution_rate_given_submission": (
+            len(hard_passed_submissions) / len(submitted_rounds)
+            if submitted_rounds else None
+        ),
+        "contract_acceptance_rate_given_hard_pass": (
+            sum(item.client_contract_pass for item in hard_passed_submissions)
+            / len(hard_passed_submissions)
+            if hard_passed_submissions else None
+        ),
+        "settlement_acceptance_rate": settlement_acceptance_rate,
+        # Deprecated compatibility alias. Despite its old name, this has always
+        # meant final settlement acceptance per round, not hard execution alone.
+        "hard_feasibility_rate": settlement_acceptance_rate,
         "submission_rate": sum(item.submitted for item in rounds) / n if n else 0.0,
         "total_dealer_margin": sum(item.dealer_margin for item in voluntary_accepted),
-        "mean_dealer_margin": (
-            sum(item.dealer_margin for item in voluntary_accepted) / len(voluntary_accepted)
-            if voluntary_accepted else 0.0
-        ),
+        "mean_dealer_margin_per_voluntary_accepted_trade": mean_voluntary_accepted_margin,
+        # Compatibility alias for the formerly ambiguous metric name.
+        "mean_dealer_margin": mean_voluntary_accepted_margin,
         "forced_prompt_margin": sum(item.dealer_margin for item in forced_prompt_accepted),
         "voluntary_submission_rate": (
             sum(item.submission_origin == "voluntary" for item in rounds) / n if n else 0.0
@@ -526,7 +657,12 @@ def compute_metrics(trace: EpisodeTrace, oracle_margins: list[float | None] | No
         degraded_consults / total_consults if total_consults else None
     )
     if oracle_margins is None:
-        recorded = [item.oracle_margin for item in rounds]
+        recorded = [
+            item.one_step_frontier_margin
+            if item.one_step_frontier_margin is not None
+            else item.oracle_margin  # deprecated trace compatibility field
+            for item in rounds
+        ]
         if any(value is not None for value in recorded):
             oracle_margins = recorded
     if oracle_margins is not None:
@@ -534,11 +670,22 @@ def compute_metrics(trace: EpisodeTrace, oracle_margins: list[float | None] | No
             raise BenchmarkError("oracle margin list must align with episode rounds")
         # one_step_attainment (formerly oracle_margin_attainment): only voluntary,
         # accepted rounds enter the ratio, matching the voluntary-only primary margin.
-        ratios = [
-            item.dealer_margin / oracle
-            for item, oracle in zip(rounds, oracle_margins)
-            if item.accepted and item.submission_origin == "voluntary" and oracle is not None and oracle > 0
-        ]
+        ratios: list[float] = []
+        for item, frontier_margin in zip(rounds, oracle_margins):
+            if not (
+                item.accepted
+                and item.submission_origin == "voluntary"
+                and frontier_margin is not None
+                and frontier_margin > 0
+            ):
+                continue
+            ratio = item.dealer_margin / frontier_margin
+            if ratio > 1.0 + 1e-9:
+                raise BenchmarkError(
+                    "voluntary accepted trade exceeds the one-step frontier "
+                    f"in round {item.round_num}: {ratio:.12g} > 1 + 1e-9"
+                )
+            ratios.append(ratio)
         result["one_step_attainment"] = sum(ratios) / len(ratios) if ratios else None
     return result
 

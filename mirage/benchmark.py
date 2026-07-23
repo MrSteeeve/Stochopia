@@ -30,7 +30,7 @@ from .pricing import (
     mc_diagnostics,
     quote_economics,
 )
-from .products import ClientProfile, MarketState, ProductSpec
+from .products import PRODUCT_TYPES, ClientProfile, MarketState, ProductSpec
 
 # Fixed diagnostic MC seed for desk/oracle quotes. Constant across candidates so
 # the structure-keyed mc_diagnostics cache is shared during oracle enumeration.
@@ -235,6 +235,14 @@ class RiskBudget:
 
 @dataclass
 class Position:
+    """Lifecycle state for an issued contract.
+
+    ``product`` is the issued contract, while the mutable fields below are the
+    environment truth carried between market observations.  In particular,
+    strike/barrier levels are stored in absolute units so a later revaluation
+    cannot silently re-anchor the contract to the new spot.
+    """
+
     position_id: str
     product: ProductSpec
     remaining_months: int
@@ -242,6 +250,179 @@ class Position:
     vega_dollars: float
     stress_loss: float
     quote_margin: float
+    trade_date: date | None = None
+    initial_fixing: float | None = None
+    absolute_strike: float | None = None
+    absolute_barrier: float | None = None
+    barrier_direction: str | None = None
+    elapsed_months: int = 0
+    running_min: float | None = None
+    running_max: float | None = None
+    barrier_touched: bool = False
+    knock_in_state: bool = False
+    knock_out_state: bool = False
+    autocall_state: bool = False
+    accrued_coupon: float = 0.0
+    current_fair_value: float = 0.0
+    status: str = "active"
+    last_valuation_round: int | None = None
+
+
+_CLIENT_OVERRIDE_FIELDS = frozenset({
+    "capital", "max_loss_pct", "min_return_pct", "risk_appetite", "preferences",
+    "max_maturity_months", "principal_protection_required", "allowed_product_types",
+    "accepting_new_products", "min_hit_prob", "current_focus",
+})
+
+
+def resolve_client_profile(client: ClientProfile, round_num: int) -> ClientProfile:
+    """Resolve a base client profile into deterministic round-specific truth.
+
+    The benchmark CLI loads ``ClientProfile`` directly from JSON, bypassing the
+    legacy scenario loader.  Keeping this resolver beside the environment makes
+    ``round_overrides`` effective on every production path and rejects malformed
+    schedules before they can change settlement semantics mid-episode.
+    """
+    combined: dict = {}
+    for index, entry in enumerate(client.round_overrides):
+        if not isinstance(entry, dict):
+            raise BenchmarkError(f"client round_overrides[{index}] must be an object")
+        rounds = entry.get("rounds")
+        if not isinstance(rounds, list) or not all(
+            isinstance(item, int) and not isinstance(item, bool) and item >= 1
+            for item in rounds
+        ):
+            raise BenchmarkError(
+                f"client round_overrides[{index}].rounds must contain positive integers"
+            )
+        unknown = set(entry) - _CLIENT_OVERRIDE_FIELDS - {"rounds"}
+        if unknown:
+            raise BenchmarkError(
+                f"client round_overrides[{index}] has unsupported fields: {sorted(unknown)}"
+            )
+        if round_num in rounds:
+            combined.update({key: value for key, value in entry.items() if key != "rounds"})
+
+    combined.setdefault("current_focus", "")
+    resolved = replace(client, **combined)
+    numeric = (
+        resolved.capital, resolved.max_loss_pct, resolved.min_return_pct,
+        resolved.min_hit_prob,
+    )
+    if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in numeric):
+        raise BenchmarkError("resolved client numeric fields must be finite")
+    if resolved.capital <= 0:
+        raise BenchmarkError("resolved client capital must be positive")
+    if not 0.0 <= resolved.max_loss_pct <= 1.0:
+        raise BenchmarkError("resolved client max_loss_pct must be in [0, 1]")
+    if not 0.0 <= resolved.min_hit_prob <= 1.0:
+        raise BenchmarkError("resolved client min_hit_prob must be in [0, 1]")
+    if (
+        not isinstance(resolved.max_maturity_months, int)
+        or isinstance(resolved.max_maturity_months, bool)
+        or resolved.max_maturity_months < 1
+    ):
+        raise BenchmarkError("resolved client max_maturity_months must be positive")
+    if resolved.risk_appetite not in {"conservative", "moderate", "aggressive"}:
+        raise BenchmarkError("resolved client risk_appetite is invalid")
+    if not isinstance(resolved.principal_protection_required, bool):
+        raise BenchmarkError("resolved client principal_protection_required must be boolean")
+    if not isinstance(resolved.accepting_new_products, bool):
+        raise BenchmarkError("resolved client accepting_new_products must be boolean")
+    if resolved.allowed_product_types is not None:
+        if not isinstance(resolved.allowed_product_types, list):
+            raise BenchmarkError("resolved client allowed_product_types must be a list or null")
+        if not all(isinstance(item, str) for item in resolved.allowed_product_types):
+            raise BenchmarkError("resolved client allowed_product_types must contain strings")
+        invalid = set(resolved.allowed_product_types) - set(PRODUCT_TYPES)
+        if invalid:
+            raise BenchmarkError(f"resolved client product types are invalid: {sorted(invalid)}")
+    return resolved
+
+
+def _barrier_direction(product: ProductSpec) -> str | None:
+    explicit = getattr(product, "barrier_direction", None)
+    if explicit is not None:
+        return explicit
+    if product.barrier_pct is None:
+        return None
+    return "down" if product.barrier_pct <= 1.0 else "up"
+
+
+def _process_position_observation(position: Position, snapshot: MarketSnapshot) -> None:
+    """Apply one observed month to persistent path state before revaluation."""
+    spot = snapshot.spot
+    position.running_min = spot if position.running_min is None else min(position.running_min, spot)
+    position.running_max = spot if position.running_max is None else max(position.running_max, spot)
+    position.elapsed_months += 1
+    position.remaining_months -= 1
+    position.accrued_coupon = (
+        (position.product.coupon_rate or 0.0) * position.elapsed_months / 12.0
+    )
+
+    barrier = position.absolute_barrier
+    direction = position.barrier_direction
+    touched = bool(
+        barrier is not None
+        and ((direction == "down" and spot <= barrier) or (direction == "up" and spot >= barrier))
+    )
+    position.barrier_touched = position.barrier_touched or touched
+
+    if position.product.product_type in {"barrier_call", "barrier_put"} and touched:
+        if position.product.barrier_type == "knock_out":
+            position.knock_out_state = True
+            # A knock-out terminates only the option component.  A protected
+            # note still carries its bond floor and remains a live liability
+            # until maturity; an unprotected option can be closed immediately.
+            if not position.product.principal_protected:
+                position.status = "knocked_out"
+        else:
+            position.knock_in_state = True
+
+    if position.product.product_type in {"snowball", "autocallable"}:
+        if barrier is not None and spot <= barrier:
+            position.knock_in_state = True
+        if position.initial_fixing is not None:
+            autocall_ratio = 1.03 if position.product.product_type == "snowball" else 1.05
+            if spot >= position.initial_fixing * autocall_ratio:
+                position.autocall_state = True
+                position.status = "autocalled"
+
+    if position.remaining_months <= 0 and position.status == "active":
+        position.status = "matured"
+
+
+def _revalue_position(position: Position, snapshot: MarketSnapshot) -> None:
+    """Recompute FV/Greeks/stress from current market and persistent path truth."""
+    if position.status != "active":
+        position.current_fair_value = 0.0
+        position.delta_dollars = 0.0
+        position.vega_dollars = 0.0
+        position.stress_loss = 0.0
+        position.last_valuation_round = snapshot.round_num
+        return
+
+    if position.initial_fixing is None or position.absolute_strike is None:
+        raise BenchmarkError(f"position {position.position_id} is missing issue fixing state")
+
+    product = replace(
+        position.product,
+        barrier_direction=position.barrier_direction,
+        reference_spot=position.initial_fixing,
+        barrier_touched=position.barrier_touched,
+        knock_in_active=position.knock_in_state,
+        elapsed_months=position.elapsed_months,
+    )
+    market = snapshot.to_market_state(max(position.remaining_months, 1))
+    pricing = evaluate_product(product, market)
+    if pricing is None:
+        raise BenchmarkError(f"cannot revalue unsupported position {position.position_id}")
+    stress_loss, _ = _fair_value_stress_loss(product, market)
+    position.current_fair_value = float(pricing["fair_value"])
+    position.delta_dollars = float(pricing["greeks"].get("delta", 0.0)) * product.notional
+    position.vega_dollars = float(pricing["greeks"].get("vega_pct", 0.0)) * product.notional
+    position.stress_loss = float(stress_loss)
+    position.last_valuation_round = snapshot.round_num
 
 
 @dataclass
@@ -254,24 +435,37 @@ class PortfolioState:
     def totals(self) -> dict[str, float]:
         return {
             "notional": sum(p.product.notional for p in self.positions),
+            "fair_value": sum(p.current_fair_value for p in self.positions),
             "net_delta": sum(p.delta_dollars for p in self.positions),
             "gross_delta": sum(abs(p.delta_dollars) for p in self.positions),
             "net_vega": sum(p.vega_dollars for p in self.positions),
             "stress_loss": sum(max(p.stress_loss, 0.0) for p in self.positions),
         }
 
-    def advance_month(self) -> list[str]:
-        matured: list[str] = []
+    def advance_month(self, snapshot: MarketSnapshot | None = None) -> list[str]:
+        """Advance positions and, when a snapshot is supplied, revalue them.
+
+        ``snapshot=None`` remains a compatibility path for callers that only
+        need mechanical maturity.  The benchmark environment always supplies
+        the next observation, so portfolio limits never use stale issue-time
+        risk after the first round.
+        """
+        closed: list[str] = []
         active: list[Position] = []
         for position in self.positions:
-            position.remaining_months -= 1
-            if position.remaining_months <= 0:
-                matured.append(position.position_id)
+            if snapshot is None:
+                position.remaining_months -= 1
+                position.elapsed_months += 1
+            else:
+                _process_position_observation(position, snapshot)
+                _revalue_position(position, snapshot)
+            if position.remaining_months <= 0 or position.status != "active":
+                closed.append(position.position_id)
             else:
                 active.append(position)
         self.positions = active
         self.revision += 1
-        return matured
+        return closed
 
     def add(self, position: Position) -> None:
         self.positions.append(position)
@@ -294,6 +488,26 @@ class CheckResult:
     @property
     def passed(self) -> bool:
         return self.status == "PASS"
+
+
+# Exact client mandate values are hidden in Partial.  A quote may reveal which
+# client gate passed/failed (that is useful, budgeted interaction), but it must
+# not turn one quote into a bulk dump of every numeric threshold.
+_PRIVATE_CLIENT_CHECK_IDS = frozenset({
+    "CLIENT_ACCEPTING",
+    "CLIENT_CAPITAL",
+    "CLIENT_MATURITY",
+    "CLIENT_PRODUCT_WHITELIST",
+    "CLIENT_LOSS_BUDGET_V2",
+    "CLIENT_PROTECTION",
+    "CONTRACT_ACCEPTING",
+    "CONTRACT_CAPITAL",
+    "CONTRACT_MATURITY",
+    "CONTRACT_WHITELIST",
+    "CONTRACT_PROTECTION",
+    "CONTRACT_LOSS",
+    "CONTRACT_HURDLE",
+})
 
 
 @dataclass(frozen=True)
@@ -406,6 +620,7 @@ def _domain_signature(product: ProductSpec) -> tuple:
         round(product.strike_pct, 9),
         round(product.barrier_pct, 9) if product.barrier_pct is not None else None,
         product.barrier_type,
+        _barrier_direction(product),
         round(product.coupon_rate, 9) if product.coupon_rate is not None else None,
         round(product.participation_rate, 9),
         bool(product.principal_protected),
@@ -435,6 +650,11 @@ def enumerate_domain(client: ClientProfile, domain: ProductDomainSpec | None = N
             target_client=client.id,
             pitch="domain lattice candidate",
             hedging_plan="delta hedge with listed futures",
+            barrier_direction=(
+                "down" if barrier is not None and barrier <= 1.0
+                else "up" if barrier is not None
+                else None
+            ),
         )
 
     lower_barriers = tuple(b for b in domain.barriers if b < 1.0)
@@ -642,9 +862,14 @@ def _structure_key(product: ProductSpec, market: MarketState) -> tuple:
         product.strike_pct,
         product.barrier_pct,
         product.barrier_type,
+        getattr(product, "barrier_direction", None),
         product.coupon_rate,
         product.participation_rate,
         product.principal_protected,
+        getattr(product, "reference_spot", None),
+        bool(getattr(product, "barrier_touched", False)),
+        bool(getattr(product, "knock_in_active", False)),
+        int(getattr(product, "elapsed_months", 0)),
         market.spot,
         market.volatility,
         market.risk_free_rate,
@@ -906,9 +1131,18 @@ def settle_submission(
 class LongHorizonEnvironment:
     """Tool-facing benchmark environment with strict information boundaries."""
 
-    CLIENT_TOPICS = {
-        "capital", "loss_tolerance", "maturity", "product_types", "protection", "preferences"
+    CLIENT_TOPIC_FIELDS = {
+        "capital": ("capital",),
+        "loss_tolerance": ("max_loss_pct",),
+        "maturity": ("max_maturity_months",),
+        "product_types": ("allowed_product_types",),
+        "protection": ("principal_protection_required",),
+        "preferences": ("preferences", "current_focus"),
+        "purchase_status": ("accepting_new_products",),
+        "risk_appetite": ("risk_appetite",),
+        "return_hurdle": ("min_return_pct", "min_hit_prob"),
     }
+    CLIENT_TOPICS = frozenset(CLIENT_TOPIC_FIELDS)
 
     def __init__(
         self,
@@ -933,7 +1167,12 @@ class LongHorizonEnvironment:
         expected = list(range(1, len(self.snapshots) + 1))
         if [s.round_num for s in self.snapshots] != expected:
             raise BenchmarkError("episode rounds must be contiguous from one")
-        self.client = client
+        # Resolve every configured round up front so a malformed schedule fails
+        # before an episode starts rather than halfway through a benchmark job.
+        for item in self.snapshots:
+            resolve_client_profile(client, item.round_num)
+        self.base_client = client
+        self.client = resolve_client_profile(client, self.snapshots[0].round_num)
         self.condition = condition
         self.portfolio = PortfolioState()
         self.client_memory = ClientMemory()
@@ -970,6 +1209,10 @@ class LongHorizonEnvironment:
 
     def get_round_brief(self) -> dict:
         brief = self.snapshot.public_brief()
+        # Routing identity is public protocol metadata, not a hidden preference.
+        # ProductSpec.target_client is mandatory, so withholding this value made
+        # otherwise valid Partial actions impossible to construct from the brief.
+        brief["client_id"] = self.client.id
         brief["condition"] = self.condition.id
         brief["quote_budget"] = self.max_quotes_per_round - self.quote_count
         if self.condition.full_information:
@@ -987,10 +1230,15 @@ class LongHorizonEnvironment:
         return {
             "capital": self.client.capital,
             "max_loss_pct": self.client.max_loss_pct,
+            "min_return_pct": self.client.min_return_pct,
+            "min_hit_prob": self.client.min_hit_prob,
+            "risk_appetite": self.client.risk_appetite,
             "max_maturity_months": self.client.max_maturity_months,
             "principal_protection_required": self.client.principal_protection_required,
             "allowed_product_types": self.client.allowed_product_types,
+            "accepting_new_products": self.client.accepting_new_products,
             "preferences": self.client.preferences,
+            "current_focus": self.client.current_focus,
         }
 
     def query_client(self, topic: str) -> dict:
@@ -1001,28 +1249,54 @@ class LongHorizonEnvironment:
         if self.query_count >= self.max_client_queries_per_round:
             raise BenchmarkError("client query budget exhausted")
         self.query_count += 1
-        mapping = {
-            "capital": self.client.capital,
-            "loss_tolerance": self.client.max_loss_pct,
-            "maturity": self.client.max_maturity_months,
-            "product_types": self.client.allowed_product_types,
-            "protection": self.client.principal_protection_required,
-            "preferences": self.client.preferences,
-        }
-        return {"topic": topic, "answer": mapping[topic], "queries_left": self.max_client_queries_per_round - self.query_count}
+        profile, _ = self._client_profile_facts(self.CLIENT_TOPIC_FIELDS[topic])
+        answer = next(iter(profile.values())) if len(profile) == 1 else profile
+        return {"topic": topic, "answer": answer,
+                "queries_left": self.max_client_queries_per_round - self.query_count}
+
+    def _visible_check(self, check: CheckResult) -> CheckResult:
+        """Return a condition-safe view of one deterministic check."""
+        if self.condition.full_information or check.check_id not in _PRIVATE_CLIENT_CHECK_IDS:
+            return check
+        return replace(
+            check,
+            observed=None,
+            limit=None,
+            reason="client mandate value hidden; query the relevant client topic",
+        )
+
+    def public_quote_payload(self, quote: Quote) -> dict:
+        """Condition-aware quote payload used at every policy-facing boundary."""
+        payload = quote.public_payload()
+        payload["checks"] = [asdict(self._visible_check(check)) for check in quote.checks]
+        return payload
 
     def request_quote(self, product: ProductSpec) -> dict:
         if self.submitted:
             raise BenchmarkError("the round is already submitted")
         if self.quote_count >= self.max_quotes_per_round:
             raise BenchmarkError("quote budget exhausted")
+        forged_state = (
+            product.reference_spot is not None
+            or product.barrier_touched
+            or product.knock_in_active
+            or product.elapsed_months != 0
+        )
+        if forged_state:
+            raise BenchmarkError(
+                "new quote requests cannot set environment-maintained lifecycle state"
+            )
         self.quote_count += 1
+        # ProductSpec is mutable for v2 compatibility.  Bind the quote to an
+        # immutable-by-convention value snapshot so a caller cannot mutate the
+        # original object between request_quote and submit_design (TOCTOU).
+        quoted_product = replace(product)
         quote = self.desk.quote(
-            product, self.snapshot, self.client, self.portfolio,
+            quoted_product, self.snapshot, self.client, self.portfolio,
             self.state_version, self.quote_count,
         )
-        self.quotes[quote.quote_id] = (quote, product)
-        return quote.public_payload()
+        self.quotes[quote.quote_id] = (quote, quoted_product)
+        return self.public_quote_payload(quote)
 
     def submit_design(self, quote_id: str, explanation: str = "") -> dict:
         if self.submitted:
@@ -1038,14 +1312,35 @@ class LongHorizonEnvironment:
         accepted = hard_executable and contract_ok
         if accepted:
             if self.condition.dynamic:
+                fixing = self.snapshot.spot
+                direction = _barrier_direction(product)
+                issued_product = replace(
+                    product,
+                    barrier_direction=direction,
+                    reference_spot=fixing,
+                    barrier_touched=False,
+                    knock_in_active=False,
+                    elapsed_months=0,
+                )
                 self.portfolio.add(Position(
                     position_id=f"P-{quote.quote_id[2:]}",
-                    product=product,
+                    product=issued_product,
                     remaining_months=product.maturity_months,
                     delta_dollars=quote.delta_dollars,
                     vega_dollars=quote.vega_dollars,
                     stress_loss=quote.stress_loss,
                     quote_margin=quote.dealer_margin,
+                    trade_date=self.snapshot.as_of,
+                    initial_fixing=fixing,
+                    absolute_strike=product.strike_pct * fixing,
+                    absolute_barrier=(
+                        product.barrier_pct * fixing if product.barrier_pct is not None else None
+                    ),
+                    barrier_direction=direction,
+                    running_min=fixing,
+                    running_max=fixing,
+                    current_fair_value=quote.fair_value,
+                    last_valuation_round=self.snapshot.round_num,
                 ))
             self.client_memory.accepted_products += 1
             self.client_memory.trust = min(1.0, self.client_memory.trust + 0.05)
@@ -1057,8 +1352,12 @@ class LongHorizonEnvironment:
             "hard_executable": hard_executable,
             "client_contract_pass": contract_ok,
             "quote_id": quote_id,
-            "hard_failures": [asdict(c) for c in quote.checks if not c.passed],
-            "contract_failures": [asdict(c) for c in contract_checks if not c.passed],
+            "hard_failures": [
+                asdict(self._visible_check(c)) for c in quote.checks if not c.passed
+            ],
+            "contract_failures": [
+                asdict(self._visible_check(c)) for c in contract_checks if not c.passed
+            ],
             "dealer_margin": quote.dealer_margin if accepted else 0.0,
             "explanation": explanation,
         }
@@ -1096,23 +1395,25 @@ class LongHorizonEnvironment:
             return None, FormalFacts(state_version=self.state_version)
 
         if role == "trading_desk":
-            block = quote.public_payload()
+            block = self.public_quote_payload(quote)
+            visible_checks = tuple(self._visible_check(c) for c in quote.checks)
             facts = FormalFacts(
                 state_version=self.state_version,
                 quote={"quote_id": quote.quote_id},
-                checks=quote.checks,
+                checks=visible_checks,
                 allowed_numeric_strings=_collect_numeric_strings(block),
             )
         else:  # risk_control: PASS/FAIL subset only, never any price
+            visible_checks = tuple(self._visible_check(c) for c in quote.checks)
             checks_block = [
                 {"check_id": c.check_id, "status": c.status,
                  "observed": c.observed, "limit": c.limit, "severity": c.severity}
-                for c in quote.checks
+                for c in visible_checks
             ]
             block = {"checks": checks_block, "hard_pass": quote.hard_pass}
             facts = FormalFacts(
                 state_version=self.state_version,
-                checks=quote.checks,
+                checks=visible_checks,
                 allowed_numeric_strings=_collect_numeric_strings(checks_block),
             )
         return block, facts
@@ -1164,16 +1465,21 @@ class LongHorizonEnvironment:
             "degraded": resp.degraded,
         }
 
-    def _client_profile_facts(self):
+    def _client_profile_facts(self, fields: Iterable[str] | None = None):
         """Full hidden client profile injected to the client LLM as grounding facts."""
         from .env_agents import FormalFacts
 
         profile = {
             **self._full_client_payload(),
+            "accepting_new_products": self.client.accepting_new_products,
             "min_hit_prob": self.client.min_hit_prob,
             "min_return_pct": self.client.min_return_pct,
             "risk_appetite": self.client.risk_appetite,
+            "current_focus": self.client.current_focus,
         }
+        if fields is not None:
+            selected = tuple(fields)
+            profile = {key: profile[key] for key in selected}
         facts = FormalFacts(
             state_version=self.state_version,
             fact_ids=tuple(profile.keys()),
@@ -1196,7 +1502,7 @@ class LongHorizonEnvironment:
         if self.query_count >= self.max_client_queries_per_round:
             raise BenchmarkError("client query budget exhausted")
         self.query_count += 1
-        profile, facts = self._client_profile_facts()
+        profile, facts = self._client_profile_facts(self.CLIENT_TOPIC_FIELDS[topic])
         self._turn_id += 1
         queries_left = self.max_client_queries_per_round - self.query_count
         request = RoleRequest(
@@ -1303,12 +1609,14 @@ class LongHorizonEnvironment:
         if self.round_index >= len(self.snapshots) - 1:
             raise BenchmarkError("episode is complete")
         matured: list[str] = []
+        next_snapshot = self.snapshots[self.round_index + 1]
         if self.condition.dynamic:
-            matured = self.portfolio.advance_month()
+            matured = self.portfolio.advance_month(next_snapshot)
         else:
             self.portfolio.reset()
             self.client_memory = ClientMemory()
         self.round_index += 1
+        self.client = resolve_client_profile(self.base_client, self.snapshot.round_num)
         self.quote_count = 0
         self.query_count = 0
         self.consult_count = 0
@@ -1330,7 +1638,7 @@ class CandidateArchive:
         self.records: list[CandidateRecord] = []
 
     def add(self, product: ProductSpec, quote: Quote) -> None:
-        self.records.append(CandidateRecord(product, quote))
+        self.records.append(CandidateRecord(replace(product), quote))
 
     def best_feasible(self) -> CandidateRecord | None:
         feasible = [record for record in self.records if record.quote.hard_pass]

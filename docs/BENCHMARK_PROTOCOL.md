@@ -1,4 +1,11 @@
-# MIRAGE CSI Long-Horizon Benchmark Protocol (v2)
+# MIRAGE CSI Protocol: v2 Legacy Benchmark and v3 Environment Spine
+
+> **Version boundary.** The CLI and `LongHorizonEnvironment` described by the
+> factorial sections below are the reproducible **v2 legacy benchmark**. The
+> new `mirage.environment` package is a **v3-spine / Level-0** synchronous
+> training interface in which partial observability and dynamic state are
+> invariants rather than experimental conditions. v2 and v3 trajectories are
+> versioned separately and must never be pooled in one result table.
 
 ## Research claim
 
@@ -19,10 +26,40 @@ document only describes behaviour that is implemented and covered by
 `tests/`; features named in `docs/redesign/` but not yet wired into the CLI or
 the runner are marked "not enabled / future work".
 
-The pre-registered main design is Full/Partial information crossed with
+The legacy v2 pre-registered design is Full/Partial information crossed with
 Static/Dynamic state. Static rounds reset portfolio and client history. Dynamic
-rounds retain outstanding notional, remaining maturity, delta, vega, stress loss
-and client history.
+rounds retain issue fixing, absolute contract levels, barrier/knock-in/autocall
+path state, remaining maturity and client history; FV, delta, vega and stress
+loss are recomputed from the next market snapshot. Barrier monitoring remains
+a monthly-snapshot approximation. Full/Static are not v3 task conditions.
+
+## v3-spine / Level-0 boundary
+
+`mirage.environment.MirageStructurerEnv` exposes typed `reset`/`step`
+transitions around the deterministic core. Its actions are `AskClient`,
+`RequestQuote`, `SubmitDesign`, `SubmitProduct`, `Skip` and `InvalidAction`;
+its output keeps an unscalarised `RewardComponents` vector and separate
+`ConstraintSignals`. The policy-visible `Observation` never contains the full
+client profile. By default `info` contains only version/hash/run metadata.
+Evaluator-only truth appears as `info["privileged_state"]` only when the
+harness explicitly opts into `expose_privileged_info=True`; it must never be
+passed to a policy. Partial quote and settlement payloads expose client check
+IDs/statuses but redact their exact observed values, limits and reasons.
+
+The core contains no LLM call, prompt, strategy, forced completion or oracle.
+`TrajectoryRecorder` stores complete typed transitions with schema/environment/
+pricing/task versions and a SHA-256 state/record chain. This is an architectural
+spine, not yet a claim that the planned payoff DSL, solve-for tools, task
+generator, teacher hierarchy, Pareto evaluator or lifecycle-P&L reward are
+complete.
+
+Typed product actions are canonicalised through the same parser as JSON
+actions; policies cannot set `reference_spot`, barrier-history or elapsed-time
+fields. Quote storage snapshots the mutable legacy `ProductSpec`, preventing
+post-quote mutation before submission. Invalid actions cannot run forever:
+`max_steps_per_round` ends the rollout with `truncated=True`. Reward/termination
+configuration and reset options are committed into the state hash, and the
+trajectory metadata commits an environment-configuration hash.
 
 ## Frozen episode design
 
@@ -117,11 +154,14 @@ attainment ratio can never exceed 1 + 1e-9.
 before the agent acts, it prices every lattice candidate against the *current*
 portfolio state and returns the maximum-`dealer_margin` feasible one. It is not
 an episode-level (hindsight/DP) upper bound and is not claimed as one; a
-hindsight oracle is future work.
+hindsight oracle is future work. The runner passes the environment's exact
+`domain` and `quote_policy`; it no longer silently rebuilds a default grid or
+default pricing policy.
 
 ## Information boundary, tools and per-round budgets
 
-The tested model sees `get_round_brief()` and can call:
+The tested model sees `get_round_brief()` (including the public routing field
+`client_id`, required by `ProductSpec.target_client`) and can call:
 
 - `query_client(topic)` -- deterministic in Full-information rounds (already
   disclosed) and in Partial-information rounds without an env role; routed
@@ -144,12 +184,13 @@ The tested model sees `get_round_brief()` and can call:
   `request_quote` immediately followed by `submit_design`.
 - `skip_round` -- ends the round with no submission.
 
-A submission or skip ends the round. If the model exhausts its action budget
-(`max_actions_per_round`, default 9) without submitting or skipping, one
-last-chance "forced prompt" turn is issued (`_run_forced_prompt`): only
-`submit_design` (against an already-issued quote) or `skip_round` is accepted;
-anything else leaves the round unsettled. See Metrics below for how this is
-scored.
+A submission or skip ends the round. `one_shot` is now literally one action:
+only `submit_product` or `skip_round` is legal, with no protocol-repair turn and
+no forced prompt. The interactive `quote_and_revise` and `ledger_archive`
+strategies retain the normal action budget (`max_actions_per_round`, default 9)
+and one last-chance forced-prompt turn after exhaustion; that turn accepts only
+`submit_design` against an already-issued quote or `skip_round`. See Metrics
+below for how this is scored.
 
 The model never receives a raw option chain, future observations, hidden
 client fields, cleaning rules or an unrestricted pricing calculator. Any
@@ -219,9 +260,10 @@ stress_loss_frac)` against `client.max_loss_pct`:
   runs.
 - `stress_loss_frac`: `stress_loss / notional`, from a frozen 3-scenario fair-
   value stress grid (spot -20%, spot +20%, vol +10 vol-points;
-  `_fair_value_stress_loss`). Strike and barrier levels are re-expressed to
-  keep their *absolute* price level fixed under the spot shock (not their
-  moneyness), and `worst_stress_id` records which scenario binds.
+  `_fair_value_stress_loss`). Stress copies freeze `reference_spot` at the
+  issue/base snapshot, so explicit strike/barrier levels and implicit
+  snowball/autocall trigger levels all keep their *absolute* price level under
+  spot shocks. `worst_stress_id` records which scenario binds.
 
 This is a **continuous loss proxy**, explicitly not a mathematical worst-case
 bound: it blends an expectation, a premium-at-risk figure and a 3-point stress
@@ -407,21 +449,31 @@ forced-prompt response, or an invalid action). There is no environment
 auto-submission path; a round with no valid model action settles as `none`
 with `dealer_margin=0`.
 
-- `hard_feasibility_rate`: share of rounds that **settled accepted**
-  (`hard_executable AND client_contract_pass`), pooling voluntary and
-  forced_prompt submissions together. It is a settlement-outcome rate, not "a
-  feasible quote existed somewhere in the round's request_quote calls" -- use
-  `quote_failures` / `failure_counts` for that.
-- `total_dealer_margin`, `mean_dealer_margin`: sum/mean of `dealer_margin`
-  over **voluntary**-accepted rounds only. `forced_prompt_margin` is reported
-  separately and never pooled into these.
+- `hard_execution_rate`: hard-executable submissions divided by all rounds;
+  this always-defined value is the pre-registered execution primary, so skips
+  and protocol failures count as non-execution rather than creating
+  condition-dependent missing data.
+- `hard_execution_rate_given_submission`: hard-executable submissions divided
+  by all submissions (`None` when there was no submission).
+- `contract_acceptance_rate_given_hard_pass`: contract-passing submissions
+  divided by hard-executable submissions (`None` when none passed HARD).
+- `settlement_acceptance_rate`: final accepted rounds divided by all rounds,
+  pooling voluntary and forced-prompt settlements. The old, misleading
+  `hard_feasibility_rate` key is retained only as a deprecated serialized alias
+  of this value.
+- `total_dealer_margin` and
+  `mean_dealer_margin_per_voluntary_accepted_trade`: sum/mean of
+  `dealer_margin` over **voluntary**-accepted rounds only.
+  `mean_dealer_margin` remains a deprecated alias; `forced_prompt_margin` is
+  reported separately and never pooled into these.
 - `voluntary_submission_rate`, `forced_prompt_rate`, `no_submission_rate`:
   the three-way partition of `submission_origin` over all rounds (sums to 1).
 - `one_step_attainment` (formerly `oracle_margin_attainment`): mean of
-  `dealer_margin / oracle_margin` over rounds that are voluntary and accepted
-  and have a positive one-step oracle margin; `None` if no such round exists.
-  Property-tested to never exceed `1 + 1e-9` (see the shared-lattice guarantee
-  above). Not an episode-level upper bound -- see the oracle definition above.
+  `dealer_margin / one_step_frontier_margin` over rounds that are voluntary and
+  accepted and have a positive frontier; `None` if no such round exists. A
+  ratio above `1 + 1e-9` is a protocol error, not silently reported. The
+  serialized `oracle_margin` field remains a deprecated trace alias. This is
+  not an episode-level upper bound -- see the oracle definition above.
 - `quote_failures`, `repeated_hard_violations`, `revision_success_rate`,
   `failure_counts`: request_quote-level diagnostics, independent of
   `submission_origin`.
@@ -436,11 +488,11 @@ with `dealer_margin=0`.
   no consult happened (see Two-tier outcomes above).
 
 `aggregate`'s per-(model, condition) table reports mean +/- a cluster
-(episode-level) bootstrap 95% CI for each of `hard_feasibility_rate`,
-`total_dealer_margin`, `one_step_attainment`, `voluntary_submission_rate`,
-`forced_prompt_rate`, `no_submission_rate`; a metric missing from every row in
-a results directory is reported as fully missing rather than silently
-defaulting.
+(episode-level) bootstrap 95% CI for canonical metrics including the three
+separated execution/contract/settlement rates, `total_dealer_margin`,
+`one_step_attainment` and the submission-origin rates; a metric missing from
+every row in a results directory is reported as fully missing rather than
+silently defaulting.
 
 ## Offline judge protocol
 
@@ -519,7 +571,9 @@ reject that key as unknown.
 - **Paired condition contrasts**: `paired_condition_contrasts` first collapses
   replicates to one mean per (episode, model, strategy, condition) cell, forms
   matched differences across conditions within each (episode, model,
-  strategy) base for two pre-registered contrasts --
+  strategy) base, then averages every correlated model/strategy/information-
+  level contrast sharing an episode to exactly one value per episode before
+  inference. The two pre-registered contrasts are
   `dynamic_degradation` (static minus dynamic, within each information level)
   and `partial_observability_degradation` (full minus partial, within each
   horizon) -- and reports a percentile bootstrap CI, a two-sided Wilcoxon
@@ -529,8 +583,10 @@ reject that key as unknown.
 - **Multiple comparisons**: Holm-Bonferroni step-down correction is applied
   within each model x metric's 2-contrast family (`holm_adjust`); `aggregate`'s
   markdown flags `holm_p < alpha` with `*`.
-- **Pre-registered primary outcomes**: `["hard_feasibility_rate",
-  "total_dealer_margin"]` (`manifest_payload`'s `protocol.primary_outcomes`).
+- **Pre-registered primary outcomes**:
+  `["hard_execution_rate", "settlement_acceptance_rate",
+  "total_dealer_margin"]` (`manifest_payload`'s
+  `protocol.primary_outcomes`).
   Every other metric/contrast is exploratory.
 
 ## Reproducibility: two separate claims
@@ -541,7 +597,8 @@ at temperature 0). It makes two narrower, implemented claims instead:
 
 - **`economic_replay`**: given a frozen episode trace (the recorded action
   sequence and the market snapshots), the deterministic core -- pricing, hard
-  checks, the contract gate, `dealer_margin`, `hard_feasibility_rate`,
+  checks, the contract gate, `dealer_margin`, the separated execution/
+  contract/settlement rates,
   `one_step_attainment` -- is a pure function of that input and recomputes
   identically every time, with no LLM call involved.
 - **`conversation_replay`**: env-role dialogue is reproducible from the

@@ -6,13 +6,19 @@ MIRAGE 评估 LLM 能否在部分可观测、有限的交易台/客户/风控交
 
 完整协议——回合设计、确定性定价/结算引擎、LLM原生环境角色、离线裁判、统计方法——冻结在[docs/BENCHMARK_PROTOCOL.md](docs/BENCHMARK_PROTOCOL.md)中。本 README 只是快速上手指引，不是协议正本。
 
+## 协议状态
+
+- `mirage.environment` 是新的 **v3-spine / Level-0** 训练接口：部分可观测与动态状态是环境不变量，动作和转移都有类型，`MirageStructurerEnv.reset()/step()` 内不调用 LLM，也不包含 forced prompt、策略规则或 oracle。默认不返回 evaluator 特权状态，并以有限的每轮 step 上限阻止 rollout 无限挂起。
+- 现有 CLI 与 `LongHorizonEnvironment` 明确保留为 **v2 遗留 benchmark**，用于复现已经冻结的 v2 运行。Full/Static 不再是 v3 任务条件，v2 与 v3 产物不得混合汇总。
+- v2 的动态头寸也已改为保存发行定盘价与绝对合约水平，处理障碍/敲入/自动赎回观察，并在下一市场快照重新计算 FV、delta、vega 与压力损失。
+
 > 早期的纳斯达克100“Structurer Playground”原型（`run.py`、`mirage.cli`、`mirage.engine`）已下线，这条入口在当前仓库中已不存在。`scenarios/structurer_nasdaq/`目录仅作为历史场景数据保留，无法通过任何现有命令运行。
 
 ## MIRAGE 评什么
 
 - **设计一份合约，而不只是给它定价**：被测模型（`structurer`）可以查询客户、就交易台/风控/客户做定性咨询、请求确定性报价、提交设计方案——每轮受固定预算约束：3次查询、3次咨询、3次报价。
 - **在部分可观测下工作**：Partial条件下，客户的硬性门槛（可投资金额、亏损容忍度、期限、产品白名单、保本要求）从不直接公开，只能通过`query_client`主动获取。
-- **跨决策承担风险**：Dynamic轮次在一个episode的六个月末轮次之间保留未平仓名义本金、delta、vega、压力损失与客户信任度；Static轮次每轮重置。
+- **跨决策承担风险**：v3 环境始终动态；v2 兼容 runner 仍保留历史 Static 消融以便复现旧协议。
 - **不能靠固定加价率取巧**：`dealer_margin`是一个成本加成函数，取决于价内程度、vega敞口、路径依赖度、蒙特卡洛定价不确定性、压力损失与容量占用率，并再乘以一个客户适配度系数——因此“永远报最大名义本金的vanilla”不再是占优策略。精确公式见协议文档。
 
 ## 双层架构
@@ -29,7 +35,8 @@ LongHorizonEnvironment（中心路由）
 DeterministicCore：定价 -> 硬约束检查 -> 客户合同门 -> 结算（从不调用 LLM）
    v
 主榜结算（始终计算，确定性）：
-  hard_executable、client_contract_pass、dealer_margin、hard_feasibility_rate、……
+  hard_execution_rate、hard_execution_rate_given_submission、
+  contract_acceptance_rate_given_hard_pass、settlement_acceptance_rate、dealer_margin、……
 次级 WorkflowOutcome（仅当传入 --roles-config 且发生提交时）：
   workflow_deal、交易台/风控/客户各自的动作
 离线：judge-runs（盲评、双裁判、批量跑；从不反馈进正式跑）
@@ -120,6 +127,7 @@ MIRAGE/
 |   |-- models.yaml                 # 模型注册表：各模型的接入信息
 |   `-- benchmark_roles.yaml        # v2 角色行为：structurer + 3 个环境 NPC + judges
 |-- mirage/
+|   |-- environment/                 # v3-spine typed reset/step 与轨迹记录
 |   |-- benchmark.py                # MarketSnapshot、RiskBudget、ProductDomainSpec、
 |   |                               #   TradingDesk、HardConstraintEngine、结算
 |   |-- benchmark_runner.py         # run_episode 主循环、compute_metrics

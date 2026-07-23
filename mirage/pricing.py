@@ -24,6 +24,49 @@ class PricingError(Exception):
     """定价参数非法或计算失败。"""
 
 
+def _reference_spot(product: ProductSpec, current_spot: float) -> float:
+    """返回合约发行时参考现货；旧 ProductSpec 默认以首次计价现货为参考。"""
+    reference = current_spot if product.reference_spot is None else product.reference_spot
+    if not isinstance(reference, (int, float)) or isinstance(reference, bool):
+        raise PricingError(f"reference_spot 必须是正的有限数字，实际为 {reference!r}")
+    reference = float(reference)
+    if not math.isfinite(reference) or reference <= 0.0:
+        raise PricingError(f"reference_spot 必须是正的有限数字，实际为 {reference!r}")
+    return reference
+
+
+def _remaining_months(product: ProductSpec) -> int:
+    """存续产品的剩余月数；elapsed_months 由环境维护，但定价边界仍做防御性校验。"""
+    elapsed = product.elapsed_months
+    if isinstance(elapsed, bool) or not isinstance(elapsed, int):
+        raise PricingError(f"elapsed_months 必须是整数，实际为 {elapsed!r}")
+    if elapsed < 0 or elapsed > product.maturity_months:
+        raise PricingError(
+            "elapsed_months 必须在 0 到 maturity_months 之间，"
+            f"实际为 {elapsed!r}"
+        )
+    return int(product.maturity_months) - elapsed
+
+
+def _barrier_direction(product: ProductSpec) -> str:
+    """获取发行时固定的障碍方向，兼容未携带新字段的旧式直接构造。"""
+    direction = product.barrier_direction
+    if direction is None:
+        barrier_pct = product.barrier_pct if product.barrier_pct is not None else 1.0
+        direction = "up" if barrier_pct > 1.0 else "down"
+    if direction not in ("up", "down"):
+        raise PricingError(f"未知障碍方向：{direction}")
+    return direction
+
+
+def _barrier_is_touched(spot: float, barrier: float, direction: str) -> bool:
+    if direction == "down":
+        return spot <= barrier
+    if direction == "up":
+        return spot >= barrier
+    raise PricingError(f"未知障碍方向：{direction}")
+
+
 # ---------------------------------------------------------------------------
 # 正态分布辅助函数
 # ---------------------------------------------------------------------------
@@ -125,22 +168,30 @@ def barrier_option(
     barrier: float,
     barrier_type: str,
     option_type: str,
+    barrier_direction: str,
+    *,
+    already_touched: bool = False,
 ) -> float:
     """Reiner-Rubinstein (1991) 障碍期权解析解，零返还（rebate=0）。
 
-    barrier_type 取值 {"knock_in", "knock_out"}；方向由 barrier 与 S 的相对位置推断：
-    barrier < S 为下障碍（down），barrier > S 为上障碍（up），barrier == S 视为已经触碰。
+    barrier_type 取值 {"knock_in", "knock_out"}；barrier_direction 是发行时
+    固定的 {"down", "up"}，不会随重估时现货位置反转。already_touched
+    用于继承存续期已触碰状态；当前现货在障碍边界上也视为触碰。
     """
     if barrier_type not in ("knock_in", "knock_out"):
         raise PricingError(f"未知障碍类型：{barrier_type}")
     if option_type not in ("call", "put"):
         raise PricingError(f"未知期权类型：{option_type}")
+    if barrier_direction not in ("down", "up"):
+        raise PricingError(f"未知障碍方向：{barrier_direction}")
 
     vanilla = bs_call(S, K, T, r, sigma, q) if option_type == "call" else bs_put(S, K, T, r, sigma, q)
 
-    # 已经触碰的边界情况（含 barrier == S）
-    is_down = barrier <= S
-    already_breached = (is_down and S <= barrier) or (not is_down and S >= barrier)
+    # 已经触碰的边界情况（含 barrier == S）。方向绝不由当前 S 重推。
+    is_down = barrier_direction == "down"
+    already_breached = already_touched or _barrier_is_touched(
+        S, barrier, barrier_direction
+    )
     if already_breached:
         return vanilla if barrier_type == "knock_in" else 0.0
 
@@ -270,18 +321,34 @@ def _mc_stats(
     drift: float | None = None,
     discount: bool = True,
     fixing_ratio: float = 1.0,
+    already_knocked_in: bool = False,
+    elapsed_months: int = 0,
 ) -> dict:
     """月度步长 GBM 蒙特卡洛核心：雪球 / 自动赎回结构定价与统计量。
 
     fixing_ratio = 期初定盘价 / 当前现货。合约的敲入/敲出/赎回水平与
     亏损结算均锚定期初定盘价的绝对水平；计算 delta 等需要扰动现货时，
     传入偏离 1 的 fixing_ratio 使触发水平保持绝对不变。
+
+    T_months 是合约总期限，elapsed_months 是已存续月数；仅模拟剩余路径，
+    但票息仍按发行起累计的总存续月数计算。already_knocked_in
+    使后续路径继承历史敲入，不会因重估重置。
     """
     if payoff_kind not in ("snowball", "autocallable"):
         raise PricingError(f"未知 MC 产品类型：{payoff_kind}")
 
+    if isinstance(elapsed_months, bool) or not isinstance(elapsed_months, int):
+        raise PricingError(f"elapsed_months 必须是整数，实际为 {elapsed_months!r}")
+    total_months = int(T_months)
+    if elapsed_months < 0 or elapsed_months > total_months:
+        raise PricingError(
+            f"elapsed_months 必须在 0 到 T_months 之间，实际为 {elapsed_months!r}"
+        )
+    if not math.isfinite(fixing_ratio) or fixing_ratio <= 0.0:
+        raise PricingError(f"fixing_ratio 必须是正的有限数字，实际为 {fixing_ratio!r}")
+
     dt = 1.0 / 12.0
-    n_steps = int(T_months)
+    n_steps = total_months - elapsed_months
     mu = drift if drift is not None else r
     rng = random.Random(seed)
 
@@ -299,6 +366,7 @@ def _mc_stats(
         min_ratio = 1.0
         cashflow = None
         term_t = None
+        payment_delay_months = None
 
         for t in range(1, n_steps + 1):
             z = rng.gauss(0.0, 1.0)
@@ -307,43 +375,53 @@ def _mc_stats(
 
             if payoff_kind == "snowball":
                 if knock_out_pct is not None and ratio >= knock_out_pct * fixing_ratio:
-                    cashflow = 1.0 + coupon_rate * (t / 12.0)
-                    term_t = t
+                    term_t = elapsed_months + t
+                    payment_delay_months = t
+                    cashflow = 1.0 + coupon_rate * (term_t / 12.0)
                     knock_out_count += 1
                     break
             else:  # autocallable
                 if autocall_pct is not None and ratio >= autocall_pct * fixing_ratio:
-                    cashflow = 1.0 + coupon_rate * (t / 12.0)
-                    term_t = t
+                    term_t = elapsed_months + t
+                    payment_delay_months = t
+                    cashflow = 1.0 + coupon_rate * (term_t / 12.0)
                     knock_out_count += 1
                     break
 
         if cashflow is None:
-            term_t = n_steps
+            term_t = total_months
+            payment_delay_months = n_steps
             if payoff_kind == "snowball":
                 knocked_in = (
-                    knock_in_pct is not None
-                    and min_ratio <= knock_in_pct * fixing_ratio
+                    (
+                        already_knocked_in
+                        or (
+                            knock_in_pct is not None
+                            and min_ratio <= knock_in_pct * fixing_ratio
+                        )
+                    )
                     and ratio < fixing_ratio
                 )
                 if knocked_in:
                     cashflow = ratio / fixing_ratio
                     knock_in_count += 1
                 else:
-                    cashflow = 1.0 + coupon_rate * (n_steps / 12.0)
+                    cashflow = 1.0 + coupon_rate * (total_months / 12.0)
             else:  # autocallable
                 knocked_in = (
-                    knock_in_pct is not None
-                    and min_ratio <= knock_in_pct * fixing_ratio
-                    and not protected
-                )
+                    already_knocked_in
+                    or (
+                        knock_in_pct is not None
+                        and min_ratio <= knock_in_pct * fixing_ratio
+                    )
+                ) and not protected
                 if knocked_in:
                     cashflow = min(ratio / fixing_ratio, 1.0)
                     knock_in_count += 1
                 else:
-                    cashflow = 1.0 + coupon_rate * (n_steps / 12.0)
+                    cashflow = 1.0 + coupon_rate * (total_months / 12.0)
 
-        t_years = term_t / 12.0
+        t_years = payment_delay_months / 12.0
         pv = cashflow * (math.exp(-r * t_years) if discount else 1.0)
         fair_values.append(pv)
         life_months.append(float(term_t))
@@ -384,6 +462,9 @@ def autocallable_price(
     n_paths: int = 10000,
     seed: int = 42,
     fixing_ratio: float = 1.0,
+    already_knocked_in: bool = False,
+    elapsed_months: int = 0,
+    protected: bool = False,
 ) -> dict:
     """自动赎回票据蒙特卡洛定价（fair_value 为单位名义本金的贴现现值）。"""
     stats = _mc_stats(
@@ -399,6 +480,9 @@ def autocallable_price(
         n_paths=n_paths,
         seed=seed,
         fixing_ratio=fixing_ratio,
+        already_knocked_in=already_knocked_in,
+        elapsed_months=elapsed_months,
+        protected=protected,
     )
     return {
         "fair_value": stats["fair_value"],
@@ -420,6 +504,8 @@ def snowball_price(
     n_paths: int = 10000,
     seed: int = 42,
     fixing_ratio: float = 1.0,
+    already_knocked_in: bool = False,
+    elapsed_months: int = 0,
 ) -> dict:
     """雪球结构蒙特卡洛定价（fair_value 为单位名义本金的贴现现值）。"""
     stats = _mc_stats(
@@ -435,6 +521,8 @@ def snowball_price(
         n_paths=n_paths,
         seed=seed,
         fixing_ratio=fixing_ratio,
+        already_knocked_in=already_knocked_in,
+        elapsed_months=elapsed_months,
     )
     return {
         "fair_value": stats["fair_value"],
@@ -470,12 +558,13 @@ def expected_payoff(product: ProductSpec, market: MarketState) -> float | None:
         return None
 
     S = market.spot
+    reference = _reference_spot(product, S)
     sigma = market.volatility
     q = market.dividend_yield
-    T = product.maturity_months / 12.0
+    T = _remaining_months(product) / 12.0
     mu = market.risk_free_rate + market.trend_alpha
-    K = product.strike_pct * S
-    m = product.notional / S
+    K = product.strike_pct * reference
+    m = product.notional / reference
 
     if product.product_type in _VANILLA_TYPES:
         if product.product_type == "vanilla_call":
@@ -483,18 +572,37 @@ def expected_payoff(product: ProductSpec, market: MarketState) -> float | None:
         else:
             e_points = math.exp(mu * T) * bs_put(S, K, T, mu, sigma, q)
         if product.principal_protected:
-            return product.notional * (1.0 + product.participation_rate * e_points / S)
+            return product.notional * (
+                1.0 + product.participation_rate * e_points / reference
+            )
         return m * product.participation_rate * e_points
 
     if product.product_type in _BARRIER_TYPES:
-        barrier = product.barrier_pct * S if product.barrier_pct is not None else S
+        barrier = (
+            product.barrier_pct * reference
+            if product.barrier_pct is not None
+            else reference
+        )
         option_type = "call" if product.product_type == "barrier_call" else "put"
         barrier_type = product.barrier_type or "knock_out"
+        barrier_direction = _barrier_direction(product)
         e_points = math.exp(mu * T) * barrier_option(
-            S, K, T, mu, sigma, q, barrier, barrier_type, option_type
+            S,
+            K,
+            T,
+            mu,
+            sigma,
+            q,
+            barrier,
+            barrier_type,
+            option_type,
+            barrier_direction,
+            already_touched=product.barrier_touched,
         )
         if product.principal_protected:
-            return product.notional * (1.0 + product.participation_rate * e_points / S)
+            return product.notional * (
+                1.0 + product.participation_rate * e_points / reference
+            )
         return m * product.participation_rate * e_points
 
     if product.product_type == "snowball":
@@ -511,6 +619,9 @@ def expected_payoff(product: ProductSpec, market: MarketState) -> float | None:
             knock_out_pct=kwargs["knock_out_pct"],
             drift=mu,
             discount=False,
+            fixing_ratio=reference / S,
+            already_knocked_in=product.knock_in_active,
+            elapsed_months=product.elapsed_months,
         )
         return stats["fair_value"] * product.notional
 
@@ -529,6 +640,9 @@ def expected_payoff(product: ProductSpec, market: MarketState) -> float | None:
             protected=product.principal_protected,
             drift=mu,
             discount=False,
+            fixing_ratio=reference / S,
+            already_knocked_in=product.knock_in_active,
+            elapsed_months=product.elapsed_months,
         )
         return stats["fair_value"] * product.notional
 
@@ -537,8 +651,9 @@ def expected_payoff(product: ProductSpec, market: MarketState) -> float | None:
 
 def _vanilla_price_points(product: ProductSpec, market: MarketState) -> float:
     S = market.spot
-    K = product.strike_pct * S
-    T = product.maturity_months / 12.0
+    reference = _reference_spot(product, S)
+    K = product.strike_pct * reference
+    T = _remaining_months(product) / 12.0
     r = market.risk_free_rate
     sigma = market.volatility
     q = market.dividend_yield
@@ -549,15 +664,32 @@ def _vanilla_price_points(product: ProductSpec, market: MarketState) -> float:
 
 def _barrier_price_points(product: ProductSpec, market: MarketState) -> float:
     S = market.spot
-    K = product.strike_pct * S
-    T = product.maturity_months / 12.0
+    reference = _reference_spot(product, S)
+    K = product.strike_pct * reference
+    T = _remaining_months(product) / 12.0
     r = market.risk_free_rate
     sigma = market.volatility
     q = market.dividend_yield
-    barrier = product.barrier_pct * S if product.barrier_pct is not None else S
+    barrier = (
+        product.barrier_pct * reference
+        if product.barrier_pct is not None
+        else reference
+    )
     option_type = "call" if product.product_type == "barrier_call" else "put"
     barrier_type = product.barrier_type or "knock_out"
-    return barrier_option(S, K, T, r, sigma, q, barrier, barrier_type, option_type)
+    return barrier_option(
+        S,
+        K,
+        T,
+        r,
+        sigma,
+        q,
+        barrier,
+        barrier_type,
+        option_type,
+        _barrier_direction(product),
+        already_touched=product.barrier_touched,
+    )
 
 
 def price_product(product: ProductSpec, market: MarketState) -> dict | None:
@@ -574,12 +706,13 @@ def price_product(product: ProductSpec, market: MarketState) -> dict | None:
         return None
 
     S = market.spot
+    reference = _reference_spot(product, S)
     sigma = market.volatility
     r = market.risk_free_rate
     q = market.dividend_yield
-    T = product.maturity_months / 12.0
-    K = product.strike_pct * S
-    m = product.notional / S
+    T = _remaining_months(product) / 12.0
+    K = product.strike_pct * reference
+    m = product.notional / reference
     participation = product.participation_rate
     details: dict = {}
 
@@ -588,42 +721,64 @@ def price_product(product: ProductSpec, market: MarketState) -> dict | None:
         option_type = "call" if product.product_type == "vanilla_call" else "put"
         raw_greeks = bs_greeks(S, K, T, r, sigma, q, option_type)
         greeks = {
-            "delta": raw_greeks["delta"] * participation,
+            # 下游直接乘 notional 得到 dollar-delta，因此这里返回
+            # 现货相对变动的名义占比：S/reference * dOption/dS。
+            "delta": raw_greeks["delta"] * participation * S / reference,
             "gamma": raw_greeks["gamma"] * participation,
             "vega": raw_greeks["vega"] * participation,
             "theta": raw_greeks["theta"] * participation,
         }
-        greeks["vega_pct"] = greeks["vega"] / S
+        greeks["vega_pct"] = greeks["vega"] / reference
 
         if product.principal_protected:
-            fair_value = product.notional * (math.exp(-r * T) + participation * price_points / S)
+            fair_value = product.notional * (
+                math.exp(-r * T) + participation * price_points / reference
+            )
         else:
             fair_value = m * participation * price_points
         details = {"price_points": price_points}
 
     elif product.product_type in _BARRIER_TYPES:
         price_points = _barrier_price_points(product, market)
-        barrier_level = product.barrier_pct * S if product.barrier_pct is not None else S
+        barrier_level = (
+            product.barrier_pct * reference
+            if product.barrier_pct is not None
+            else reference
+        )
         option_type = "call" if product.product_type == "barrier_call" else "put"
         barrier_type = product.barrier_type or "knock_out"
+        barrier_direction = _barrier_direction(product)
 
         def _g_points(s: float, vol: float) -> float:
             # 合约条款（行权价、障碍位）在产品设计时已固定为绝对水平，
             # 计算希腊值时只扰动现货价格，不随现货重新折算。
-            return barrier_option(s, K, T, r, vol, q, barrier_level, barrier_type, option_type)
+            return barrier_option(
+                s,
+                K,
+                T,
+                r,
+                vol,
+                q,
+                barrier_level,
+                barrier_type,
+                option_type,
+                barrier_direction,
+                already_touched=product.barrier_touched,
+            )
 
         # delta 在绝对价格上做中心差分（对"价格/现货"差分会混入 −price/S 项）
         bump_s = 0.01 * S
         delta_frac = (_g_points(S + bump_s, sigma) - _g_points(S - bump_s, sigma)) / (2.0 * bump_s)
 
         vol_bump = 0.01
-        p_vol_up = _g_points(S, sigma + vol_bump) / S
-        p_vol_down = _g_points(S, max(sigma - vol_bump, 1e-6)) / S
+        p_vol_up = _g_points(S, sigma + vol_bump) / reference
+        p_vol_down = _g_points(S, max(sigma - vol_bump, 1e-6)) / reference
         vega_pct = (p_vol_up - p_vol_down) / 2.0
-        vega_points = vega_pct * S
+        vega_points = vega_pct * reference
 
         greeks = {
-            "delta": delta_frac * participation,
+            # 与 vanilla 一致，将绝对价格导数转成相对现货变动占名义比。
+            "delta": delta_frac * participation * S / reference,
             "gamma": 0.0,
             "vega": vega_points * participation,
             "theta": 0.0,
@@ -631,7 +786,9 @@ def price_product(product: ProductSpec, market: MarketState) -> dict | None:
         }
 
         if product.principal_protected:
-            fair_value = product.notional * (math.exp(-r * T) + participation * price_points / S)
+            fair_value = product.notional * (
+                math.exp(-r * T) + participation * price_points / reference
+            )
         else:
             fair_value = m * participation * price_points
         details = {"price_points": price_points}
@@ -654,7 +811,9 @@ def price_product(product: ProductSpec, market: MarketState) -> dict | None:
                     knock_out_pct=kwargs["knock_out_pct"],
                     n_paths=MC_PATHS,
                     seed=seed,
-                    fixing_ratio=S / s,
+                    fixing_ratio=reference / s,
+                    already_knocked_in=product.knock_in_active,
+                    elapsed_months=product.elapsed_months,
                 )["fair_value"]
 
             mc_stats = snowball_price(
@@ -668,6 +827,9 @@ def price_product(product: ProductSpec, market: MarketState) -> dict | None:
                 knock_out_pct=kwargs["knock_out_pct"],
                 n_paths=MC_PATHS,
                 seed=MC_SEED,
+                fixing_ratio=reference / S,
+                already_knocked_in=product.knock_in_active,
+                elapsed_months=product.elapsed_months,
             )
         else:
             kwargs = _autocallable_kwargs(product)
@@ -685,7 +847,10 @@ def price_product(product: ProductSpec, market: MarketState) -> dict | None:
                     autocall_pct=kwargs["autocall_pct"],
                     n_paths=MC_PATHS,
                     seed=seed,
-                    fixing_ratio=S / s,
+                    fixing_ratio=reference / s,
+                    already_knocked_in=product.knock_in_active,
+                    elapsed_months=product.elapsed_months,
+                    protected=product.principal_protected,
                 )["fair_value"]
 
             mc_stats = autocallable_price(
@@ -699,6 +864,10 @@ def price_product(product: ProductSpec, market: MarketState) -> dict | None:
                 autocall_pct=kwargs["autocall_pct"],
                 n_paths=MC_PATHS,
                 seed=MC_SEED,
+                fixing_ratio=reference / S,
+                already_knocked_in=product.knock_in_active,
+                elapsed_months=product.elapsed_months,
+                protected=product.principal_protected,
             )
 
         pv_frac = mc_stats["fair_value"]
@@ -798,17 +967,29 @@ def hurdle_hit_prob(
 
     定义：
         realized_annual = (payoff_yuan − client_price) / notional × 12 / t_months
-    其中 t_months 为提前赎回产品的实际终止月份，否则为 maturity_months。
+    其中 t_months 为从当前估值日到提前赎回/到期的剩余月数。
     """
+    if (
+        not isinstance(product.participation_rate, (int, float))
+        or isinstance(product.participation_rate, bool)
+        or not math.isfinite(product.participation_rate)
+        or product.participation_rate <= 0.0
+    ):
+        raise PricingError(
+            "hurdle_hit_prob 要求 participation_rate > 0，"
+            f"实际为 {product.participation_rate!r}"
+        )
+
     if product.product_type == "custom":
         return None
 
     S0 = market.spot
+    reference = _reference_spot(product, S0)
     sigma = market.volatility
     q = market.dividend_yield
-    T = product.maturity_months / 12.0
+    T = _remaining_months(product) / 12.0
     mu = market.risk_free_rate + market.trend_alpha
-    K = product.strike_pct * S0
+    K = product.strike_pct * reference
     participation = product.participation_rate
     protected = product.principal_protected
     notional = product.notional
@@ -821,16 +1002,16 @@ def hurdle_hit_prob(
 
         if is_call:
             if protected:
-                # payoff_frac = 1 + participation * max(S_T − K, 0) / S0
+                # payoff_frac = 1 + participation * max(S_T − K, 0) / reference
                 excess = required_frac - 1.0
                 if excess <= 0.0:
                     return 1.0  # 保本地板已超过门槛
-                S_T_star = K + excess * S0 / participation
+                S_T_star = K + excess * reference / participation
             else:
-                # payoff_frac = participation * max(S_T − K, 0) / S0
+                # payoff_frac = participation * max(S_T − K, 0) / reference
                 if required_frac <= 0.0:
                     return 1.0
-                S_T_star = K + required_frac * S0 / participation
+                S_T_star = K + required_frac * reference / participation
 
             if S_T_star <= 0.0:
                 return 1.0
@@ -843,24 +1024,24 @@ def hurdle_hit_prob(
 
         else:  # vanilla_put
             if protected:
-                # payoff_frac = 1 + participation * max(K − S_T, 0) / S0
+                # payoff_frac = 1 + participation * max(K − S_T, 0) / reference
                 excess = required_frac - 1.0
                 if excess <= 0.0:
                     return 1.0
-                max_payoff_frac = 1.0 + participation * K / S0
+                max_payoff_frac = 1.0 + participation * K / reference
                 if required_frac > max_payoff_frac + 1e-12:
                     return 0.0
-                S_T_star = K - excess * S0 / participation
+                S_T_star = K - excess * reference / participation
                 if S_T_star <= 0.0:
                     return 0.0
             else:
-                # payoff_frac = participation * max(K − S_T, 0) / S0
+                # payoff_frac = participation * max(K − S_T, 0) / reference
                 if required_frac <= 0.0:
                     return 1.0
-                max_payoff_frac = participation * K / S0
+                max_payoff_frac = participation * K / reference
                 if required_frac > max_payoff_frac + 1e-12:
                     return 0.0
-                S_T_star = K - required_frac * S0 / participation
+                S_T_star = K - required_frac * reference / participation
                 if S_T_star <= 0.0:
                     return 0.0
 
@@ -888,9 +1069,13 @@ def _mc_hit_prob(
     但逐路径计算实现年化收益而非贴现现值。barrier 产品障碍监测为月度步长近似。
     """
     S0 = market.spot
+    reference = _reference_spot(product, S0)
+    fixing_ratio = reference / S0
     sigma = market.volatility
     q = market.dividend_yield
-    T_months = int(product.maturity_months)
+    total_months = int(product.maturity_months)
+    elapsed_months = product.elapsed_months
+    remaining_months = _remaining_months(product)
     notional = product.notional
     participation = product.participation_rate
     protected = product.principal_protected
@@ -905,40 +1090,45 @@ def _mc_hit_prob(
     for _ in range(MC_PATHS):
         ratio = 1.0  # S_t / S0
         cashflow_frac: float = 0.0  # payoff / notional
-        term_t: int = T_months
+        term_t: int = remaining_months
 
         if product.product_type in _BARRIER_TYPES:
             barrier_pct_val = product.barrier_pct if product.barrier_pct is not None else 1.0
+            barrier_ratio = barrier_pct_val * fixing_ratio
             barrier_type = product.barrier_type or "knock_out"
             is_call = product.product_type == "barrier_call"
             K_frac = product.strike_pct
-            is_up_barrier = barrier_pct_val > 1.0
+            barrier_direction = _barrier_direction(product)
 
-            touched = False
-            for _t in range(1, T_months + 1):
+            touched = product.barrier_touched or _barrier_is_touched(
+                S0, barrier_pct_val * reference, barrier_direction
+            )
+            for _t in range(1, remaining_months + 1):
+                if barrier_type == "knock_out" and touched:
+                    break
                 z = rng.gauss(0.0, 1.0)
                 ratio = ratio * math.exp(drift_term + vol_term * z)
                 if not touched:
-                    if is_up_barrier and ratio >= barrier_pct_val:
-                        touched = True
-                    elif not is_up_barrier and ratio <= barrier_pct_val:
-                        touched = True
+                    touched = _barrier_is_touched(
+                        ratio, barrier_ratio, barrier_direction
+                    )
                     # knock_out：已触碰即死，无需继续模拟到期
                     if barrier_type == "knock_out" and touched:
                         break
 
             # 对 knock_in：ratio 为到期价格比；knock_out 触碰后：payoff=0/floor，不依赖 ratio
+            terminal_ref_ratio = ratio / fixing_ratio
             if is_call:
-                opt_frac = participation * max(ratio - K_frac, 0.0)
+                opt_frac = participation * max(terminal_ref_ratio - K_frac, 0.0)
             else:
-                opt_frac = participation * max(K_frac - ratio, 0.0)
+                opt_frac = participation * max(K_frac - terminal_ref_ratio, 0.0)
 
             active = (barrier_type == "knock_out" and not touched) or (
                 barrier_type == "knock_in" and touched
             )
             option_part = opt_frac if active else 0.0
             cashflow_frac = (1.0 + option_part) if protected else option_part
-            term_t = T_months
+            term_t = remaining_months
 
         elif product.product_type == "snowball":
             ko_pct = 1.03
@@ -947,20 +1137,28 @@ def _mc_hit_prob(
             min_ratio = 1.0
             knocked_out = False
 
-            for t_step in range(1, T_months + 1):
+            for t_step in range(1, remaining_months + 1):
                 z = rng.gauss(0.0, 1.0)
                 ratio = ratio * math.exp(drift_term + vol_term * z)
                 min_ratio = min(min_ratio, ratio)
-                if ratio >= ko_pct:
-                    cashflow_frac = 1.0 + coupon * (t_step / 12.0)
+                if ratio >= ko_pct * fixing_ratio:
+                    cashflow_frac = 1.0 + coupon * (
+                        (elapsed_months + t_step) / 12.0
+                    )
                     term_t = t_step
                     knocked_out = True
                     break
 
             if not knocked_out:
-                term_t = T_months
-                knocked_in = min_ratio <= ki_pct and ratio < 1.0
-                cashflow_frac = ratio if knocked_in else 1.0 + coupon * (T_months / 12.0)
+                term_t = remaining_months
+                knocked_in = (
+                    product.knock_in_active or min_ratio <= ki_pct * fixing_ratio
+                ) and ratio < fixing_ratio
+                cashflow_frac = (
+                    ratio / fixing_ratio
+                    if knocked_in
+                    else 1.0 + coupon * (total_months / 12.0)
+                )
 
         elif product.product_type == "autocallable":
             autocall_pct = 1.05
@@ -969,27 +1167,44 @@ def _mc_hit_prob(
             min_ratio = 1.0
             knocked_out = False
 
-            for t_step in range(1, T_months + 1):
+            for t_step in range(1, remaining_months + 1):
                 z = rng.gauss(0.0, 1.0)
                 ratio = ratio * math.exp(drift_term + vol_term * z)
                 min_ratio = min(min_ratio, ratio)
-                if ratio >= autocall_pct:
-                    cashflow_frac = 1.0 + coupon * (t_step / 12.0)
+                if ratio >= autocall_pct * fixing_ratio:
+                    cashflow_frac = 1.0 + coupon * (
+                        (elapsed_months + t_step) / 12.0
+                    )
                     term_t = t_step
                     knocked_out = True
                     break
 
             if not knocked_out:
-                term_t = T_months
-                knocked_in = ki_pct is not None and min_ratio <= ki_pct and not protected
+                term_t = remaining_months
+                knocked_in = (
+                    product.knock_in_active
+                    or (
+                        ki_pct is not None
+                        and min_ratio <= ki_pct * fixing_ratio
+                    )
+                ) and not protected
                 cashflow_frac = (
-                    min(ratio, 1.0) if knocked_in else 1.0 + coupon * (T_months / 12.0)
+                    min(ratio / fixing_ratio, 1.0)
+                    if knocked_in
+                    else 1.0 + coupon * (total_months / 12.0)
                 )
 
         else:
             continue
 
-        realized_annual = (cashflow_frac - client_price / notional) * 12.0 / term_t
+        if term_t <= 0:
+            realized_annual = (
+                math.inf
+                if cashflow_frac >= client_price / notional
+                else -math.inf
+            )
+        else:
+            realized_annual = (cashflow_frac - client_price / notional) * 12.0 / term_t
         if realized_annual >= hurdle_annual - 1e-12:
             hits += 1
 
@@ -1120,15 +1335,17 @@ def best_case_line(
         return None
 
     S0 = market.spot
+    reference = _reference_spot(product, S0)
     r = market.risk_free_rate
     sigma = market.volatility
     q = market.dividend_yield
-    T = product.maturity_months / 12.0
+    remaining_months = _remaining_months(product)
+    T = remaining_months / 12.0
     T_months = int(product.maturity_months)
     participation = product.participation_rate
     protected = product.principal_protected
     notional = product.notional
-    K = product.strike_pct * S0
+    K = product.strike_pct * reference
 
     # 风险中性市场态（trend_alpha = 0，防止漏出真实漂移）
     rn_market = MarketState(
@@ -1160,6 +1377,9 @@ def best_case_line(
                 knock_in_pct=kwargs["knock_in_pct"],
                 knock_out_pct=kwargs["knock_out_pct"],
                 discount=False,
+                fixing_ratio=reference / S0,
+                already_knocked_in=product.knock_in_active,
+                elapsed_months=product.elapsed_months,
             )
         else:
             kwargs = _autocallable_kwargs(product)
@@ -1175,6 +1395,9 @@ def best_case_line(
                 autocall_pct=kwargs["autocall_pct"],
                 protected=protected,
                 discount=False,
+                fixing_ratio=reference / S0,
+                already_knocked_in=product.knock_in_active,
+                elapsed_months=product.elapsed_months,
             )
 
         # 票息情景 = 敲出 + 到期未敲入 = 1 − 敲入概率
@@ -1188,16 +1411,20 @@ def best_case_line(
     )
 
     if is_capped:
-        barrier_S = (product.barrier_pct or 1.0) * S0
+        barrier_S = (product.barrier_pct or 1.0) * reference
         is_call = product.product_type == "barrier_call"
 
         if is_call:
-            opt_at_cap = participation * max(barrier_S - K, 0.0) / S0
+            opt_at_cap = participation * max(barrier_S - K, 0.0) / reference
         else:
-            opt_at_cap = participation * max(K - barrier_S, 0.0) / S0
+            opt_at_cap = participation * max(K - barrier_S, 0.0) / reference
 
         cap_payoff_frac = (1.0 + opt_at_cap) if protected else opt_at_cap
-        cap_annual = (cap_payoff_frac - client_price / notional) * 12.0 / T_months
+        cap_annual = (
+            (cap_payoff_frac - client_price / notional)
+            * 12.0
+            / max(remaining_months, 1)
+        )
 
         # P_RN(realized_annual ≥ cap_annual)，以风险中性市场态调用 hurdle_hit_prob
         p = hurdle_hit_prob(product, rn_market, cap_annual, client_price)
@@ -1211,12 +1438,16 @@ def best_case_line(
     S_T_illus = S0 * (1.0 + move)
 
     if is_call:
-        opt_frac = participation * max(S_T_illus - K, 0.0) / S0
+        opt_frac = participation * max(S_T_illus - K, 0.0) / reference
     else:
-        opt_frac = participation * max(K - S_T_illus, 0.0) / S0
+        opt_frac = participation * max(K - S_T_illus, 0.0) / reference
 
     illus_payoff_frac = (1.0 + opt_frac) if protected else opt_frac
-    illus_annual = (illus_payoff_frac - client_price / notional) * 12.0 / T_months
+    illus_annual = (
+        (illus_payoff_frac - client_price / notional)
+        * 12.0
+        / max(remaining_months, 1)
+    )
 
     # RN 概率：P(S_T ≥ 1.2*S0) for call, P(S_T ≤ 0.8*S0) for put
     if product.product_type in _VANILLA_TYPES:
@@ -1291,9 +1522,14 @@ def _diag_cache_key(product: ProductSpec, market: MarketState, n_paths: int, see
         product.strike_pct,
         product.barrier_pct,
         product.barrier_type,
+        product.barrier_direction,
         product.coupon_rate,
         product.participation_rate,
         product.principal_protected,
+        product.reference_spot,
+        product.barrier_touched,
+        product.knock_in_active,
+        product.elapsed_months,
         market.spot,
         market.volatility,
         market.risk_free_rate,
@@ -1313,11 +1549,14 @@ def _mc_vanilla_barrier_stats(
     的 premium 项承担），故此处逐路径损失记 0；保本票据地板为 1，损失恒 0。
     """
     S0 = market.spot
+    reference = _reference_spot(product, S0)
+    fixing_ratio = reference / S0
     sigma = market.volatility
     q = market.dividend_yield
     r = market.risk_free_rate
-    T_months = int(product.maturity_months)
-    T = T_months / 12.0
+    total_months = int(product.maturity_months)
+    remaining_months = _remaining_months(product)
+    T = remaining_months / 12.0
     participation = product.participation_rate
     protected = product.principal_protected
     K_frac = product.strike_pct
@@ -1331,8 +1570,9 @@ def _mc_vanilla_barrier_stats(
     is_call = product.product_type in ("vanilla_call", "barrier_call")
     if is_barrier:
         barrier_pct_val = product.barrier_pct if product.barrier_pct is not None else 1.0
+        barrier_ratio = barrier_pct_val * fixing_ratio
         barrier_type = product.barrier_type or "knock_out"
-        is_up = barrier_pct_val > 1.0
+        barrier_direction = _barrier_direction(product)
 
     rng = random.Random(seed)
     pvs: list[float] = []
@@ -1341,25 +1581,32 @@ def _mc_vanilla_barrier_stats(
 
     for _ in range(n_paths):
         ratio = 1.0
-        touched = False
-        for _t in range(1, T_months + 1):
+        touched = is_barrier and (
+            product.barrier_touched
+            or _barrier_is_touched(
+                S0, barrier_pct_val * reference, barrier_direction
+            )
+        )
+        for _t in range(1, remaining_months + 1):
+            if is_barrier and barrier_type == "knock_out" and touched:
+                break
             z = rng.gauss(0.0, 1.0)
             ratio = ratio * math.exp(drift_term + vol_term * z)
             if is_barrier and not touched:
-                if is_up and ratio >= barrier_pct_val:
-                    touched = True
-                elif not is_up and ratio <= barrier_pct_val:
-                    touched = True
+                touched = _barrier_is_touched(
+                    ratio, barrier_ratio, barrier_direction
+                )
                 if barrier_type == "knock_out" and touched:
                     break
 
         if is_barrier and touched:
             touch_count += 1
 
+        terminal_ref_ratio = ratio / fixing_ratio
         if is_call:
-            opt = participation * max(ratio - K_frac, 0.0)
+            opt = participation * max(terminal_ref_ratio - K_frac, 0.0)
         else:
-            opt = participation * max(K_frac - ratio, 0.0)
+            opt = participation * max(K_frac - terminal_ref_ratio, 0.0)
 
         if is_barrier:
             active = (barrier_type == "knock_out" and not touched) or (
@@ -1388,7 +1635,7 @@ def _mc_vanilla_barrier_stats(
         pv_se_frac=pv_se,
         expected_loss_frac=sum(losses) / n,
         event_probs=event_probs,
-        expected_life_months=float(T_months),
+        expected_life_months=float(total_months),
         p95_loss_frac=p95,
     )
 
@@ -1430,6 +1677,9 @@ def mc_diagnostics(
                 knock_out_pct=kw["knock_out_pct"],
                 n_paths=n_paths,
                 seed=seed,
+                fixing_ratio=_reference_spot(product, market.spot) / market.spot,
+                already_knocked_in=product.knock_in_active,
+                elapsed_months=product.elapsed_months,
             )
         else:
             kw = _autocallable_kwargs(product)
@@ -1446,6 +1696,9 @@ def mc_diagnostics(
                 protected=product.principal_protected,
                 n_paths=n_paths,
                 seed=seed,
+                fixing_ratio=_reference_spot(product, market.spot) / market.spot,
+                already_knocked_in=product.knock_in_active,
+                elapsed_months=product.elapsed_months,
             )
         diag = MCDiagnostics(
             pv_mean_frac=stats["fair_value"],
@@ -1720,10 +1973,18 @@ def _fair_value_stress_loss(product: ProductSpec, market: MarketState) -> tuple[
     worst_loss = 0.0
     worst_id = ""
     for stress_id, spot_factor, vol_add in _STRESS_SCENARIOS:
+        # 压力仅扰动现货/波动率，不改写合约条款。对旧式
+        # reference_spot=None 的发行时产品，在压力副本上显式冻结
+        # 基准市场现货。这不仅锁定 strike/barrier，也锁定雪球/
+        # autocall 的隐式 1.03/1.05 敲出水平。
         stressed_product = replace(
             product,
-            strike_pct=product.strike_pct / spot_factor,
-            barrier_pct=(product.barrier_pct / spot_factor if product.barrier_pct is not None else None),
+            reference_spot=_reference_spot(product, market.spot),
+            barrier_direction=(
+                _barrier_direction(product)
+                if product.product_type in _BARRIER_TYPES
+                else None
+            ),
         )
         stressed_market = replace(
             market,

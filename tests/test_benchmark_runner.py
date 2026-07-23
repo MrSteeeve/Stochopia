@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import FrozenInstanceError
 from datetime import date
 from pathlib import Path
 
@@ -12,18 +13,45 @@ import yaml
 
 from mirage.benchmark import (
     BenchmarkCondition,
+    BenchmarkError,
     LongHorizonEnvironment,
     MarketSnapshot,
+    PortfolioState,
+    ProductDomainSpec,
     RiskBudget,
     WorkflowOutcome,
+    oracle_best_quote,
 )
-from mirage.benchmark_runner import EpisodeTrace, RoundTrace, compute_metrics, run_episode
+from mirage.benchmark_runner import (
+    PROTOCOL_POLICIES,
+    RUNNER_SYSTEM_PROMPT,
+    EpisodeTrace,
+    RoundTrace,
+    compute_metrics,
+    run_episode,
+)
 from mirage.env_agents import FrozenEnvAgent
 from mirage.llm import BaseLLMClient, MockLLMClient
+from mirage.pricing import PricingError, QuotePolicy
 from mirage.products import ClientProfile
 from mirage.role_config import InferenceSpec, RetryPolicy, RoleSpecV2
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+# A one-candidate lattice keeps runner tests fast and makes the expected
+# one-step frontier transparent. It exactly contains product_payload().
+RUNNER_DOMAIN = ProductDomainSpec(
+    product_types=("vanilla_call",),
+    notional_fractions=(.10,),
+    maturities=(3,),
+    strikes=(.95,),
+    barriers=(),
+    coupons=(),
+    participations=(1.0,),
+    principal_protected=(True,),
+    version="runner-test-domain-v1",
+)
 
 
 def product_payload(notional=1_000_000):
@@ -59,14 +87,20 @@ def environment():
         MarketSnapshot("E", 1, date(2023, 1, 31), "CSI500", 6000, 0.02, realized_vol_20d=0.2, source="fixture"),
         MarketSnapshot("E", 2, date(2023, 2, 28), "CSI500", 6100, 0.02, realized_vol_20d=0.2, source="fixture"),
     ]
-    return LongHorizonEnvironment(states, _client_profile(), _risk_budget(), BenchmarkCondition(False, True))
+    return LongHorizonEnvironment(
+        states, _client_profile(), _risk_budget(), BenchmarkCondition(False, True),
+        domain=RUNNER_DOMAIN,
+    )
 
 
 def single_round_environment():
     states = [
         MarketSnapshot("E", 1, date(2023, 1, 31), "CSI500", 6000, 0.02, realized_vol_20d=0.2, source="fixture"),
     ]
-    return LongHorizonEnvironment(states, _client_profile(), _risk_budget(), BenchmarkCondition(False, True))
+    return LongHorizonEnvironment(
+        states, _client_profile(), _risk_budget(), BenchmarkCondition(False, True),
+        domain=RUNNER_DOMAIN,
+    )
 
 
 class _ForcedChoiceClient(MockLLMClient):
@@ -99,9 +133,16 @@ async def test_one_shot_runner_and_metrics():
     trace = await run_episode(environment(), MockLLMClient([response, response]), strategy="one_shot")
     assert len(trace.rounds) == 2
     assert all(item.accepted for item in trace.rounds)
+    assert all(item.hard_executable for item in trace.rounds)
+    assert all(item.client_contract_pass for item in trace.rounds)
+    assert all(item.contract_failures == [] for item in trace.rounds)
     assert all(item.submission_origin == "voluntary" for item in trace.rounds)
     metrics = compute_metrics(trace, oracle_margins=[100_000, 100_000])
     assert metrics["hard_feasibility_rate"] == 1.0
+    assert metrics["hard_execution_rate"] == 1.0
+    assert metrics["settlement_acceptance_rate"] == 1.0
+    assert metrics["hard_execution_rate_given_submission"] == 1.0
+    assert metrics["contract_acceptance_rate_given_hard_pass"] == 1.0
     assert metrics["submission_rate"] == 1.0
     assert metrics["voluntary_submission_rate"] == 1.0
     assert metrics["forced_prompt_rate"] == 0.0
@@ -109,6 +150,195 @@ async def test_one_shot_runner_and_metrics():
     assert metrics["forced_prompt_margin"] == 0.0
     assert metrics["total_dealer_margin"] > 0.0
     assert metrics["mean_dealer_margin"] == pytest.approx(metrics["total_dealer_margin"] / 2)
+    assert metrics["mean_dealer_margin_per_voluntary_accepted_trade"] == pytest.approx(
+        metrics["total_dealer_margin"] / 2
+    )
+
+
+def test_protocol_policies_are_immutable_and_one_shot_is_strict():
+    policy = PROTOCOL_POLICIES["one_shot"]
+    assert policy.allowed_actions == frozenset({"submit_product", "skip_round"})
+    assert policy.action_budget == 1
+    assert policy.protocol_repair is False
+    assert policy.forced_prompt is False
+    with pytest.raises(FrozenInstanceError):
+        policy.action_budget = 2  # type: ignore[misc]
+
+
+def test_runner_fallback_prompt_matches_parser_contract():
+    assert "purchase_status|risk_appetite|return_hurdle" in RUNNER_SYSTEM_PROMPT
+    assert "participation_rate: 参与率 (0,10]" in RUNNER_SYSTEM_PROMPT
+    assert 'barrier_direction: 可选，null 或 "up" | "down"' in RUNNER_SYSTEM_PROMPT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [
+    json.dumps({"action": "query_client", "topic": "capital"}),
+    json.dumps({"action": "request_quote", "product": product_payload()}),
+    "not-json",
+])
+async def test_one_shot_forbidden_or_malformed_action_has_no_repair_or_forced_prompt(raw):
+    valid_second_turn = json.dumps({"action": "skip_round"})
+    client = MockLLMClient([raw, valid_second_turn])
+    env = single_round_environment()
+
+    trace = await run_episode(
+        env, client, strategy="one_shot", max_actions_per_round=99,
+    )
+
+    round_trace = trace.rounds[0]
+    assert client.total_usage["calls"] == 1
+    assert len(round_trace.actions) == 1
+    assert round_trace.actions[0].action == "protocol_error"
+    assert round_trace.submitted is False
+    assert round_trace.submission_origin == "none"
+    assert env.query_count == 0
+    assert env.quote_count == 0
+    assert not any(action.action.startswith("forced_prompt") for action in round_trace.actions)
+
+
+@pytest.mark.asyncio
+async def test_one_shot_skip_is_the_only_non_submission_terminal_action():
+    client = MockLLMClient([json.dumps({"action": "skip_round"}), "not-used"])
+    trace = await run_episode(single_round_environment(), client, strategy="one_shot")
+    round_trace = trace.rounds[0]
+    assert client.total_usage["calls"] == 1
+    assert [action.action for action in round_trace.actions] == ["skip_round"]
+    assert round_trace.submitted is False
+    assert round_trace.submission_origin == "none"
+
+
+@pytest.mark.asyncio
+async def test_zero_participation_is_recorded_as_protocol_error_not_episode_crash():
+    invalid_product = product_payload()
+    invalid_product["participation_rate"] = 0
+    response = json.dumps({"action": "submit_product", "product": invalid_product})
+    client = MockLLMClient([response, json.dumps({"action": "skip_round"})])
+
+    trace = await run_episode(single_round_environment(), client, strategy="one_shot")
+
+    round_trace = trace.rounds[0]
+    assert client.total_usage["calls"] == 1
+    assert round_trace.submitted is False
+    assert [action.action for action in round_trace.actions] == ["protocol_error"]
+    assert "participation_rate" in round_trace.actions[0].response["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary_error", [
+    PricingError("pricing boundary"),
+    ArithmeticError("numeric boundary"),
+], ids=["pricing", "arithmetic"])
+async def test_tool_boundary_pricing_errors_are_recorded_not_raised(monkeypatch, boundary_error):
+    env = single_round_environment()
+
+    def fail_quote(_product):
+        raise boundary_error
+
+    monkeypatch.setattr(env, "request_quote", fail_quote)
+    response = json.dumps({"action": "submit_product", "product": product_payload()})
+    trace = await run_episode(env, MockLLMClient([response]), strategy="one_shot")
+
+    round_trace = trace.rounds[0]
+    assert [action.action for action in round_trace.actions] == ["protocol_error"]
+    assert "boundary" in round_trace.actions[0].response["error"]
+    assert round_trace.submitted is False
+
+
+@pytest.mark.asyncio
+async def test_frontier_uses_environment_nondefault_domain_and_quote_policy():
+    policy = QuotePolicy(
+        a_f=QuotePolicy().a_f * 4,
+        a_v=QuotePolicy().a_v * 4,
+        a_p=QuotePolicy().a_p * 4,
+        a_b=QuotePolicy().a_b * 4,
+    )
+    states = [
+        MarketSnapshot(
+            "E", 1, date(2023, 1, 31), "CSI500", 6000, 0.02,
+            realized_vol_20d=0.2, source="fixture",
+        ),
+    ]
+    client_profile = _client_profile()
+    client_profile.min_hit_prob = 0.0
+    env = LongHorizonEnvironment(
+        states,
+        client_profile,
+        _risk_budget(),
+        BenchmarkCondition(False, True),
+        domain=RUNNER_DOMAIN,
+        quote_policy=policy,
+    )
+    expected = oracle_best_quote(
+        RUNNER_DOMAIN,
+        env.snapshot,
+        env.client,
+        PortfolioState(),
+        _risk_budget(),
+        policy=policy,
+    )
+    default_policy_frontier = oracle_best_quote(
+        RUNNER_DOMAIN,
+        env.snapshot,
+        env.client,
+        PortfolioState(),
+        _risk_budget(),
+        policy=QuotePolicy(),
+    )
+    assert expected is not None
+    assert default_policy_frontier is not None
+    assert expected[1].dealer_margin != pytest.approx(default_policy_frontier[1].dealer_margin)
+
+    response = json.dumps({
+        "action": "submit_product",
+        "product": product_payload(),
+        "explanation": "same custom-policy candidate",
+    })
+    trace = await run_episode(env, MockLLMClient([response]), strategy="one_shot")
+    round_trace = trace.rounds[0]
+
+    assert round_trace.one_step_frontier_margin == pytest.approx(expected[1].dealer_margin)
+    assert round_trace.oracle_margin == pytest.approx(expected[1].dealer_margin)
+    assert round_trace.dealer_margin == pytest.approx(expected[1].dealer_margin)
+    assert compute_metrics(trace)["one_step_attainment"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_round_trace_records_contract_rejection_after_hard_execution():
+    client_profile = _client_profile()
+    client_profile.min_hit_prob = 0.999999
+    states = [
+        MarketSnapshot(
+            "E", 1, date(2023, 1, 31), "CSI500", 6000, 0.02,
+            realized_vol_20d=0.2, source="fixture",
+        ),
+    ]
+    env = LongHorizonEnvironment(
+        states,
+        client_profile,
+        _risk_budget(),
+        BenchmarkCondition(False, True),
+        domain=RUNNER_DOMAIN,
+    )
+    response = json.dumps({
+        "action": "submit_product",
+        "product": product_payload(),
+        "explanation": "hard executable but misses client hurdle",
+    })
+
+    trace = await run_episode(env, MockLLMClient([response]), strategy="one_shot")
+    round_trace = trace.rounds[0]
+
+    assert round_trace.submitted is True
+    assert round_trace.hard_executable is True
+    assert round_trace.client_contract_pass is False
+    assert round_trace.accepted is False
+    assert "CONTRACT_HURDLE" in round_trace.contract_failures
+    metrics = compute_metrics(trace)
+    assert metrics["hard_execution_rate_given_submission"] == 1.0
+    assert metrics["hard_execution_rate"] == 1.0
+    assert metrics["contract_acceptance_rate_given_hard_pass"] == 0.0
+    assert metrics["settlement_acceptance_rate"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -136,7 +366,8 @@ async def test_no_submission_when_model_never_submits_or_skips():
 
 
 @pytest.mark.asyncio
-async def test_forced_prompt_submission_is_tagged_and_excluded_from_primary_margin():
+@pytest.mark.parametrize("strategy", ["quote_and_revise", "ledger_archive"])
+async def test_forced_prompt_submission_is_tagged_and_excluded_from_primary_margin(strategy):
     """预算内只 request_quote（不提交），追加的最后机会消息里模型才 submit_design：
     origin="forced_prompt"，真实成交、portfolio 更新，但不计入 total_dealer_margin。"""
     quote_action = json.dumps({"action": "request_quote", "product": product_payload()})
@@ -148,12 +379,15 @@ async def test_forced_prompt_submission_is_tagged_and_excluded_from_primary_marg
 
     client = _ForcedChoiceClient([quote_action], on_forced_prompt)
     env = single_round_environment()
-    trace = await run_episode(env, client, strategy="ledger_archive", max_actions_per_round=1)
+    trace = await run_episode(env, client, strategy=strategy, max_actions_per_round=1)
 
     assert len(client.forced_prompt_payloads) == 1
     round_trace = trace.rounds[0]
     assert round_trace.submitted is True
     assert round_trace.accepted is True
+    assert round_trace.hard_executable is True
+    assert round_trace.client_contract_pass is True
+    assert round_trace.contract_failures == []
     assert round_trace.submission_origin == "forced_prompt"
     assert round_trace.dealer_margin > 0.0
     assert round_trace.submitted_product is not None
@@ -221,10 +455,13 @@ def test_compute_metrics_splits_mixed_origins():
     rounds = [
         RoundTrace(
             round_num=1, submitted=True, accepted=True,
-            submission_origin="voluntary", dealer_margin=100.0, oracle_margin=200.0,
+            hard_executable=True, client_contract_pass=True,
+            submission_origin="voluntary", dealer_margin=100.0,
+            one_step_frontier_margin=200.0,
         ),
         RoundTrace(
             round_num=2, submitted=True, accepted=True,
+            hard_executable=True, client_contract_pass=True,
             submission_origin="forced_prompt", dealer_margin=50.0, oracle_margin=100.0,
         ),
         RoundTrace(
@@ -234,6 +471,8 @@ def test_compute_metrics_splits_mixed_origins():
         ),
         RoundTrace(
             round_num=4, submitted=True, accepted=False,
+            hard_executable=True, client_contract_pass=False,
+            contract_failures=["CONTRACT_HURDLE"],
             submission_origin="voluntary", dealer_margin=0.0, oracle_margin=60.0,
         ),
     ]
@@ -242,16 +481,79 @@ def test_compute_metrics_splits_mixed_origins():
 
     assert metrics["total_dealer_margin"] == 100.0
     assert metrics["mean_dealer_margin"] == 100.0
+    assert metrics["mean_dealer_margin_per_voluntary_accepted_trade"] == 100.0
     assert metrics["forced_prompt_margin"] == 50.0
     assert metrics["voluntary_submission_rate"] == pytest.approx(2 / 4)
     assert metrics["forced_prompt_rate"] == pytest.approx(1 / 4)
     assert metrics["no_submission_rate"] == pytest.approx(1 / 4)
-    # hard_feasibility_rate: accepted rounds regardless of origin (1 and 2).
+    assert metrics["hard_execution_rate_given_submission"] == 1.0
+    assert metrics["hard_execution_rate"] == pytest.approx(3 / 4)
+    assert metrics["contract_acceptance_rate_given_hard_pass"] == pytest.approx(2 / 3)
+    assert metrics["settlement_acceptance_rate"] == pytest.approx(2 / 4)
+    # Deprecated alias: final accepted rounds regardless of origin (1 and 2).
     assert metrics["hard_feasibility_rate"] == pytest.approx(2 / 4)
     # one_step_attainment: only the voluntary+accepted round (round 1) enters the ratio.
     assert metrics["one_step_attainment"] == pytest.approx(100.0 / 200.0)
     assert "oracle_margin_attainment" not in metrics
     assert "forced_submission_rate" not in metrics
+
+
+def test_compute_metrics_separates_hard_contract_and_settlement_gates():
+    rounds = [
+        RoundTrace(
+            round_num=1, submitted=True, accepted=True,
+            hard_executable=True, client_contract_pass=True,
+            submission_origin="voluntary", dealer_margin=10.0,
+        ),
+        RoundTrace(
+            round_num=2, submitted=True, accepted=False,
+            hard_executable=True, client_contract_pass=False,
+            contract_failures=["CONTRACT_HURDLE"], submission_origin="voluntary",
+        ),
+        RoundTrace(
+            round_num=3, submitted=True, accepted=False,
+            hard_executable=False, client_contract_pass=True,
+            hard_failures=["PORTFOLIO_NOTIONAL"], submission_origin="voluntary",
+        ),
+        RoundTrace(round_num=4),
+    ]
+    metrics = compute_metrics(EpisodeTrace("E", "full_static", "one_shot", rounds, {}))
+
+    assert metrics["hard_execution_rate_given_submission"] == pytest.approx(2 / 3)
+    assert metrics["hard_execution_rate"] == pytest.approx(2 / 4)
+    assert metrics["contract_acceptance_rate_given_hard_pass"] == pytest.approx(1 / 2)
+    assert metrics["settlement_acceptance_rate"] == pytest.approx(1 / 4)
+    assert metrics["hard_feasibility_rate"] == metrics["settlement_acceptance_rate"]
+
+
+def test_conditional_execution_metrics_are_none_without_denominators():
+    trace = EpisodeTrace("E", "full_static", "one_shot", [RoundTrace(round_num=1)], {})
+    metrics = compute_metrics(trace)
+    assert metrics["hard_execution_rate_given_submission"] is None
+    assert metrics["hard_execution_rate"] == 0.0
+    assert metrics["contract_acceptance_rate_given_hard_pass"] is None
+    assert metrics["settlement_acceptance_rate"] == 0.0
+
+
+def test_compute_metrics_rejects_attainment_above_one_step_frontier():
+    trace = EpisodeTrace(
+        "E",
+        "full_static",
+        "one_shot",
+        [RoundTrace(
+            round_num=1,
+            submitted=True,
+            accepted=True,
+            hard_executable=True,
+            client_contract_pass=True,
+            submission_origin="voluntary",
+            dealer_margin=100.000001,
+            one_step_frontier_margin=100.0,
+        )],
+        {},
+    )
+    with pytest.raises(BenchmarkError, match="exceeds the one-step frontier"):
+        compute_metrics(trace)
 
 
 @pytest.mark.asyncio
@@ -336,7 +638,7 @@ def env_with_agents(agents, *, full: bool = False) -> LongHorizonEnvironment:
     ]
     return LongHorizonEnvironment(
         states, _client_profile(), _risk_budget(),
-        BenchmarkCondition(full, True), env_agents=agents,
+        BenchmarkCondition(full, True), domain=RUNNER_DOMAIN, env_agents=agents,
     )
 
 

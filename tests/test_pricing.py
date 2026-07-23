@@ -7,10 +7,17 @@ import math
 
 import pytest
 
-from mirage.products import MarketState, ProductSpec
 import inspect
+import mirage.pricing as pricing_module
+
+from mirage.products import (
+    MarketState,
+    ProductSpec,
+    parse_product_spec,
+)
 
 from mirage.pricing import (
+    PricingError,
     autocallable_price,
     bs_call,
     bs_greeks,
@@ -21,6 +28,7 @@ from mirage.pricing import (
     evaluate_product,
     expected_payoff,
     hurdle_hit_prob,
+    mc_diagnostics,
     price_product,
     snowball_price,
 )
@@ -158,8 +166,13 @@ _BARRIER_CONFIGS = [
 def test_barrier_in_out_parity(option_type, barrier, S, K):
     """8 种 up/down x in/out x call/put 组合（以及不同 K 相对障碍位置）均满足 KI+KO=vanilla。"""
     T, r, sigma, q = 1.0, 0.05, 0.2, 0.0
-    ki = barrier_option(S, K, T, r, sigma, q, barrier, "knock_in", option_type)
-    ko = barrier_option(S, K, T, r, sigma, q, barrier, "knock_out", option_type)
+    direction = "down" if barrier < S else "up"
+    ki = barrier_option(
+        S, K, T, r, sigma, q, barrier, "knock_in", option_type, direction
+    )
+    ko = barrier_option(
+        S, K, T, r, sigma, q, barrier, "knock_out", option_type, direction
+    )
     vanilla = bs_call(S, K, T, r, sigma, q) if option_type == "call" else bs_put(S, K, T, r, sigma, q)
     assert abs(ki + ko - vanilla) < 1e-8
 
@@ -168,19 +181,81 @@ def test_barrier_in_out_parity(option_type, barrier, S, K):
 def test_barrier_knockout_leq_vanilla(option_type, barrier):
     """敲出期权价格不超过对应香草期权价格。"""
     S, K, T, r, sigma, q = 100.0, 100.0, 1.0, 0.05, 0.2, 0.0
-    ko = barrier_option(S, K, T, r, sigma, q, barrier, "knock_out", option_type)
+    direction = "down" if barrier < S else "up"
+    ko = barrier_option(
+        S, K, T, r, sigma, q, barrier, "knock_out", option_type, direction
+    )
     vanilla = bs_call(S, K, T, r, sigma, q) if option_type == "call" else bs_put(S, K, T, r, sigma, q)
     assert ko <= vanilla + 1e-12
 
 
-def test_barrier_equal_spot_treated_as_breached():
+@pytest.mark.parametrize("direction", ["down", "up"])
+def test_barrier_equal_spot_treated_as_breached(direction):
     """barrier == S 视为已经触碰。"""
     S, K, T, r, sigma, q = 100.0, 100.0, 1.0, 0.05, 0.2, 0.0
     vanilla = bs_call(S, K, T, r, sigma, q)
-    ki = barrier_option(S, K, T, r, sigma, q, S, "knock_in", "call")
-    ko = barrier_option(S, K, T, r, sigma, q, S, "knock_out", "call")
+    ki = barrier_option(
+        S, K, T, r, sigma, q, S, "knock_in", "call", direction
+    )
+    ko = barrier_option(
+        S, K, T, r, sigma, q, S, "knock_out", "call", direction
+    )
     assert ki == pytest.approx(vanilla, abs=1e-10)
     assert ko == pytest.approx(0.0, abs=1e-10)
+
+
+@pytest.mark.parametrize(
+    "direction,S,barrier",
+    [("up", 130.0, 120.0), ("down", 70.0, 80.0)],
+)
+def test_barrier_crossing_uses_fixed_issuance_direction(direction, S, barrier):
+    """重估现货跨越固定上/下障碍后必须识别为已触碰，不能按当前 S 反转方向。"""
+    K, T, r, sigma, q = 100.0, 1.0, 0.05, 0.2, 0.0
+    vanilla = bs_call(S, K, T, r, sigma, q)
+
+    ki = barrier_option(
+        S, K, T, r, sigma, q, barrier, "knock_in", "call", direction
+    )
+    ko = barrier_option(
+        S, K, T, r, sigma, q, barrier, "knock_out", "call", direction
+    )
+
+    assert ki == pytest.approx(vanilla)
+    assert ko == pytest.approx(0.0)
+
+
+def test_barrier_option_historical_touch_is_inherited():
+    """当前现货虽回到障碍内侧，历史已触碰仍使 knock-out 永久失效。"""
+    ko = barrier_option(
+        100.0,
+        100.0,
+        1.0,
+        0.03,
+        0.2,
+        0.0,
+        120.0,
+        "knock_out",
+        "call",
+        "up",
+        already_touched=True,
+    )
+    assert ko == 0.0
+
+
+def test_barrier_option_rejects_unknown_direction():
+    with pytest.raises(PricingError, match="障碍方向"):
+        barrier_option(
+            100.0,
+            100.0,
+            1.0,
+            0.03,
+            0.2,
+            0.0,
+            120.0,
+            "knock_out",
+            "call",
+            "sideways",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +272,68 @@ def test_mc_determinism():
     a1 = autocallable_price(100, 12, 0.03, 0.2, 0.0, 0.1, barrier_pct=0.75, n_paths=2000, seed=7)
     a2 = autocallable_price(100, 12, 0.03, 0.2, 0.0, 0.1, barrier_pct=0.75, n_paths=2000, seed=7)
     assert a1 == a2
+
+
+def test_snowball_revaluation_inherits_knock_in_and_reference_spot():
+    """已敲入雪球在现货跌至期初 80% 后重估，不得重置历史敲入或改用当前现货归一化。"""
+    result = snowball_price(
+        80.0,
+        12,
+        0.0,
+        0.0,
+        0.0,
+        0.12,
+        knock_in_pct=0.75,
+        knock_out_pct=10.0,
+        n_paths=16,
+        seed=7,
+        fixing_ratio=100.0 / 80.0,
+        already_knocked_in=True,
+        elapsed_months=6,
+    )
+
+    assert result["fair_value"] == pytest.approx(0.8)
+    assert result["knock_in_prob"] == pytest.approx(1.0)
+    assert result["expected_life_months"] == pytest.approx(12.0)
+
+
+def test_snowball_revaluation_coupon_uses_total_elapsed_life():
+    """剩余只模拟 6 个月，但到期票息仍按合约总存续 12 个月计提。"""
+    result = snowball_price(
+        100.0,
+        12,
+        0.0,
+        0.0,
+        0.0,
+        0.12,
+        knock_in_pct=0.5,
+        knock_out_pct=10.0,
+        n_paths=8,
+        fixing_ratio=1.0,
+        elapsed_months=6,
+    )
+
+    assert result["fair_value"] == pytest.approx(1.12)
+
+
+def test_autocall_revaluation_coupon_counts_elapsed_months_before_future_call():
+    """已存续 6 个月后下一月赎回，票息应按总计 7 个月计提。"""
+    result = autocallable_price(
+        110.0,
+        12,
+        0.0,
+        0.0,
+        0.0,
+        0.12,
+        barrier_pct=0.75,
+        autocall_pct=1.05,
+        n_paths=8,
+        fixing_ratio=100.0 / 110.0,
+        elapsed_months=6,
+    )
+
+    assert result["fair_value"] == pytest.approx(1.0 + 0.12 * 7.0 / 12.0)
+    assert result["expected_life_months"] == pytest.approx(7.0)
 
 
 def test_snowball_fair_value_plausible_band():
@@ -283,6 +420,113 @@ def test_price_product_custom_is_none():
 def test_evaluate_product_custom_is_none():
     product = _product(product_type="custom")
     assert evaluate_product(product, _market()) is None
+
+
+def test_price_product_revaluation_anchors_strike_to_reference_spot():
+    """存续期 vanilla 的行权价锚定发行定盘价，且只使用剩余期限定价。"""
+    product = _product(
+        product_type="vanilla_call",
+        maturity_months=12,
+        reference_spot=100.0,
+        elapsed_months=6,
+    )
+    market = _market(spot=120.0)
+
+    result = price_product(product, market)
+    expected_points = bs_call(120.0, 100.0, 0.5, 0.03, 0.2, 0.0)
+    expected_fair_value = product.notional / 100.0 * expected_points
+    raw_delta = bs_greeks(120.0, 100.0, 0.5, 0.03, 0.2, 0.0, "call")[
+        "delta"
+    ]
+
+    assert result["fair_value"] == pytest.approx(expected_fair_value)
+    assert result["greeks"]["delta"] == pytest.approx(120.0 / 100.0 * raw_delta)
+    assert result["greeks"]["delta"] * product.notional == pytest.approx(
+        product.notional * 120.0 / 100.0 * raw_delta
+    )
+
+
+@pytest.mark.parametrize(
+    "product",
+    [
+        _product(product_type="vanilla_call", reference_spot=100.0),
+        _product(
+            product_type="barrier_call",
+            barrier_pct=2.0,
+            barrier_type="knock_out",
+            barrier_direction="up",
+            reference_spot=100.0,
+        ),
+    ],
+)
+def test_revaluation_delta_matches_one_percent_fair_value_bump(product):
+    """vanilla/barrier delta 是下游可直接乘 N 的 dollar-delta 占比。"""
+    market = _market(spot=120.0)
+    bump = 0.01 * market.spot
+    result = price_product(product, market)
+    fair_up = price_product(product, _market(spot=market.spot + bump))[
+        "fair_value"
+    ]
+    fair_down = price_product(product, _market(spot=market.spot - bump))[
+        "fair_value"
+    ]
+    bumped_delta = (fair_up - fair_down) / (0.02 * product.notional)
+
+    assert result["greeks"]["delta"] == pytest.approx(bumped_delta, rel=2e-3)
+
+
+@pytest.mark.parametrize(
+    "direction,spot,barrier_pct,product_type",
+    [
+        ("up", 130.0, 1.2, "barrier_call"),
+        ("down", 70.0, 0.8, "barrier_put"),
+    ],
+)
+def test_product_revaluation_detects_crossed_fixed_barrier(
+    direction, spot, barrier_pct, product_type
+):
+    product = _product(
+        product_type=product_type,
+        barrier_pct=barrier_pct,
+        barrier_type="knock_out",
+        barrier_direction=direction,
+        reference_spot=100.0,
+    )
+    market = _market(spot=spot)
+
+    priced = price_product(product, market)
+    expected = expected_payoff(product, market)
+
+    assert priced["fair_value"] == pytest.approx(0.0)
+    assert expected == pytest.approx(0.0)
+
+
+def test_stateful_snowball_flows_through_price_expected_and_diagnostics():
+    """reference_spot / knock_in_active / elapsed_months 在三条 MC 路径中必须保持一致。"""
+    product = _product(
+        product_type="snowball",
+        barrier_pct=0.75,
+        barrier_type="knock_in",
+        coupon_rate=0.12,
+        reference_spot=100.0,
+        knock_in_active=True,
+        elapsed_months=6,
+    )
+    market = _market(
+        spot=80.0,
+        volatility=0.0,
+        risk_free_rate=0.0,
+        trend_alpha=0.0,
+    )
+
+    priced = price_product(product, market)
+    expected = expected_payoff(product, market)
+    diag = mc_diagnostics(product, market, n_paths=32, seed=11)
+
+    assert priced["fair_value"] == pytest.approx(0.8 * product.notional)
+    assert expected == pytest.approx(0.8 * product.notional)
+    assert diag.pv_mean_frac == pytest.approx(0.8)
+    assert diag.event_probs["knock_in"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(
@@ -465,6 +709,80 @@ def test_barrier_far_knockout_delta_matches_vanilla():
     assert abs(delta_fd - delta_an) < 1e-3
 
 
+def test_fair_value_stress_keeps_fixed_barrier_direction_after_spot_crossing():
+    """上行压力跨越固定 up knock-out 后公允价值归零，且应成为最坏情景。"""
+    product = _product(
+        product_type="barrier_call",
+        strike_pct=0.8,
+        barrier_pct=1.1,
+        barrier_type="knock_out",
+        barrier_direction="up",
+        reference_spot=100.0,
+    )
+    market = _market()
+    base_fair_value = price_product(product, market)["fair_value"]
+
+    loss, worst_id = pricing_module._fair_value_stress_loss(product, market)
+
+    assert worst_id == "spot_up_20"
+    assert loss == pytest.approx(base_fair_value)
+
+
+@pytest.mark.parametrize("reference_spot", [None, 100.0])
+def test_fair_value_stress_freezes_reference_without_rescaling_terms(
+    monkeypatch, reference_spot
+):
+    """压力副本统一冻结发行参考现货，不得通过缩放比例二次改写条款。"""
+    product = _product(
+        product_type="barrier_call",
+        strike_pct=0.9,
+        barrier_pct=1.1,
+        barrier_type="knock_out",
+        barrier_direction="up",
+        reference_spot=reference_spot,
+    )
+    captured: list[ProductSpec] = []
+
+    def _capture_price(candidate, _market_state):
+        captured.append(candidate)
+        return {"fair_value": 1.0}
+
+    monkeypatch.setattr(pricing_module, "price_product", _capture_price)
+    pricing_module._fair_value_stress_loss(product, _market())
+
+    stressed = captured[1:]
+    assert len(stressed) == 3
+    assert all(p.barrier_direction == "up" for p in stressed)
+    assert all(p.reference_spot == pytest.approx(100.0) for p in stressed)
+    assert all(p.strike_pct == pytest.approx(0.9) for p in stressed)
+    assert all(p.barrier_pct == pytest.approx(1.1) for p in stressed)
+
+
+@pytest.mark.parametrize("product_type", ["snowball", "autocallable"])
+def test_fair_value_stress_freezes_reference_for_implicit_coupon_barriers(
+    monkeypatch, product_type
+):
+    """发行时 reference=None 也必须在压力副本上锁定隐式 1.03/1.05 敲出水平。"""
+    product = _product(
+        product_type=product_type,
+        barrier_pct=0.75,
+        barrier_type="knock_in",
+        coupon_rate=0.12,
+        reference_spot=None,
+    )
+    captured: list[ProductSpec] = []
+
+    def _capture_price(candidate, _market_state):
+        captured.append(candidate)
+        return {"fair_value": 1.0}
+
+    monkeypatch.setattr(pricing_module, "price_product", _capture_price)
+    pricing_module._fair_value_stress_loss(product, _market(spot=100.0))
+
+    assert all(p.reference_spot == pytest.approx(100.0) for p in captured[1:])
+    assert all(p.barrier_pct == pytest.approx(0.75) for p in captured[1:])
+
+
 # ---------------------------------------------------------------------------
 # hurdle_hit_prob：闭合公式正确性
 # ---------------------------------------------------------------------------
@@ -472,6 +790,35 @@ def test_barrier_far_knockout_delta_matches_vanilla():
 
 def test_hurdle_hit_prob_custom_is_none():
     assert hurdle_hit_prob(_product(product_type="custom"), _market(), 0.05, 1000.0) is None
+
+
+@pytest.mark.parametrize("participation", [0.0, -1.0])
+def test_hurdle_hit_prob_rejects_nonpositive_participation(participation):
+    """直接构造 ProductSpec 可绕过解析器，hurdle 边界必须防御除零/反号语义。"""
+    product = _product(participation_rate=participation)
+    with pytest.raises(PricingError, match="participation_rate > 0"):
+        hurdle_hit_prob(product, _market(), 0.05, 50_000.0)
+
+
+def test_positive_participation_parses_and_prices_end_to_end():
+    product = parse_product_spec(
+        {
+            "product_type": "vanilla_call",
+            "notional": 1_000_000,
+            "maturity_months": 12,
+            "strike_pct": 1.0,
+            "participation_rate": 0.5,
+            "target_client": "retail",
+        }
+    )
+
+    pricing = evaluate_product(product, _market())
+    probability = hurdle_hit_prob(
+        product, _market(), 0.05, pricing["client_price"]
+    )
+
+    assert pricing["fair_value"] > 0.0
+    assert probability is not None and 0.0 <= probability <= 1.0
 
 
 def test_hurdle_hit_prob_protected_call_below_floor_is_one():
@@ -558,6 +905,25 @@ def test_hurdle_hit_prob_determinism():
     p1 = hurdle_hit_prob(product, market, 0.05, 50_000.0)
     p2 = hurdle_hit_prob(product, market, 0.05, 50_000.0)
     assert p1 == p2
+
+
+def test_barrier_hurdle_and_diagnostics_honor_explicit_fixed_direction():
+    """显式 up 障碍低于发行现货时已触碰；MC 不得因 barrier_pct < 1 重推为 down。"""
+    product = _product(
+        product_type="barrier_call",
+        barrier_pct=0.8,
+        barrier_type="knock_out",
+        barrier_direction="up",
+        reference_spot=100.0,
+    )
+    market = _market()
+
+    probability = hurdle_hit_prob(product, market, 0.01, 0.0)
+    diag = mc_diagnostics(product, market, n_paths=64, seed=3)
+
+    assert probability == 0.0
+    assert diag.event_probs["touch"] == 1.0
+    assert diag.pv_mean_frac == 0.0
 
 
 # ---------------------------------------------------------------------------

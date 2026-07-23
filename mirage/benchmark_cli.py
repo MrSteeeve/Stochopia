@@ -721,8 +721,12 @@ def _cmd_judge_runs(args: argparse.Namespace) -> int:
 # be missing some of these (runner migration in progress); aggregate reads
 # whatever is present and reports the rest as missing rather than failing.
 CANONICAL_METRICS = (
-    "hard_feasibility_rate",
+    "hard_execution_rate",
+    "hard_execution_rate_given_submission",
+    "contract_acceptance_rate_given_hard_pass",
+    "settlement_acceptance_rate",
     "total_dealer_margin",
+    "mean_dealer_margin_per_voluntary_accepted_trade",
     "one_step_attainment",
     "voluntary_submission_rate",
     "forced_prompt_rate",

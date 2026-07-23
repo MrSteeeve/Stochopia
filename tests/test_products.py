@@ -236,11 +236,16 @@ def test_parse_product_spec_happy_path_with_defaults():
     assert spec.maturity_months == 6
     assert spec.barrier_pct is None
     assert spec.barrier_type is None
+    assert spec.barrier_direction is None
     assert spec.coupon_rate is None
     assert spec.participation_rate == 1.0
     assert spec.principal_protected is False
     assert spec.pitch == ""
     assert spec.hedging_plan == ""
+    assert spec.reference_spot is None
+    assert spec.barrier_touched is False
+    assert spec.knock_in_active is False
+    assert spec.elapsed_months == 0
 
 
 def test_parse_product_spec_accepts_integral_float_maturity():
@@ -281,6 +286,47 @@ def test_parse_product_spec_barrier_both_or_neither():
     )
     assert spec.barrier_pct == 1.1
     assert spec.barrier_type == "knock_in"
+    assert spec.barrier_direction == "up"
+
+
+def test_parse_product_spec_barrier_direction_is_fixed_at_issuance():
+    """障碍方向缺省时按发行时 barrier_pct 相对 1.0 推断，显式方向则保留。"""
+    down = parse_product_spec(
+        _valid_payload(
+            product_type="barrier_put",
+            barrier_pct=0.8,
+            barrier_type="knock_in",
+        )
+    )
+    explicit = parse_product_spec(
+        _valid_payload(
+            product_type="barrier_call",
+            barrier_pct=0.8,
+            barrier_type="knock_out",
+            barrier_direction="up",
+        )
+    )
+
+    assert down.barrier_direction == "down"
+    assert explicit.barrier_direction == "up"
+
+
+@pytest.mark.parametrize("bad_direction", ["left", 1, True])
+def test_parse_product_spec_rejects_invalid_barrier_direction(bad_direction):
+    with pytest.raises(ProductError, match="barrier_direction"):
+        parse_product_spec(
+            _valid_payload(
+                product_type="barrier_call",
+                barrier_pct=1.2,
+                barrier_type="knock_out",
+                barrier_direction=bad_direction,
+            )
+        )
+
+
+def test_parse_product_spec_rejects_barrier_direction_on_non_barrier_product():
+    with pytest.raises(ProductError, match="barrier_direction"):
+        parse_product_spec(_valid_payload(barrier_direction="up"))
 
 
 def test_parse_product_spec_autocallable_needs_coupon():
@@ -334,6 +380,16 @@ def test_parse_product_spec_snowball_participation_must_be_one():
         _valid_payload(product_type="snowball", coupon_rate=0.12, participation_rate=1.0)
     )
     assert spec.participation_rate == 1.0
+
+
+@pytest.mark.parametrize("bad_participation", [0, 0.0, -0.1])
+def test_parse_product_spec_participation_must_be_strictly_positive(
+    bad_participation,
+):
+    with pytest.raises(ProductError, match=r"participation_rate .+\(0, 10\]"):
+        parse_product_spec(
+            _valid_payload(participation_rate=bad_participation)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +449,23 @@ def test_parse_product_spec_explicit_null_optional_fields_get_defaults():
     assert spec.principal_protected is False
     assert spec.pitch == ""
     assert spec.hedging_plan == ""
+
+
+def test_parse_product_spec_ignores_untrusted_internal_state_fields():
+    """提交 JSON 不得伪造存续期定盘价、历史敲入或已存续时间。"""
+    spec = parse_product_spec(
+        _valid_payload(
+            reference_spot=999.0,
+            barrier_touched=True,
+            knock_in_active=True,
+            elapsed_months=5,
+        )
+    )
+
+    assert spec.reference_spot is None
+    assert spec.barrier_touched is False
+    assert spec.knock_in_active is False
+    assert spec.elapsed_months == 0
 
 
 def test_parse_product_spec_null_target_client_still_errors():

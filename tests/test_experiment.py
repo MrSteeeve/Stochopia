@@ -70,8 +70,10 @@ def test_paired_condition_contrasts_means_backward_compatible():
     result = paired_condition_contrasts(rows, "score")
     assert result["dynamic_degradation_mean"] == pytest.approx(0.25)
     assert result["partial_observability_degradation_mean"] == pytest.approx(0.15)
-    assert result["dynamic_pairs"] == 2
-    assert result["partial_pairs"] == 2
+    # Both within-episode contrasts are collapsed to the single independent
+    # market-path replication unit before inference.
+    assert result["dynamic_pairs"] == 1
+    assert result["partial_pairs"] == 1
 
 
 def test_paired_condition_contrasts_adds_ci_and_significance():
@@ -91,8 +93,8 @@ def test_paired_condition_contrasts_adds_ci_and_significance():
     result = paired_condition_contrasts(rows, "score", n_permutations=2000, n_resamples=2000)
     dynamic = result["dynamic_degradation"]
     partial = result["partial_observability_degradation"]
-    assert dynamic["n_pairs"] == 6  # 2 drops per episode x 3 episodes
-    assert partial["n_pairs"] == 6
+    assert dynamic["n_pairs"] == 3  # one independent value per episode
+    assert partial["n_pairs"] == 3
     assert dynamic["mean"] > 0  # full/partial always degrade under dynamic in this fixture
     lo, hi = dynamic["ci"]
     assert lo <= dynamic["mean"] <= hi
@@ -115,6 +117,25 @@ def test_paired_condition_contrasts_reproducible_with_same_seed():
     a = paired_condition_contrasts(rows, "score", n_permutations=2000, n_resamples=2000, seed=7)
     b = paired_condition_contrasts(rows, "score", n_permutations=2000, n_resamples=2000, seed=7)
     assert a == b
+
+
+def test_paired_condition_contrasts_cluster_models_and_strategies_by_episode():
+    rows = []
+    for strategy, shift in (("S1", 0.0), ("S2", 0.1)):
+        for condition, value in {
+            "full_static": 0.9 + shift,
+            "full_dynamic": 0.7 + shift,
+            "partial_static": 0.8 + shift,
+            "partial_dynamic": 0.5 + shift,
+        }.items():
+            rows.append({
+                "episode_id": "E1", "model": "M", "strategy": strategy,
+                "condition": condition, "score": value,
+            })
+    result = paired_condition_contrasts(rows, "score", n_permutations=100, n_resamples=100)
+    assert result["dynamic_pairs"] == 1
+    assert result["partial_pairs"] == 1
+    assert result["dynamic_degradation_mean"] == pytest.approx(0.25)
 
 
 def test_paired_condition_contrasts_missing_field_raises():

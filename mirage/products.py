@@ -52,6 +52,14 @@ class ProductSpec:
     target_client: str
     pitch: str
     hedging_plan: str
+    # 障碍方向是发行时固定的合约条款。旧调用方可继续省略；解析器会为
+    # barrier_call / barrier_put 从发行时 barrier_pct 相对 1.0 的位置推断。
+    barrier_direction: str | None = None
+    # 以下字段是存续期重估状态，不接受提交 JSON 注入；由环境在发行/演进时维护。
+    reference_spot: float | None = None
+    barrier_touched: bool = False
+    knock_in_active: bool = False
+    elapsed_months: int = 0
 
 
 def _prob_bucket(p: float) -> str:
@@ -244,7 +252,8 @@ def parse_product_spec(data: dict) -> ProductSpec:
     """解析并校验提交的产品 JSON，字段齐全且合法才返回 ProductSpec，否则聚合报错。
 
     可选字段（participation_rate、principal_protected、pitch、hedging_plan）
-    的显式 null 视同缺失，取默认值。
+    的显式 null 视同缺失，取默认值。reference_spot、barrier_touched、
+    knock_in_active、elapsed_months 是环境维护的内部状态，解析提交时始终重置。
     """
     if not isinstance(data, dict):
         raise ProductError("产品规格必须是字典（JSON 对象）")
@@ -307,6 +316,26 @@ def parse_product_spec(data: dict) -> ProductSpec:
     if (barrier_pct is None) != (barrier_type is None):
         errors.append("barrier_pct 与 barrier_type 必须同时设置或同时为空")
 
+    barrier_direction = data.get("barrier_direction")
+    is_barrier_product = product_type in ("barrier_call", "barrier_put")
+    if barrier_direction is not None and barrier_direction not in ("up", "down"):
+        errors.append(
+            "barrier_direction 必须为空或 up / down 之一，"
+            f"实际为 {barrier_direction!r}"
+        )
+    elif not is_barrier_product and barrier_direction is not None:
+        errors.append("barrier_direction 仅适用于 barrier_call / barrier_put 产品")
+    elif is_barrier_product and barrier_direction is None and _is_finite_number(barrier_pct):
+        # 发行时方向只推断一次；后续现货跨越障碍也不会翻转方向。
+        barrier_direction = "up" if barrier_pct > 1.0 else "down"
+
+    if barrier_direction is not None and barrier_pct is None:
+        errors.append("barrier_direction 必须与 barrier_pct 同时设置")
+
+    if not is_barrier_product:
+        # 即使提交携带了非法值，也不让它进入非障碍产品的内部状态。
+        barrier_direction = None
+
     coupon_rate = data.get("coupon_rate")
     if coupon_rate is not None and (
         not _is_finite_number(coupon_rate) or coupon_rate < 0 or coupon_rate > 5
@@ -317,9 +346,9 @@ def parse_product_spec(data: dict) -> ProductSpec:
         errors.append(f"{product_type} 类型必须设置 coupon_rate")
 
     participation_rate = data.get("participation_rate", 1.0)
-    if not _is_finite_number(participation_rate) or participation_rate < 0 or participation_rate > 10:
+    if not _is_finite_number(participation_rate) or participation_rate <= 0 or participation_rate > 10:
         errors.append(
-            f"participation_rate 必须是 [0, 10] 范围内的有限数字，实际为 {participation_rate!r}"
+            f"participation_rate 必须是 (0, 10] 范围内的有限数字，实际为 {participation_rate!r}"
         )
     elif (
         product_type in ("autocallable", "snowball")
@@ -362,6 +391,11 @@ def parse_product_spec(data: dict) -> ProductSpec:
         target_client=target_client,
         pitch=pitch,
         hedging_plan=hedging_plan,
+        barrier_direction=barrier_direction,
+        reference_spot=None,
+        barrier_touched=False,
+        knock_in_active=False,
+        elapsed_months=0,
     )
 
 

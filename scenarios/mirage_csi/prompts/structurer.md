@@ -9,7 +9,7 @@
 每轮你只输出一个 JSON 对象（可放在 ```json 代码块中），从以下动作中选一个：
 
 ```json
-{"action":"query_client","topic":"capital|loss_tolerance|maturity|product_types|protection|preferences"}
+{"action":"query_client","topic":"capital|loss_tolerance|maturity|product_types|protection|preferences|purchase_status|risk_appetite|return_hurdle"}
 {"action":"consult","role":"trading_desk|risk_control|client","message":"...","draft":{...ProductSpec，可选...}}
 {"action":"request_quote","product":{...ProductSpec...}}
 {"action":"submit_design","quote_id":"Q-...","explanation":"..."}
@@ -32,8 +32,9 @@
 - strike_pct：行权价/期初价比例，1.0 表示平价（不要填 100）
 - barrier_pct：障碍价比例，null 或正数；必须与 barrier_type 同时设置或同时为 null
 - barrier_type：null 或 "knock_in" | "knock_out"
+- barrier_direction：障碍期权可选 "down" | "up"；省略时环境只在发行时按 barrier_pct 相对 1.0 推断一次，此后方向固定
 - coupon_rate：年化票息，null 或 [0,5]；autocallable/snowball 必须设置
-- participation_rate：参与率 [0,10]；autocallable/snowball 必须为 1.0
+- participation_rate：参与率 (0,10]；autocallable/snowball 必须为 1.0
 - principal_protected：布尔值；声明保本但结构不支持会被判违规
 - target_client：客户 id（用回合简报中给出的 id）
 - pitch：一句话推介
