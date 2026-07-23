@@ -292,10 +292,27 @@ class EnvResponseCache:
 
     @staticmethod
     def make_key(
-        role_id: str, model: str, temperature: float, seed: int, messages: list[dict]
+        role_id: str,
+        model: str,
+        temperature: float,
+        seed: int | None,
+        messages: list[dict],
+        *,
+        max_tokens: int | None = None,
+        output_schema: str = "",
+        inference_contract: str = "env-response-v2",
     ) -> str:
         canonical = "\x1f".join(
-            [role_id, model, repr(float(temperature)), str(seed), _canonical_json(messages)]
+            [
+                inference_contract,
+                role_id,
+                model,
+                repr(float(temperature)),
+                str(seed),
+                str(max_tokens),
+                output_schema,
+                _canonical_json(messages),
+            ]
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -387,7 +404,12 @@ class FrozenEnvAgent:
             + [{"role": "user", "content": user_content}]
         )
 
-    def _seed(self, request: RoleRequest) -> int:
+    def _seed(self, request: RoleRequest) -> int | None:
+        policy = self.spec.inference.seed_policy
+        if policy == "none":
+            return None
+        if policy == "fixed":
+            return self.spec.inference.seed_offset & 0xFFFFFFFF
         base = derive_seed(
             SEED_NAMESPACE,
             request.episode_id,
@@ -414,7 +436,11 @@ class FrozenEnvAgent:
             degraded=True,
         )
 
-    async def _call_model(self, messages: list[dict], seed: int) -> tuple[str | None, str]:
+    async def _call_model(
+        self,
+        messages: list[dict],
+        seed: int | None,
+    ) -> tuple[str | None, str]:
         """带传输层重试地调用模型。返回 (raw, error_class)；raw is None 表示失败。"""
         transport_retries = self.spec.retry.transport_retries
         error_class = "provider"
@@ -456,7 +482,13 @@ class FrozenEnvAgent:
         raw: str | None = None
         if self.cache is not None:
             cache_key = EnvResponseCache.make_key(
-                self.spec.id, model, temperature, seed, messages
+                self.spec.id,
+                model,
+                temperature,
+                seed,
+                messages,
+                max_tokens=self.spec.inference.max_tokens,
+                output_schema=self.spec.output_schema,
             )
             cached = self.cache.get(cache_key)
             if cached is not None:

@@ -31,7 +31,8 @@ OUTPUT_ROOT = Path("data/derived")
 FIELDS = [
     "episode_id", "round", "date", "underlying", "spot", "risk_free_rate",
     "return_20d", "realized_vol_20d", "realized_vol_60d", "drawdown_6m",
-    "atm_iv_1m", "atm_iv_3m", "atm_iv_6m", "carry_rate", "regime", "source",
+    "atm_iv_1m", "atm_iv_3m", "atm_iv_6m", "carry_rate", "trend_alpha",
+    "regime", "source",
 ]
 UNDERLYINGS = {
     "CSI500": {"ts_code": "000905.SH", "future": "IC"},
@@ -248,6 +249,7 @@ def _csv_bytes(snapshots: Sequence[MarketSnapshot]) -> bytes:
             "atm_iv_3m": item.atm_iv_3m if item.atm_iv_3m is not None else "",
             "atm_iv_6m": item.atm_iv_6m if item.atm_iv_6m is not None else "",
             "carry_rate": item.carry_rate,
+            "trend_alpha": item.trend_alpha,
             "regime": item.regime, "source": item.source,
         })
     return buffer.getvalue().encode("utf-8")

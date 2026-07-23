@@ -106,6 +106,19 @@ def test_reset_is_deterministic_and_rebuilds_state():
     assert second_observation.disclosed_client == {}
 
 
+def test_task_manifest_detaches_reset_from_later_client_mutation():
+    task = _task()
+    original_capital = task.client.capital
+    original_hash = task.task_hash
+    task.client.capital = 1.0
+
+    env = MirageStructurerEnv(task, expose_privileged_info=True)
+    _, info = env.reset()
+
+    assert info["privileged_state"]["client"]["capital"] == original_capital
+    assert task.task_hash == original_hash
+
+
 def test_typed_quote_then_submit_auto_advances_round():
     env = MirageStructurerEnv(_task())
     env.reset()
@@ -115,14 +128,19 @@ def test_typed_quote_then_submit_auto_advances_round():
 
     assert quoted.action.type == "request_quote"
     assert quoted.constraint_signals.hard_pass is True
-    assert quoted.reward_components.quote_cost < 0
+    assert quoted.reward_components.quote_cost.value < 0
+    assert quoted.reward_components.quote_cost.available is True
+    assert quoted.reward_components.client_utility.available is False
     assert quoted.terminated is False
 
     submitted = env.step(SubmitDesign(quote_id, "risks disclosed"))
 
     assert submitted.action.type == "submit_design"
     assert submitted.constraint_signals.accepted is True
-    assert submitted.reward_components.dealer_economics > 0
+    assert submitted.reward_components.dealer_economics.available is True
+    assert submitted.reward_components.dealer_economics.value == pytest.approx(
+        submitted.tool_result["payload"]["dealer_margin"]
+    )
     assert submitted.observation.round_num == 2
     assert submitted.observation.last_event["advanced_to_round"] == 2
     assert submitted.terminated is False
@@ -137,7 +155,7 @@ def test_submit_product_is_atomic_typed_quote_and_submission():
 
     assert transition.tool_result["type"] == "quote_and_submission"
     assert transition.constraint_signals.accepted is True
-    assert transition.reward_components.quote_cost < 0
+    assert transition.reward_components.quote_cost.value < 0
     assert transition.observation.round_num == 2
 
 
@@ -148,9 +166,11 @@ def test_query_cost_is_emitted_on_every_query_step():
     capital = env.step(AskClient("capital"))
     maturity = env.step(AskClient("maturity"))
 
-    assert capital.reward_components.query_cost == pytest.approx(-0.01)
-    assert maturity.reward_components.query_cost == pytest.approx(-0.01)
-    assert sum(t.reward_components.query_cost for t in (capital, maturity)) == pytest.approx(-0.02)
+    assert capital.reward_components.query_cost.value == pytest.approx(-0.01)
+    assert maturity.reward_components.query_cost.value == pytest.approx(-0.01)
+    assert sum(
+        t.reward_components.query_cost.value for t in (capital, maturity)
+    ) == pytest.approx(-0.02)
     assert maturity.previous_observation == capital.observation
     assert maturity.state_hash_before == capital.state_hash_after
     assert maturity.observation.disclosed_client == {
@@ -174,7 +194,7 @@ def test_direct_typed_product_pricing_error_becomes_constraint_signal():
 
     assert transition.constraint_signals.action_valid is False
     assert "participation_rate" in transition.constraint_signals.error
-    assert transition.reward_components.operational_cost < 0
+    assert transition.reward_components.operational_cost.value < 0
     assert transition.terminated is False
 
 
@@ -264,6 +284,24 @@ def test_invalid_actions_hit_a_finite_round_time_limit():
         env.step(Skip())
 
 
+def test_available_action_mask_removes_exhausted_query_and_quote_actions():
+    env = MirageStructurerEnv(_task(), max_steps_per_round=12)
+    observation, _ = env.reset()
+    assert {"ask_client", "request_quote", "submit_product"} <= set(
+        observation.available_actions
+    )
+
+    for topic in ("capital", "maturity", "protection"):
+        transition = env.step(AskClient(topic))
+    assert "ask_client" not in transition.observation.available_actions
+
+    for _ in range(3):
+        transition = env.step(RequestQuote(_product()))
+    assert "request_quote" not in transition.observation.available_actions
+    assert "submit_product" not in transition.observation.available_actions
+    assert "submit_design" in transition.observation.available_actions
+
+
 def test_state_hash_commits_reward_config_and_reset_options():
     base = MirageStructurerEnv(_task(), query_cost=-0.01)
     costly = MirageStructurerEnv(_task(), query_cost=-99.0)
@@ -295,7 +333,7 @@ def test_trajectory_records_full_transitions_and_verifies_chain(tmp_path):
 
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["metadata"]["schema_version"] == "mirage.environment.test.v3"
-    assert saved["metadata"]["environment_version"] == "v3-spine-level0"
+    assert saved["metadata"]["environment_version"] == env.environment_version
     assert saved["metadata"]["pricing_version"]
     assert saved["metadata"]["task_version"] == "test-task-v1"
     assert saved["metadata"]["environment_config_hash"]
@@ -303,4 +341,24 @@ def test_trajectory_records_full_transitions_and_verifies_chain(tmp_path):
 
     saved["entries"][1]["transition"]["state_hash_before"] = "tampered"
     path.write_text(json.dumps(saved), encoding="utf-8")
+    assert TrajectoryRecorder.verify(path) is False
+
+
+def test_trajectory_snapshot_is_detached_and_suffix_deletion_is_detected(tmp_path):
+    env = MirageStructurerEnv(_task())
+    _, reset_info = env.reset()
+    recorder = TrajectoryRecorder(env, initial_state_hash=reset_info["state_hash"])
+    first = env.step(Skip("one"))
+    recorder.record(first, policy_metadata={"mutable": {"value": 1}})
+    second = env.step(Skip("two"))
+    recorder.record(second)
+
+    # Mutating the caller-owned transition after record() cannot rewrite history.
+    first.info["state_hash"] = "caller-mutated"
+    assert recorder.entries[0].transition["info"]["state_hash"] != "caller-mutated"
+
+    path = recorder.save(tmp_path / "trajectory.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["entries"].pop()
+    path.write_text(json.dumps(payload), encoding="utf-8")
     assert TrajectoryRecorder.verify(path) is False

@@ -20,6 +20,8 @@ PRODUCT_TYPES = (
     "custom",
 )
 
+FUNDING_STYLES = ("premium_paid", "funded_note")
+
 
 @dataclass
 class MarketState:
@@ -52,6 +54,13 @@ class ProductSpec:
     target_client: str
     pitch: str
     hedging_plan: str
+    # Funding semantics are deliberately separate from risk notional.  Old
+    # callers may omit them; the effective_* properties below provide the
+    # deterministic v3 migration defaults.
+    funding_style: str | None = None
+    face_value: float | None = None
+    issue_price_pct: float | None = None
+    protected_amount: float | None = None
     # 障碍方向是发行时固定的合约条款。旧调用方可继续省略；解析器会为
     # barrier_call / barrier_put 从发行时 barrier_pct 相对 1.0 的位置推断。
     barrier_direction: str | None = None
@@ -60,6 +69,41 @@ class ProductSpec:
     barrier_touched: bool = False
     knock_in_active: bool = False
     elapsed_months: int = 0
+
+    @property
+    def effective_funding_style(self) -> str:
+        """Return the explicit style or the frozen compatibility default."""
+
+        if self.funding_style is not None:
+            return self.funding_style
+        if (
+            self.principal_protected
+            or self.product_type in {"autocallable", "snowball"}
+        ):
+            return "funded_note"
+        return "premium_paid"
+
+    @property
+    def effective_face_value(self) -> float:
+        """Contract redemption base, distinct from exposure notional."""
+
+        return self.notional if self.face_value is None else self.face_value
+
+    @property
+    def effective_issue_price_pct(self) -> float | None:
+        """Issue price as a face-value fraction for funded notes."""
+
+        if self.effective_funding_style == "funded_note":
+            return 1.0 if self.issue_price_pct is None else self.issue_price_pct
+        return self.issue_price_pct
+
+    @property
+    def effective_protected_amount(self) -> float:
+        """Contractually protected redemption amount in currency units."""
+
+        if self.protected_amount is not None:
+            return self.protected_amount
+        return self.effective_face_value if self.principal_protected else 0.0
 
 
 def _prob_bucket(p: float) -> str:
@@ -128,8 +172,9 @@ class ClientProfile:
         if self.risk_appetite == "conservative" and not product.principal_protected:
             return False, "不保本，不符合风险偏好"
 
-        if product.notional > self.capital:
-            return False, "名义本金超过可投资金额"
+        cash_outlay = float(pricing.get("cash_outlay", pricing.get("client_price", 0.0)))
+        if cash_outlay > self.capital:
+            return False, "客户实际现金出资超过可投资金额"
 
         loss_frac = pricing["loss_frac"]
         if loss_frac > self.max_loss_pct + 1e-9:
@@ -264,6 +309,34 @@ def parse_product_spec(data: dict) -> ProductSpec:
     }
 
     errors: list[str] = []
+    allowed_fields = {
+        "product_type",
+        "notional",
+        "maturity_months",
+        "strike_pct",
+        "barrier_pct",
+        "barrier_type",
+        "barrier_direction",
+        "coupon_rate",
+        "participation_rate",
+        "principal_protected",
+        "target_client",
+        "pitch",
+        "hedging_plan",
+        "funding_style",
+        "face_value",
+        "issue_price_pct",
+        "protected_amount",
+        # Environment-maintained legacy fields are accepted only so this
+        # parser can deterministically discard them at the external boundary.
+        "reference_spot",
+        "barrier_touched",
+        "knock_in_active",
+        "elapsed_months",
+    }
+    unknown_fields = set(data) - allowed_fields
+    if unknown_fields:
+        errors.append(f"产品规格包含未知字段：{sorted(unknown_fields)}")
 
     def _is_number(x) -> bool:
         return isinstance(x, (int, float)) and not isinstance(x, bool)
@@ -363,6 +436,105 @@ def parse_product_spec(data: dict) -> ProductSpec:
     if not isinstance(principal_protected, bool):
         errors.append(f"principal_protected 必须是布尔值，实际为 {principal_protected!r}")
 
+    inferred_funding_style = (
+        "funded_note"
+        if principal_protected is True or product_type in {"autocallable", "snowball"}
+        else "premium_paid"
+    )
+    funding_style = data.get("funding_style")
+    if funding_style is None:
+        funding_style = inferred_funding_style
+    if funding_style not in FUNDING_STYLES:
+        errors.append(
+            f"funding_style 必须是 {FUNDING_STYLES} 之一，实际为 {funding_style!r}"
+        )
+
+    face_value = data.get("face_value")
+    if face_value is None:
+        face_value = notional
+    if not _is_finite_number(face_value) or face_value <= 0 or face_value > 1e12:
+        errors.append(
+            f"face_value 必须是 (0, 1e12] 范围内的有限数字，实际为 {face_value!r}"
+        )
+
+    issue_price_pct = data.get("issue_price_pct")
+    if issue_price_pct is None and funding_style == "funded_note":
+        issue_price_pct = 1.0
+    if issue_price_pct is not None and (
+        not _is_finite_number(issue_price_pct)
+        or issue_price_pct <= 0
+        or issue_price_pct > 10
+    ):
+        errors.append(
+            "issue_price_pct 必须为空或 (0, 10] 范围内的有限数字，"
+            f"实际为 {issue_price_pct!r}"
+        )
+    if funding_style == "funded_note" and issue_price_pct is None:
+        errors.append("funded_note 必须设置 issue_price_pct")
+    if (
+        funding_style == "funded_note"
+        and _is_finite_number(issue_price_pct)
+        and not math.isclose(float(issue_price_pct), 1.0, rel_tol=0.0, abs_tol=1e-12)
+    ):
+        errors.append(
+            "Level-0 funded_note 的 issue_price_pct 固定为 1.0；"
+            "价格适配必须通过 participation/coupon solve-for"
+        )
+    if funding_style == "premium_paid" and issue_price_pct is not None:
+        errors.append("premium_paid 的发行价由报价求解，issue_price_pct 必须为空")
+
+    default_protected = (
+        face_value
+        if principal_protected is True and _is_finite_number(face_value)
+        else 0.0
+    )
+    protected_amount = data.get("protected_amount")
+    if protected_amount is None:
+        protected_amount = default_protected
+    if (
+        not _is_finite_number(protected_amount)
+        or protected_amount < 0
+        or protected_amount > 1e12
+    ):
+        errors.append(
+            "protected_amount 必须是 [0, 1e12] 范围内的有限数字，"
+            f"实际为 {protected_amount!r}"
+        )
+    if principal_protected is True and _is_finite_number(protected_amount):
+        if protected_amount <= 0:
+            errors.append("principal_protected 产品的 protected_amount 必须为正")
+    if principal_protected is False and _is_finite_number(protected_amount):
+        if protected_amount > 0:
+            errors.append(
+                "未声明 principal_protected 的产品不能设置正 protected_amount"
+            )
+    if (
+        _is_finite_number(protected_amount)
+        and _is_finite_number(default_protected)
+        and not math.isclose(
+            float(protected_amount),
+            float(default_protected),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        errors.append(
+            "Level-0 protected_amount 由确定性 payoff floor 推导，不能由策略指定"
+        )
+
+    # Level 0 MC note templates are normalised to one unit of face.  Keeping
+    # face and exposure equal here is an explicit boundary until the solve-for
+    # payoff DSL supports separate participation notionals.
+    if (
+        product_type in {"autocallable", "snowball"}
+        and _is_finite_number(face_value)
+        and _is_finite_number(notional)
+        and not math.isclose(float(face_value), float(notional), rel_tol=0.0, abs_tol=1e-9)
+    ):
+        errors.append(
+            "Level-0 autocallable/snowball 要求 face_value 与 notional 相等"
+        )
+
     target_client = data.get("target_client")
     if not isinstance(target_client, str) or not target_client.strip():
         errors.append("target_client 必须是非空字符串")
@@ -391,6 +563,14 @@ def parse_product_spec(data: dict) -> ProductSpec:
         target_client=target_client,
         pitch=pitch,
         hedging_plan=hedging_plan,
+        funding_style=funding_style,
+        face_value=float(face_value) if _is_finite_number(face_value) else None,
+        issue_price_pct=(
+            float(issue_price_pct) if _is_finite_number(issue_price_pct) else None
+        ),
+        protected_amount=(
+            float(protected_amount) if _is_finite_number(protected_amount) else None
+        ),
         barrier_direction=barrier_direction,
         reference_spot=None,
         barrier_touched=False,

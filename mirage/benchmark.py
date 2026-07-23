@@ -18,6 +18,7 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Sequence
 
+from .cache import BoundedLRUCache
 if TYPE_CHECKING:  # runtime import avoided (env_agents imports CheckResult from here)
     from .env_agents import FormalFacts, FrozenEnvAgent, RoleResponse
 
@@ -26,11 +27,18 @@ from .pricing import (
     _fair_value_stress_loss,
     client_loss_measure,
     evaluate_product,
+    fair_value_stress_profile,
     hurdle_hit_prob,
     mc_diagnostics,
-    quote_economics,
+    solve_quote_equilibrium,
 )
-from .products import PRODUCT_TYPES, ClientProfile, MarketState, ProductSpec
+from .products import (
+    DRAFT_TARGET,
+    PRODUCT_TYPES,
+    ClientProfile,
+    MarketState,
+    ProductSpec,
+)
 
 # Fixed diagnostic MC seed for desk/oracle quotes. Constant across candidates so
 # the structure-keyed mc_diagnostics cache is shared during oracle enumeration.
@@ -75,6 +83,7 @@ class MarketSnapshot:
     carry_rate: float = 0.0
     regime: str = "unknown"
     source: str = ""
+    trend_alpha: float = 0.0
 
     def pricing_volatility(self, maturity_months: int | None = None) -> tuple[float, str]:
         """Return the documented ATM -> realized-vol fallback."""
@@ -113,6 +122,7 @@ class MarketSnapshot:
             dividend_yield=self.carry_rate,
             recent_trend=self.regime,
             vix_level=self.regime,
+            trend_alpha=self.trend_alpha,
         )
 
     def public_brief(self) -> dict:
@@ -176,9 +186,31 @@ def load_market_snapshots(path: str | Path) -> list[MarketSnapshot]:
                     carry_rate=_optional_float(row, "carry_rate") or 0.0,
                     regime=row.get("regime", "unknown").strip() or "unknown",
                     source=row["source"].strip(),
+                    trend_alpha=_optional_float(row, "trend_alpha") or 0.0,
                 )
                 if not snapshot.episode_id or not snapshot.underlying or not snapshot.source:
                     raise ValueError("episode_id, underlying and source must be non-empty")
+                finite_required = (
+                    snapshot.spot,
+                    snapshot.risk_free_rate,
+                    snapshot.carry_rate,
+                    snapshot.trend_alpha,
+                )
+                finite_optional = (
+                    snapshot.return_20d,
+                    snapshot.realized_vol_20d,
+                    snapshot.realized_vol_60d,
+                    snapshot.drawdown_6m,
+                    snapshot.atm_iv_1m,
+                    snapshot.atm_iv_3m,
+                    snapshot.atm_iv_6m,
+                )
+                if not all(math.isfinite(value) for value in finite_required):
+                    raise ValueError("required market numerics must be finite")
+                if not all(
+                    value is None or math.isfinite(value) for value in finite_optional
+                ):
+                    raise ValueError("optional market numerics must be null or finite")
                 if snapshot.round_num < 1 or snapshot.spot <= 0:
                     raise ValueError("round must be >=1 and spot must be positive")
                 snapshot.pricing_volatility()
@@ -220,6 +252,23 @@ class RiskBudget:
     net_vega: float
     stress_loss: float
 
+    def __post_init__(self) -> None:
+        for name in ("notional", "net_delta", "gross_delta", "net_vega", "stress_loss"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise BenchmarkError(f"RiskBudget.{name} must be positive and finite")
+
+    @property
+    def dealer_stress_loss(self) -> float:
+        """Explicit meaning of the legacy serialized ``stress_loss`` field."""
+
+        return self.stress_loss
+
     def scaled(self, factor: float) -> "RiskBudget":
         if factor <= 0:
             raise BenchmarkError("risk budget scale must be positive")
@@ -248,8 +297,17 @@ class Position:
     remaining_months: int
     delta_dollars: float
     vega_dollars: float
-    stress_loss: float
+    client_value_loss: float
+    dealer_unhedged_liability_loss: float
+    dealer_hedged_stress_loss: float
     quote_margin: float
+    funding_style: str
+    face_value: float
+    issue_price_pct: float | None
+    issue_cash_outlay: float
+    premium: float | None
+    protected_amount: float
+    dealer_fee: float
     trade_date: date | None = None
     initial_fixing: float | None = None
     absolute_strike: float | None = None
@@ -266,6 +324,54 @@ class Position:
     current_fair_value: float = 0.0
     status: str = "active"
     last_valuation_round: int | None = None
+    close_event_id: str | None = None
+    settlement_amount: float | None = None
+    client_realized_pnl: float | None = None
+    dealer_liability_realized_pnl: float | None = None
+
+    @property
+    def stress_loss(self) -> float:
+        """Deprecated alias for the client-long value-loss measure."""
+
+        return self.client_value_loss
+
+
+@dataclass(frozen=True)
+class CashflowRecord:
+    """One immutable contractual cash movement."""
+
+    cashflow_id: str
+    position_id: str
+    event_type: str
+    as_of: date
+    round_num: int
+    payer: str
+    receiver: str
+    amount: float
+    component: str
+    currency: str = "CNY"
+
+
+@dataclass(frozen=True)
+class LifecycleEvent:
+    """Economically meaningful position event preserved after closure."""
+
+    event_id: str
+    position_id: str
+    event_type: str
+    close_reason: str
+    as_of: date
+    round_num: int
+    spot: float
+    cashflows: tuple[CashflowRecord, ...]
+    client_cash_outlay: float
+    settlement_amount: float
+    client_realized_pnl: float
+    dealer_liability_realized_pnl: float
+    dealer_hedge_pnl: float | None
+    transaction_costs: float | None
+    dealer_total_pnl: float | None
+    pnl_provenance: str = "contract-cashflow-ledger-v1"
 
 
 _CLIENT_OVERRIDE_FIELDS = frozenset({
@@ -303,7 +409,6 @@ def resolve_client_profile(client: ClientProfile, round_num: int) -> ClientProfi
         if round_num in rounds:
             combined.update({key: value for key, value in entry.items() if key != "rounds"})
 
-    combined.setdefault("current_focus", "")
     resolved = replace(client, **combined)
     numeric = (
         resolved.capital, resolved.max_loss_pct, resolved.min_return_pct,
@@ -398,7 +503,9 @@ def _revalue_position(position: Position, snapshot: MarketSnapshot) -> None:
         position.current_fair_value = 0.0
         position.delta_dollars = 0.0
         position.vega_dollars = 0.0
-        position.stress_loss = 0.0
+        position.client_value_loss = 0.0
+        position.dealer_unhedged_liability_loss = 0.0
+        position.dealer_hedged_stress_loss = 0.0
         position.last_valuation_round = snapshot.round_num
         return
 
@@ -417,12 +524,153 @@ def _revalue_position(position: Position, snapshot: MarketSnapshot) -> None:
     pricing = evaluate_product(product, market)
     if pricing is None:
         raise BenchmarkError(f"cannot revalue unsupported position {position.position_id}")
-    stress_loss, _ = _fair_value_stress_loss(product, market)
+    stress = fair_value_stress_profile(product, market)
     position.current_fair_value = float(pricing["fair_value"])
     position.delta_dollars = float(pricing["greeks"].get("delta", 0.0)) * product.notional
     position.vega_dollars = float(pricing["greeks"].get("vega_pct", 0.0)) * product.notional
-    position.stress_loss = float(stress_loss)
+    position.client_value_loss = float(stress.client_value_loss)
+    position.dealer_unhedged_liability_loss = float(
+        stress.dealer_unhedged_liability_loss
+    )
+    position.dealer_hedged_stress_loss = float(stress.dealer_hedged_stress_loss)
     position.last_valuation_round = snapshot.round_num
+
+
+def _position_settlement_amount(position: Position, snapshot: MarketSnapshot) -> float:
+    """Deterministic contractual settlement at an observed close event."""
+
+    product = position.product
+    face = position.face_value
+    protected = position.protected_amount
+    reference = position.initial_fixing
+    if reference is None or reference <= 0:
+        raise BenchmarkError(
+            f"position {position.position_id} is missing a valid issue fixing"
+        )
+
+    if position.status == "knocked_out":
+        # Level-0 barrier grammar carries no rebate.
+        return protected
+
+    elapsed_years = max(position.elapsed_months, 0) / 12.0
+    coupon = product.coupon_rate or 0.0
+    if position.status == "autocalled":
+        return face * (1.0 + coupon * elapsed_years)
+
+    spot = snapshot.spot
+    strike = position.absolute_strike
+    if strike is None:
+        raise BenchmarkError(
+            f"position {position.position_id} is missing an absolute strike"
+        )
+
+    if product.product_type in {"vanilla_call", "vanilla_put"}:
+        intrinsic = (
+            max(spot - strike, 0.0)
+            if product.product_type == "vanilla_call"
+            else max(strike - spot, 0.0)
+        )
+        option_cash = (
+            product.notional
+            * product.participation_rate
+            * intrinsic
+            / reference
+        )
+        return protected + option_cash
+
+    if product.product_type in {"barrier_call", "barrier_put"}:
+        active = True
+        if product.barrier_type == "knock_out" and position.barrier_touched:
+            active = False
+        if product.barrier_type == "knock_in" and not position.barrier_touched:
+            active = False
+        intrinsic = (
+            max(spot - strike, 0.0)
+            if product.product_type == "barrier_call"
+            else max(strike - spot, 0.0)
+        )
+        option_cash = (
+            product.notional
+            * product.participation_rate
+            * intrinsic
+            / reference
+            if active
+            else 0.0
+        )
+        return protected + option_cash
+
+    if product.product_type == "snowball":
+        if position.knock_in_state and spot < reference:
+            return face * spot / reference
+        return face * (1.0 + coupon * product.maturity_months / 12.0)
+
+    if product.product_type == "autocallable":
+        if (
+            position.knock_in_state
+            and not product.principal_protected
+            and spot < reference
+        ):
+            return face * min(spot / reference, 1.0)
+        return face * (1.0 + coupon * product.maturity_months / 12.0)
+
+    raise BenchmarkError(
+        f"cannot settle unsupported product type {product.product_type!r}"
+    )
+
+
+def _close_position(
+    position: Position,
+    snapshot: MarketSnapshot,
+) -> LifecycleEvent:
+    settlement = max(_position_settlement_amount(position, snapshot), 0.0)
+    client_pnl = settlement - position.issue_cash_outlay
+    dealer_liability_pnl = -client_pnl
+    event_id = hashlib.sha256(
+        (
+            f"{position.position_id}|{position.status}|"
+            f"{snapshot.as_of.isoformat()}|{snapshot.round_num}"
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    cashflow = CashflowRecord(
+        cashflow_id=f"CF-{event_id}",
+        position_id=position.position_id,
+        event_type="settlement",
+        as_of=snapshot.as_of,
+        round_num=snapshot.round_num,
+        payer="dealer",
+        receiver="client",
+        amount=settlement,
+        component=(
+            "autocall_payment"
+            if position.status == "autocalled"
+            else "barrier_close_payment"
+            if position.status == "knocked_out"
+            else "maturity_redemption"
+        ),
+    )
+    position.close_event_id = f"LE-{event_id}"
+    position.settlement_amount = settlement
+    position.client_realized_pnl = client_pnl
+    position.dealer_liability_realized_pnl = dealer_liability_pnl
+    return LifecycleEvent(
+        event_id=position.close_event_id,
+        position_id=position.position_id,
+        event_type="position_closed",
+        close_reason=position.status,
+        as_of=snapshot.as_of,
+        round_num=snapshot.round_num,
+        spot=snapshot.spot,
+        cashflows=(cashflow,),
+        client_cash_outlay=position.issue_cash_outlay,
+        settlement_amount=settlement,
+        client_realized_pnl=client_pnl,
+        dealer_liability_realized_pnl=dealer_liability_pnl,
+        # A static-delta stress proxy is not a realised hedge ledger.  These
+        # remain unavailable until actual hedge trades and unwind costs exist.
+        dealer_hedge_pnl=None,
+        transaction_costs=None,
+        dealer_total_pnl=None,
+    )
 
 
 @dataclass
@@ -430,16 +678,34 @@ class PortfolioState:
     """Outstanding products and risk carried across dynamic rounds."""
 
     positions: list[Position] = field(default_factory=list)
+    closed_positions: list[Position] = field(default_factory=list)
+    cashflow_ledger: list[CashflowRecord] = field(default_factory=list)
+    lifecycle_events: list[LifecycleEvent] = field(default_factory=list)
+    last_lifecycle_events: list[LifecycleEvent] = field(default_factory=list)
     revision: int = 0
 
     def totals(self) -> dict[str, float]:
         return {
             "notional": sum(p.product.notional for p in self.positions),
+            "cash_outlay": sum(p.issue_cash_outlay for p in self.positions),
             "fair_value": sum(p.current_fair_value for p in self.positions),
             "net_delta": sum(p.delta_dollars for p in self.positions),
             "gross_delta": sum(abs(p.delta_dollars) for p in self.positions),
             "net_vega": sum(p.vega_dollars for p in self.positions),
-            "stress_loss": sum(max(p.stress_loss, 0.0) for p in self.positions),
+            "client_value_loss": sum(
+                max(p.client_value_loss, 0.0) for p in self.positions
+            ),
+            "dealer_unhedged_liability_loss": sum(
+                max(p.dealer_unhedged_liability_loss, 0.0)
+                for p in self.positions
+            ),
+            "dealer_hedged_stress_loss": sum(
+                max(p.dealer_hedged_stress_loss, 0.0) for p in self.positions
+            ),
+            # Compatibility alias, explicitly client-sided.
+            "stress_loss": sum(
+                max(p.client_value_loss, 0.0) for p in self.positions
+            ),
         }
 
     def advance_month(self, snapshot: MarketSnapshot | None = None) -> list[str]:
@@ -452,27 +718,65 @@ class PortfolioState:
         """
         closed: list[str] = []
         active: list[Position] = []
+        events: list[LifecycleEvent] = []
         for position in self.positions:
             if snapshot is None:
                 position.remaining_months -= 1
                 position.elapsed_months += 1
+                if position.remaining_months <= 0 and position.status == "active":
+                    position.status = "matured"
             else:
                 _process_position_observation(position, snapshot)
                 _revalue_position(position, snapshot)
             if position.remaining_months <= 0 or position.status != "active":
                 closed.append(position.position_id)
+                if snapshot is not None:
+                    event = _close_position(position, snapshot)
+                    events.append(event)
+                    self.lifecycle_events.append(event)
+                    self.cashflow_ledger.extend(event.cashflows)
+                self.closed_positions.append(position)
             else:
                 active.append(position)
         self.positions = active
+        self.last_lifecycle_events = events
         self.revision += 1
         return closed
 
     def add(self, position: Position) -> None:
         self.positions.append(position)
+        if position.trade_date is not None:
+            digest = hashlib.sha256(
+                (
+                    f"{position.position_id}|issue|"
+                    f"{position.trade_date.isoformat()}|{position.last_valuation_round}"
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            self.cashflow_ledger.append(
+                CashflowRecord(
+                    cashflow_id=f"CF-{digest}",
+                    position_id=position.position_id,
+                    event_type="issuance",
+                    as_of=position.trade_date,
+                    round_num=position.last_valuation_round or 0,
+                    payer="client",
+                    receiver="dealer",
+                    amount=position.issue_cash_outlay,
+                    component=(
+                        "premium"
+                        if position.funding_style == "premium_paid"
+                        else "issue_proceeds"
+                    ),
+                )
+            )
         self.revision += 1
 
     def reset(self) -> None:
         self.positions.clear()
+        self.closed_positions.clear()
+        self.cashflow_ledger.clear()
+        self.lifecycle_events.clear()
+        self.last_lifecycle_events.clear()
         self.revision += 1
 
 
@@ -519,14 +823,29 @@ class Quote:
     dealer_margin: float
     delta_dollars: float
     vega_dollars: float
-    stress_loss: float
+    client_value_loss: float
+    dealer_unhedged_liability_loss: float
+    dealer_hedged_stress_loss: float | None
     volatility_source: str
     checks: tuple[CheckResult, ...]
     warnings: tuple[str, ...]
     margin_rate: float = 0.0
     suitability: float = 1.0
     hurdle_hit_prob: float | None = None
-    worst_stress_id: str = ""
+    client_worst_stress_id: str = ""
+    dealer_worst_stress_id: str = ""
+    dealer_hedged_worst_stress_id: str = ""
+    hedge_model: str = "static_delta_v1"
+    funding_style: str = "premium_paid"
+    face_value: float = 0.0
+    issue_price_pct: float | None = None
+    cash_outlay: float = 0.0
+    premium: float | None = None
+    protected_amount: float = 0.0
+    dealer_fee: float = 0.0
+    quote_solver_version: str = ""
+    quote_solver_iterations: int = 0
+    quote_solver_price_residual: float = 0.0
     # Full engine-side pricing dict (enriched with hurdle_hit_prob / stress_loss).
     # Excluded from equality/repr so the frozen dataclass stays lightweight and the
     # dict never leaks through public_payload. Consumed by client_contract_pass.
@@ -535,6 +854,18 @@ class Quote:
     @property
     def hard_pass(self) -> bool:
         return all(item.passed for item in self.checks if item.severity == "HARD")
+
+    @property
+    def stress_loss(self) -> float:
+        """Deprecated public alias for client-long value loss."""
+
+        return self.client_value_loss
+
+    @property
+    def worst_stress_id(self) -> str:
+        """Deprecated alias for the client-long worst scenario."""
+
+        return self.client_worst_stress_id
 
     def public_payload(self) -> dict:
         # Deliberately exposes margin_rate and suitability, but never the margin
@@ -548,12 +879,32 @@ class Quote:
             "suitability": self.suitability,
             "delta_dollars": self.delta_dollars,
             "vega_dollars": self.vega_dollars,
-            "stress_loss": self.stress_loss,
+            "client_value_loss": self.client_value_loss,
+            "dealer_unhedged_liability_loss": self.dealer_unhedged_liability_loss,
+            "dealer_hedged_stress_loss": self.dealer_hedged_stress_loss,
+            "client_worst_stress_id": self.client_worst_stress_id,
+            "dealer_worst_stress_id": self.dealer_worst_stress_id,
+            "dealer_hedged_worst_stress_id": self.dealer_hedged_worst_stress_id,
+            "hedge_model": self.hedge_model,
+            # Compatibility alias, now explicitly client-sided.
+            "stress_loss": self.client_value_loss,
+            "funding_style": self.funding_style,
+            "face_value": self.face_value,
+            "issue_price_pct": self.issue_price_pct,
+            "cash_outlay": self.cash_outlay,
+            "premium": self.premium,
+            "protected_amount": self.protected_amount,
+            "dealer_fee": self.dealer_fee,
             "volatility_source": self.volatility_source,
             "hard_pass": self.hard_pass,
             "checks": [asdict(check) for check in self.checks],
             "warnings": list(self.warnings),
             "valid_for_state": self.state_version,
+            "quote_solver": {
+                "version": self.quote_solver_version,
+                "iterations": self.quote_solver_iterations,
+                "price_residual": self.quote_solver_price_residual,
+            },
         }
 
 
@@ -604,7 +955,91 @@ class ProductDomainSpec:
     coupons: tuple[float, ...] = (.04, .08)
     participations: tuple[float, ...] = (.5, 1.0)
     principal_protected: tuple[bool, ...] = (False, True)
-    version: str = "csi-domain-v1"
+    version: str = "csi-domain-v2-funding"
+
+    def __post_init__(self) -> None:
+        tuple_fields = (
+            "product_types",
+            "notional_fractions",
+            "maturities",
+            "strikes",
+            "barriers",
+            "coupons",
+            "participations",
+            "principal_protected",
+        )
+        for name in tuple_fields:
+            value = tuple(getattr(self, name))
+            object.__setattr__(self, name, value)
+        for name in ("product_types", "notional_fractions", "maturities"):
+            if not getattr(self, name):
+                raise BenchmarkError(f"ProductDomainSpec.{name} must not be empty")
+        invalid_types = set(self.product_types) - set(PRODUCT_TYPES)
+        if invalid_types:
+            raise BenchmarkError(
+                f"ProductDomainSpec has invalid product types: {sorted(invalid_types)}"
+            )
+        option_types = {"vanilla_call", "vanilla_put", "barrier_call", "barrier_put"}
+        if set(self.product_types) & option_types:
+            if not self.strikes:
+                raise BenchmarkError(
+                    "ProductDomainSpec.strikes must not be empty for option products"
+                )
+            if not self.participations:
+                raise BenchmarkError(
+                    "ProductDomainSpec.participations must not be empty for option products"
+                )
+            if not self.principal_protected:
+                raise BenchmarkError(
+                    "ProductDomainSpec.principal_protected must not be empty for option products"
+                )
+        if set(self.product_types) & {"barrier_call", "barrier_put", "snowball"}:
+            if not self.barriers:
+                raise BenchmarkError(
+                    "ProductDomainSpec.barriers must not be empty for barrier/snowball products"
+                )
+        if set(self.product_types) & {"autocallable", "snowball"}:
+            if not self.coupons:
+                raise BenchmarkError(
+                    "ProductDomainSpec.coupons must not be empty for note products"
+                )
+        if "autocallable" in self.product_types and not self.principal_protected:
+            raise BenchmarkError(
+                "ProductDomainSpec.principal_protected must not be empty for autocallable products"
+            )
+        for name in (
+            "notional_fractions",
+            "strikes",
+            "barriers",
+            "participations",
+        ):
+            if not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value > 0
+                for value in getattr(self, name)
+            ):
+                raise BenchmarkError(f"ProductDomainSpec.{name} must be positive and finite")
+        if not all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+            for value in self.coupons
+        ):
+            raise BenchmarkError("ProductDomainSpec.coupons must be finite and non-negative")
+        if not all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+            for value in self.maturities
+        ):
+            raise BenchmarkError("ProductDomainSpec.maturities must be positive integers")
+        if not all(isinstance(value, bool) for value in self.principal_protected):
+            raise BenchmarkError("ProductDomainSpec.principal_protected must be booleans")
+        if not isinstance(self.version, str) or not self.version.strip():
+            raise BenchmarkError("ProductDomainSpec.version must be non-empty")
 
 
 def _domain_notionals(client: ClientProfile, domain: ProductDomainSpec) -> list[int]:
@@ -624,6 +1059,14 @@ def _domain_signature(product: ProductSpec) -> tuple:
         round(product.coupon_rate, 9) if product.coupon_rate is not None else None,
         round(product.participation_rate, 9),
         bool(product.principal_protected),
+        product.effective_funding_style,
+        round(product.effective_face_value, 9),
+        (
+            round(product.effective_issue_price_pct, 9)
+            if product.effective_issue_price_pct is not None
+            else None
+        ),
+        round(product.effective_protected_amount, 9),
     )
 
 
@@ -690,7 +1133,7 @@ def enumerate_domain(client: ClientProfile, domain: ProductDomainSpec | None = N
                                         barrier=barrier, barrier_type="knock_in", protected=False)
 
 
-_DOMAIN_SET_CACHE: dict = {}
+_DOMAIN_SET_CACHE: BoundedLRUCache[tuple, frozenset] = BoundedLRUCache(maxsize=128)
 
 
 def _domain_signature_set(client: ClientProfile, domain: ProductDomainSpec) -> frozenset:
@@ -732,9 +1175,15 @@ def client_contract_pass(
     Mirrors mirage.products.ClientProfile.would_buy but on the continuous loss
     measure. The client LLM's attitude never overrides this gate.
     """
-    stress_loss = float(quote_pricing.get("stress_loss", 0.0))
+    client_value_loss = float(quote_pricing.get("client_value_loss", 0.0))
     worst_stress_id = str(quote_pricing.get("worst_stress_id", ""))
-    measure = client_loss_measure(product, quote_pricing, stress_loss, worst_stress_id=worst_stress_id)
+    measure = client_loss_measure(
+        product,
+        quote_pricing,
+        client_value_loss,
+        worst_stress_id=worst_stress_id,
+    )
+    cash_outlay = float(quote_pricing.get("cash_outlay", product.notional))
     allowed = client.allowed_product_types is None or product.product_type in client.allowed_product_types
     needs_protection = client.principal_protection_required or client.risk_appetite == "conservative"
     protection_ok = not needs_protection or product.principal_protected
@@ -742,12 +1191,15 @@ def client_contract_pass(
     hurdle_ok = hh is None or hh >= client.min_hit_prob - 1e-9
 
     checks = [
+        _check("CONTRACT_TARGET_CLIENT_MATCH", product.target_client == client.id,
+               product.target_client, client.id,
+               "term-sheet target client must match the settlement client", "CONTRACT"),
         _check("CONTRACT_ACCEPTING", client.accepting_new_products,
                client.accepting_new_products, True,
                "client must be accepting new products", "CONTRACT"),
-        _check("CONTRACT_CAPITAL", product.notional <= client.capital + 1e-9,
-               product.notional, client.capital,
-               "notional must not exceed available capital", "CONTRACT"),
+        _check("CONTRACT_CAPITAL", cash_outlay <= client.capital + 1e-9,
+               cash_outlay, client.capital,
+               "cash outlay must not exceed available capital", "CONTRACT"),
         _check("CONTRACT_MATURITY", product.maturity_months <= client.max_maturity_months,
                product.maturity_months, client.max_maturity_months,
                "maturity must fit the client mandate", "CONTRACT"),
@@ -784,31 +1236,60 @@ class HardConstraintEngine:
         *,
         delta_dollars: float,
         vega_dollars: float,
-        stress_loss: float,
-        worst_stress_id: str = "",
+        client_value_loss: float,
+        dealer_unhedged_liability_loss: float,
+        dealer_hedged_stress_loss: float,
+        client_worst_stress_id: str = "",
+        dealer_worst_stress_id: str = "",
+        dealer_hedged_worst_stress_id: str = "",
     ) -> list[CheckResult]:
         current = portfolio.totals()
         protection_tolerance = self.description_tolerance_bp / 10_000.0
         floor = worst_case_payoff_ratio(product)
-        client_loss = client_loss_measure(product, pricing, stress_loss, worst_stress_id=worst_stress_id)
+        floor_amount = floor * product.effective_face_value
+        cash_outlay = float(pricing["cash_outlay"])
+        protected_amount = float(pricing["protected_amount"])
+        client_loss = client_loss_measure(
+            product,
+            pricing,
+            client_value_loss,
+            worst_stress_id=client_worst_stress_id,
+        )
         post_notional = current["notional"] + product.notional
+        post_cash_outlay = current["cash_outlay"] + cash_outlay
         post_net_delta = current["net_delta"] + delta_dollars
         post_gross_delta = current["gross_delta"] + abs(delta_dollars)
         post_net_vega = current["net_vega"] + vega_dollars
-        post_stress = current["stress_loss"] + max(stress_loss, 0.0)
+        post_stress = (
+            current["dealer_hedged_stress_loss"]
+            + max(dealer_hedged_stress_loss, 0.0)
+        )
 
         allowed = client.allowed_product_types is None or product.product_type in client.allowed_product_types
-        protection_ok = not client.principal_protection_required or floor >= 1.0 - protection_tolerance
-        claim_ok = not product.principal_protected or floor >= 1.0 - protection_tolerance
+        protection_ok = (
+            not client.principal_protection_required
+            or protected_amount >= cash_outlay * (1.0 - protection_tolerance)
+        )
+        claim_ok = (
+            not product.principal_protected
+            or (
+                floor_amount + 1e-9 >= protected_amount
+                and protected_amount >= cash_outlay * (1.0 - protection_tolerance)
+            )
+        )
         normalized_pitch = product.pitch.lower().replace(" ", "")
         protected_words = ("保本", "本金保障", "本金保证", "principalprotected", "capitalguaranteed")
         pitch_claims_protection = any(word in normalized_pitch for word in protected_words)
         description_ok = not pitch_claims_protection or claim_ok
         return [
+            _check("TARGET_CLIENT_MATCH", product.target_client == client.id,
+                   product.target_client, client.id,
+                   "term-sheet target client must match the current client"),
             _check("CLIENT_ACCEPTING", client.accepting_new_products, client.accepting_new_products, True,
                    "client must be accepting new products"),
-            _check("CLIENT_CAPITAL", product.notional <= client.capital + 1e-9,
-                   product.notional, client.capital, "notional must not exceed available capital"),
+            _check("CLIENT_CAPITAL", post_cash_outlay <= client.capital + 1e-9,
+                   post_cash_outlay, client.capital,
+                   "active client cash outlay plus this trade must fit available capital"),
             _check("CLIENT_MATURITY", product.maturity_months <= client.max_maturity_months,
                    product.maturity_months, client.max_maturity_months, "maturity must fit the client mandate"),
             _check("CLIENT_PRODUCT_WHITELIST", allowed, product.product_type,
@@ -822,10 +1303,10 @@ class HardConstraintEngine:
                    f"premium={client_loss.premium_at_risk_frac:.4f} "
                    f"stress={client_loss.stress_loss_frac:.4f} "
                    f"worst_stress={client_loss.worst_stress_id or 'n/a'})"),
-            _check("CLIENT_PROTECTION", protection_ok, floor, 1.0,
-                   "a protection requirement needs a deterministic bond floor"),
-            _check("PROTECTION_CLAIM", claim_ok, floor, 1.0 - protection_tolerance,
-                   "a principal-protected claim must match the payoff floor within 1 bp"),
+            _check("CLIENT_PROTECTION", protection_ok, protected_amount, cash_outlay,
+                   "a protection requirement covers the client's actual cash outlay"),
+            _check("PROTECTION_CLAIM", claim_ok, protected_amount, cash_outlay,
+                   "a principal-protected claim must cover cash outlay and fit the payoff floor"),
             _check("DESCRIPTION_PROTECTION", description_ok, pitch_claims_protection,
                    product.principal_protected,
                    "a natural-language protection claim must match the deterministic payoff floor"),
@@ -837,8 +1318,11 @@ class HardConstraintEngine:
                    post_gross_delta, self.risk_budget.gross_delta, "post-trade gross delta budget"),
             _check("PORTFOLIO_NET_VEGA", abs(post_net_vega) <= self.risk_budget.net_vega + 1e-9,
                    abs(post_net_vega), self.risk_budget.net_vega, "post-trade absolute vega budget"),
-            _check("PORTFOLIO_STRESS_LOSS", post_stress <= self.risk_budget.stress_loss + 1e-9,
-                   post_stress, self.risk_budget.stress_loss, "post-trade stress-loss budget"),
+            _check("PORTFOLIO_DEALER_STRESS_LOSS",
+                   post_stress <= self.risk_budget.dealer_stress_loss + 1e-9,
+                   post_stress, self.risk_budget.dealer_stress_loss,
+                   "post-trade static-delta-hedged dealer stress budget "
+                   f"(worst={dealer_hedged_worst_stress_id or 'n/a'})"),
         ]
 
 
@@ -851,8 +1335,18 @@ class HardConstraintEngine:
 # ---------------------------------------------------------------------------
 
 _PRICE_REF_NOTIONAL = 1_000_000.0
-_STRUCT_PRICE_CACHE: dict = {}
-_HURDLE_CACHE: dict = {}
+_STRUCT_PRICE_CACHE: BoundedLRUCache[tuple, dict] = BoundedLRUCache(maxsize=4096)
+_HURDLE_CACHE: BoundedLRUCache[tuple, float | None] = BoundedLRUCache(maxsize=8192)
+
+
+def _with_reference_notional(product: ProductSpec) -> ProductSpec:
+    scale = _PRICE_REF_NOTIONAL / product.notional
+    return replace(
+        product,
+        notional=_PRICE_REF_NOTIONAL,
+        face_value=product.effective_face_value * scale,
+        protected_amount=product.effective_protected_amount * scale,
+    )
 
 
 def _structure_key(product: ProductSpec, market: MarketState) -> tuple:
@@ -866,6 +1360,10 @@ def _structure_key(product: ProductSpec, market: MarketState) -> tuple:
         product.coupon_rate,
         product.participation_rate,
         product.principal_protected,
+        product.effective_funding_style,
+        product.effective_face_value / product.notional,
+        product.effective_issue_price_pct,
+        product.effective_protected_amount / product.notional,
         getattr(product, "reference_spot", None),
         bool(getattr(product, "barrier_touched", False)),
         bool(getattr(product, "knock_in_active", False)),
@@ -874,6 +1372,7 @@ def _structure_key(product: ProductSpec, market: MarketState) -> tuple:
         market.volatility,
         market.risk_free_rate,
         market.dividend_yield,
+        market.trend_alpha,
     )
 
 
@@ -883,18 +1382,41 @@ def _structural_pricing(product: ProductSpec, market: MarketState) -> dict:
     cached = _STRUCT_PRICE_CACHE.get(key)
     if cached is not None:
         return cached
-    ref = replace(product, notional=_PRICE_REF_NOTIONAL)
+    ref = _with_reference_notional(product)
     pr = evaluate_product(ref, market)
     if pr is None:
         raise BenchmarkError("custom products are outside the finite benchmark grammar")
-    stress_ref, worst_stress_id = _fair_value_stress_loss(ref, market)
+    stress = fair_value_stress_profile(ref, market)
     cached = {
         "frac_fair": pr["fair_value"] / _PRICE_REF_NOTIONAL,
         "greeks": pr["greeks"],
         "loss_frac": pr["loss_frac"],
         "pricing_details": pr["pricing_details"],
-        "stress_frac": stress_ref / _PRICE_REF_NOTIONAL,
-        "worst_stress_id": worst_stress_id,
+        "client_value_loss_frac": stress.client_value_loss / _PRICE_REF_NOTIONAL,
+        "client_worst_stress_id": stress.client_worst_stress_id,
+        "dealer_unhedged_liability_loss_frac": (
+            stress.dealer_unhedged_liability_loss / _PRICE_REF_NOTIONAL
+        ),
+        "dealer_worst_stress_id": stress.dealer_worst_stress_id,
+        "dealer_hedged_stress_loss_frac": (
+            stress.dealer_hedged_stress_loss / _PRICE_REF_NOTIONAL
+        ),
+        "dealer_hedged_worst_stress_id": stress.dealer_hedged_worst_stress_id,
+        "hedge_model": stress.hedge_model,
+        "stress_scenarios": tuple(
+            {
+                "stress_id": row.stress_id,
+                "client_pnl_frac": row.client_pnl / _PRICE_REF_NOTIONAL,
+                "dealer_liability_pnl_frac": (
+                    row.dealer_liability_pnl / _PRICE_REF_NOTIONAL
+                ),
+                "hedge_pnl_frac": row.hedge_pnl / _PRICE_REF_NOTIONAL,
+                "dealer_hedged_pnl_frac": (
+                    row.dealer_hedged_pnl / _PRICE_REF_NOTIONAL
+                ),
+            }
+            for row in stress.scenarios
+        ),
     }
     _STRUCT_PRICE_CACHE[key] = cached
     return cached
@@ -911,7 +1433,7 @@ def _cached_hurdle(
     )
     if key in _HURDLE_CACHE:
         return _HURDLE_CACHE[key]
-    ref = replace(product, notional=_PRICE_REF_NOTIONAL)
+    ref = _with_reference_notional(product)
     value = hurdle_hit_prob(ref, market, min_return, client_price_per_notional * _PRICE_REF_NOTIONAL)
     _HURDLE_CACHE[key] = value
     return value
@@ -954,31 +1476,60 @@ class TradingDesk:
             "loss_frac": struct["loss_frac"],
             "pricing_details": struct["pricing_details"],
         }
-        stress_loss = struct["stress_frac"] * product.notional
-        worst_stress_id = struct["worst_stress_id"]
-        pricing["stress_loss"] = stress_loss
-        pricing["worst_stress_id"] = worst_stress_id
+        client_value_loss = struct["client_value_loss_frac"] * product.notional
+        dealer_unhedged_loss = (
+            struct["dealer_unhedged_liability_loss_frac"] * product.notional
+        )
+        dealer_hedged_loss = (
+            struct["dealer_hedged_stress_loss_frac"] * product.notional
+        )
+        client_worst_stress_id = struct["client_worst_stress_id"]
+        dealer_worst_stress_id = struct["dealer_worst_stress_id"]
+        dealer_hedged_worst_stress_id = struct["dealer_hedged_worst_stress_id"]
+        pricing["client_value_loss"] = client_value_loss
+        pricing["dealer_unhedged_liability_loss"] = dealer_unhedged_loss
+        pricing["dealer_hedged_stress_loss"] = dealer_hedged_loss
+        pricing["hedge_model"] = struct["hedge_model"]
+        pricing["stress_loss"] = client_value_loss
+        pricing["worst_stress_id"] = client_worst_stress_id
 
         diag = mc_diagnostics(product, market, n_paths=self.policy.diagnostic_paths, seed=QUOTE_DIAGNOSTIC_SEED)
         totals = portfolio.totals()
         capacity_notional = self.hard_checks.risk_budget.notional
         post_notional = totals["notional"] + product.notional
 
-        # Two-pass so suitability reflects the client's hurdle probability: the
-        # first pass (no hurdle in pricing -> neutral) yields a client_price to
-        # size hurdle_hit_prob, which the second pass folds into suitability.
-        econ0 = quote_economics(
-            pricing, diag, stress_loss=stress_loss, post_notional=post_notional,
-            capacity_notional=capacity_notional, policy=self.policy, product=product, client=client,
+        equilibrium = solve_quote_equilibrium(
+            product,
+            market,
+            client,
+            pricing,
+            diag,
+            dealer_stress_loss=dealer_hedged_loss,
+            post_notional=post_notional,
+            capacity_notional=capacity_notional,
+            policy=self.policy,
+            hurdle_probability=lambda price: _cached_hurdle(
+                product,
+                market,
+                client.min_return_pct,
+                price / product.notional if product.notional else 0.0,
+            ),
         )
-        cpn = econ0.client_price / product.notional if product.notional else 0.0
-        hh = _cached_hurdle(product, market, client.min_return_pct, cpn)
+        if not equilibrium.converged:
+            raise BenchmarkError(
+                "quote equilibrium did not converge "
+                f"(residual={equilibrium.price_residual:.6g})"
+            )
+        hh = equilibrium.hurdle_hit_prob
+        econ = equilibrium.economics
         pricing["hurdle_hit_prob"] = hh
-        econ = quote_economics(
-            pricing, diag, stress_loss=stress_loss, post_notional=post_notional,
-            capacity_notional=capacity_notional, policy=self.policy, product=product, client=client,
-        )
         pricing["client_price"] = econ.client_price
+        pricing["cash_outlay"] = econ.cash_outlay
+        pricing["premium"] = econ.premium
+        pricing["face_value"] = econ.face_value
+        pricing["issue_price_pct"] = econ.issue_price_pct
+        pricing["protected_amount"] = econ.protected_amount
+        pricing["dealer_fee"] = econ.dealer_fee
         pricing["hedging_cost"] = econ.hedging_cost
         pricing["dealer_margin"] = econ.dealer_margin
 
@@ -990,8 +1541,12 @@ class TradingDesk:
             product, pricing, client, portfolio,
             delta_dollars=delta_dollars,
             vega_dollars=vega_dollars,
-            stress_loss=stress_loss,
-            worst_stress_id=worst_stress_id,
+            client_value_loss=client_value_loss,
+            dealer_unhedged_liability_loss=dealer_unhedged_loss,
+            dealer_hedged_stress_loss=dealer_hedged_loss,
+            client_worst_stress_id=client_worst_stress_id,
+            dealer_worst_stress_id=dealer_worst_stress_id,
+            dealer_hedged_worst_stress_id=dealer_hedged_worst_stress_id,
         )
         checks = list(domain_checks) + hard
 
@@ -1015,14 +1570,29 @@ class TradingDesk:
             dealer_margin=econ.dealer_margin,
             delta_dollars=delta_dollars,
             vega_dollars=vega_dollars,
-            stress_loss=stress_loss,
+            client_value_loss=client_value_loss,
+            dealer_unhedged_liability_loss=dealer_unhedged_loss,
+            dealer_hedged_stress_loss=dealer_hedged_loss,
             volatility_source=vol_source,
             checks=tuple(checks),
             warnings=tuple(warnings),
             margin_rate=econ.margin_rate,
             suitability=econ.suitability,
             hurdle_hit_prob=hh,
-            worst_stress_id=worst_stress_id,
+            client_worst_stress_id=client_worst_stress_id,
+            dealer_worst_stress_id=dealer_worst_stress_id,
+            dealer_hedged_worst_stress_id=dealer_hedged_worst_stress_id,
+            hedge_model=struct["hedge_model"],
+            funding_style=econ.funding_style,
+            face_value=econ.face_value,
+            issue_price_pct=econ.issue_price_pct,
+            cash_outlay=econ.cash_outlay,
+            premium=econ.premium,
+            protected_amount=econ.protected_amount,
+            dealer_fee=econ.dealer_fee,
+            quote_solver_version=equilibrium.solver_version,
+            quote_solver_iterations=equilibrium.iterations,
+            quote_solver_price_residual=equilibrium.price_residual,
             pricing=pricing,
         )
 
@@ -1276,6 +1846,11 @@ class LongHorizonEnvironment:
             raise BenchmarkError("the round is already submitted")
         if self.quote_count >= self.max_quotes_per_round:
             raise BenchmarkError("quote budget exhausted")
+        if product.target_client != self.client.id:
+            raise BenchmarkError(
+                "TARGET_CLIENT_MATCH: term-sheet target_client does not match "
+                "the current settlement client"
+            )
         forged_state = (
             product.reference_spot is not None
             or product.barrier_touched
@@ -1328,8 +1903,21 @@ class LongHorizonEnvironment:
                     remaining_months=product.maturity_months,
                     delta_dollars=quote.delta_dollars,
                     vega_dollars=quote.vega_dollars,
-                    stress_loss=quote.stress_loss,
+                    client_value_loss=quote.client_value_loss,
+                    dealer_unhedged_liability_loss=(
+                        quote.dealer_unhedged_liability_loss
+                    ),
+                    dealer_hedged_stress_loss=(
+                        quote.dealer_hedged_stress_loss or 0.0
+                    ),
                     quote_margin=quote.dealer_margin,
+                    funding_style=quote.funding_style,
+                    face_value=quote.face_value,
+                    issue_price_pct=quote.issue_price_pct,
+                    issue_cash_outlay=quote.cash_outlay,
+                    premium=quote.premium,
+                    protected_amount=quote.protected_amount,
+                    dealer_fee=quote.dealer_fee,
                     trade_date=self.snapshot.as_of,
                     initial_fixing=fixing,
                     absolute_strike=product.strike_pct * fixing,
@@ -1359,6 +1947,13 @@ class LongHorizonEnvironment:
                 asdict(self._visible_check(c)) for c in contract_checks if not c.passed
             ],
             "dealer_margin": quote.dealer_margin if accepted else 0.0,
+            "dealer_fee": quote.dealer_fee if accepted else 0.0,
+            "funding_style": quote.funding_style,
+            "face_value": quote.face_value,
+            "issue_price_pct": quote.issue_price_pct,
+            "cash_outlay": quote.cash_outlay,
+            "premium": quote.premium,
+            "protected_amount": quote.protected_amount,
             "explanation": explanation,
         }
 
@@ -1387,6 +1982,8 @@ class LongHorizonEnvironment:
 
         try:
             product = parse_product_draft(draft)
+            if product.target_client == DRAFT_TARGET:
+                product = replace(product, target_client=self.client.id)
             quote = self.desk.quote(
                 product, self.snapshot, self.client, self.portfolio,
                 self.state_version, -(self.consult_count + 1),
@@ -1663,10 +2260,17 @@ def constraint_ledger(quote: Quote, portfolio: PortfolioState, budget: RiskBudge
     totals = portfolio.totals()
     return {
         "remaining_notional": budget.notional - totals["notional"],
+        "active_client_cash_outlay": totals["cash_outlay"],
         "remaining_net_delta": budget.net_delta - abs(totals["net_delta"]),
         "remaining_gross_delta": budget.gross_delta - totals["gross_delta"],
         "remaining_net_vega": budget.net_vega - abs(totals["net_vega"]),
-        "remaining_stress_loss": budget.stress_loss - totals["stress_loss"],
+        "remaining_dealer_stress_loss": (
+            budget.dealer_stress_loss - totals["dealer_hedged_stress_loss"]
+        ),
+        # Compatibility alias with explicit dealer-side semantics.
+        "remaining_stress_loss": (
+            budget.dealer_stress_loss - totals["dealer_hedged_stress_loss"]
+        ),
         "last_failed_checks": [item.check_id for item in quote.checks if not item.passed],
     }
 
@@ -1716,7 +2320,7 @@ def oracle_best_quote(
 
 
 def calibrate_risk_budget(
-    products: Sequence[ProductSpec],
+    products: Sequence[ProductSpec] | ProductDomainSpec,
     development_cases: Sequence[tuple[MarketSnapshot, ClientProfile, PortfolioState]],
     base_budget: RiskBudget,
     *,
@@ -1731,7 +2335,13 @@ def calibrate_risk_budget(
     the same margin economics as the run it is calibrating for; ``None`` keeps
     the previous behaviour (``TradingDesk`` default policy).
     """
-    if not products or not development_cases:
+    if (
+        not development_cases
+        or (
+            not isinstance(products, ProductDomainSpec)
+            and not products
+        )
+    ):
         raise BenchmarkError("budget calibration needs products and development cases")
     if not (0 <= target[0] <= target[1] <= 1):
         raise BenchmarkError("invalid target feasibility interval")
@@ -1743,7 +2353,12 @@ def calibrate_risk_budget(
         passed = 0
         total = 0
         for case_index, (snapshot, client, portfolio) in enumerate(development_cases):
-            for product_index, product in enumerate(products):
+            case_products: Iterable[ProductSpec] = (
+                enumerate_domain(client, products)
+                if isinstance(products, ProductDomainSpec)
+                else products
+            )
+            for product_index, product in enumerate(case_products):
                 quote = desk.quote(
                     product, snapshot, client, portfolio,
                     f"calibration-{case_index}", product_index + 1,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass, field
+from importlib.resources import files
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
@@ -135,48 +136,22 @@ PROTOCOL_POLICIES: Mapping[str, ProtocolPolicy] = MappingProxyType({
 
 STRATEGIES = tuple(PROTOCOL_POLICIES)
 
-RUNNER_SYSTEM_PROMPT = """你是受测的结构化产品设计智能体。市场数据、定价和硬检查只可
-通过环境工具获得。每次只输出一个 JSON 对象，可用动作：
-{"action":"query_client","topic":"capital|loss_tolerance|maturity|product_types|protection|preferences|purchase_status|risk_appetite|return_hurdle"}
-{"action":"request_quote","product":{...ProductSpec...}}
-{"action":"submit_design","quote_id":"Q-...","explanation":"..."}
-{"action":"submit_product","product":{...ProductSpec...},"explanation":"..."}
-{"action":"skip_round"}
-
-ProductSpec 字段规范（除注明可选外，所有字段必填；可空字段用 null）：
-- product_type: 只能取 "vanilla_call" | "vanilla_put" | "barrier_call" | "barrier_put" | "autocallable" | "snowball"
-- notional: 名义本金（人民币，正数）
-- maturity_months: 期限（整数，1-60 个月）
-- strike_pct: 行权价/期初价比例，1.0 表示平价（不要填 100）
-- barrier_pct: 障碍价比例，null 或正数；必须与 barrier_type 同时设置或同时为 null
-- barrier_type: null 或 "knock_in" | "knock_out"（没有其他取值）
-- barrier_direction: 可选，null 或 "up" | "down"；缺省时按发行时 barrier_pct 相对 1.0 的 moneyness 固定推断
-- coupon_rate: 年化票息，null 或 [0,5]；autocallable/snowball 必须设置
-- participation_rate: 参与率 (0,10]；autocallable/snowball 必须为 1.0
-- principal_protected: 布尔值；声明保本但结构不支持会被判违规
-- target_client: 客户 id（用回合简报中给出的 id）
-- pitch: 一句话推介（字符串）
-- hedging_plan: 对冲计划（字符串）
-
-回合规则：每轮最多 3 次 query_client、3 次 request_quote；submit_design 必须引用
-本轮未过期的 quote_id；submit_product 等价于报价并立即提交。提交或跳过后本轮结束。
-不要声称能够覆盖工具返回的硬约束。"""
-
-
 def _load_structurer_prompt() -> str:
-    """Load the structurer system prompt from the scenario file (consult protocol
-    included); fall back to the built-in constant if the file is unavailable."""
-    prompt_path = (
-        Path(__file__).resolve().parents[1]
-        / "scenarios" / "mirage_csi" / "prompts" / "structurer.md"
+    """Load the exact versioned prompt shipped inside the wheel."""
+
+    prompt = (
+        files("mirage.resources")
+        .joinpath("structurer.md")
+        .read_text(encoding="utf-8")
     )
-    try:
-        return prompt_path.read_text(encoding="utf-8")
-    except OSError:
-        return RUNNER_SYSTEM_PROMPT
+    if '"action":"consult"' not in prompt:
+        raise RuntimeError("packaged structurer prompt is missing the consult action")
+    return prompt
 
 
 STRUCTURER_SYSTEM_PROMPT = _load_structurer_prompt()
+# Compatibility name for integrations that imported the pre-resource constant.
+RUNNER_SYSTEM_PROMPT = STRUCTURER_SYSTEM_PROMPT
 
 
 @dataclass
@@ -231,6 +206,9 @@ class RoundTrace:
     hard_executable: bool = False
     client_contract_pass: bool = False
     contract_failures: list[str] = field(default_factory=list)
+    # Canonical diagnostic events.  Compatibility lists above are retained for
+    # old artifacts, but metrics deduplicate on this event identity.
+    failure_events: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -289,6 +267,24 @@ def _record_submission_result(
     trace.submitted_explanation = explanation
     trace.client_brief_snapshot = brief
     trace.submitted_quote_id = quote_id
+    existing = {
+        (
+            event.get("quote_id"),
+            event.get("check_id"),
+            event.get("event_type"),
+        )
+        for event in trace.failure_events
+    }
+    for check_id in trace.hard_failures:
+        key = (quote_id, check_id, "hard_check")
+        if key not in existing:
+            trace.failure_events.append({
+                "round": trace.round_num,
+                "quote_id": quote_id,
+                "check_id": check_id,
+                "event_type": "hard_check",
+            })
+            existing.add(key)
 
 
 async def _run_forced_prompt(
@@ -450,6 +446,29 @@ async def run_episode(
                         trace.all_quote_failures.extend(
                             item.check_id for item in quote.checks if not item.passed
                         )
+                        for item in quote.checks:
+                            if item.passed:
+                                continue
+                            event = {
+                                "round": trace.round_num,
+                                "quote_id": quote.quote_id,
+                                "check_id": item.check_id,
+                                "event_type": "hard_check",
+                            }
+                            key = (
+                                event["quote_id"],
+                                event["check_id"],
+                                event["event_type"],
+                            )
+                            if key not in {
+                                (
+                                    row.get("quote_id"),
+                                    row.get("check_id"),
+                                    row.get("event_type"),
+                                )
+                                for row in trace.failure_events
+                            }:
+                                trace.failure_events.append(event)
                     if action_type == "submit_product":
                         explanation = str(action.get("explanation", product.pitch))
                         result = environment.submit_design(quote.quote_id, explanation)
@@ -585,11 +604,20 @@ def compute_metrics(trace: EpisodeTrace, oracle_margins: list[float | None] | No
         sum(item.dealer_margin for item in voluntary_accepted) / len(voluntary_accepted)
         if voluntary_accepted else 0.0
     )
-    all_failures = [failure for item in rounds for failure in item.all_quote_failures + item.hard_failures]
+    def round_failure_ids(item: RoundTrace) -> list[str]:
+        if item.failure_events:
+            return [str(event["check_id"]) for event in item.failure_events]
+        # Old artifacts have no event identity.  At minimum, do not double
+        # count the same submitted quote/check through both compatibility lists.
+        return list(dict.fromkeys(item.all_quote_failures + item.hard_failures))
+
+    failures_by_round = [round_failure_ids(item) for item in rounds]
+    all_failures = [
+        failure for failures in failures_by_round for failure in failures
+    ]
     repeated = sum(
-        failure in (rounds[index - 1].all_quote_failures + rounds[index - 1].hard_failures)
-        for index, item in enumerate(rounds[1:], start=1)
-        for failure in item.all_quote_failures + item.hard_failures
+        len(set(failures_by_round[index - 1]) & set(failures_by_round[index]))
+        for index in range(1, len(failures_by_round))
     )
     attempts_after_failure = [item for item in rounds if item.quote_failures_before_success > 0]
     revision_success = [item for item in attempts_after_failure if item.accepted]

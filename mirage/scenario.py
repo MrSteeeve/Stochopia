@@ -80,7 +80,7 @@ class PlaygroundScenario:
         round_num 为 None 时返回 base profile（v1.1 行为）；
         指定 round_num 时返回一个新的 ClientProfile 副本，
         将所有 round_overrides 中 round_num 匹配的条目按列表顺序合并，
-        current_focus 若无 override 则默认为空字符串。
+        未被 override 的字段继承 base profile。
         """
         for c in self.clients:
             if c.id == client_id:
@@ -93,8 +93,6 @@ class PlaygroundScenario:
                         for k, v in override_entry.items():
                             if k != "rounds":
                                 combined[k] = v
-                # 若没有任何 override 设置 current_focus，默认置空
-                combined.setdefault("current_focus", "")
                 return replace(c, **combined)
         raise ScenarioError(f"场景 {self.id} 中不存在客户：{client_id}")
 
@@ -393,6 +391,12 @@ def _load_clients(path: Path, total_rounds: int) -> list[ClientProfile]:
                         )
             round_overrides.append(dict(ov))
 
+        current_focus = c.get("current_focus", "")
+        if not isinstance(current_focus, str):
+            raise ScenarioError(
+                f"客户 {c['id']} 的 current_focus 必须是字符串（{path}）"
+            )
+
         clients.append(
             ClientProfile(
                 id=str(c["id"]),
@@ -407,6 +411,7 @@ def _load_clients(path: Path, total_rounds: int) -> list[ClientProfile]:
                 allowed_product_types=allowed_product_types,
                 accepting_new_products=accepting_new_products,
                 min_hit_prob=min_hit_prob,
+                current_focus=current_focus,
                 round_overrides=round_overrides,
             )
         )

@@ -1,11 +1,27 @@
 """MIRAGE v3-spine training environment (Curriculum Level 0).
 
-The package is intentionally framework-neutral: core has no LLM or Gymnasium
-dependency, and exposes only typed tasks, actions, observations, transitions,
-and a versioned trajectory recorder.
+The deterministic core remains framework-neutral and contains no LLM calls or
+Gymnasium dependency.  This package also exposes optional external CLI/API
+policy adapters; they live outside ``MirageStructurerEnv.reset()/step()`` and
+consume the same typed public boundary.
 """
 
 from .core import ENVIRONMENT_VERSION, PRICING_VERSION, MirageStructurerEnv
+from .agent_runner import (
+    AGENT_REQUEST_SCHEMA,
+    AGENT_RUN_SCHEMA,
+    AgentActionError,
+    AgentDecision,
+    AgentEpisodeResult,
+    AgentPolicy,
+    AgentRequest,
+    CommandAgentPolicy,
+    LLMAgentPolicy,
+    create_api_agent_policy,
+    load_agent_system_prompt,
+    parse_environment_action,
+    run_agent_episode,
+)
 from .trajectory import (
     TRAJECTORY_FORMAT,
     TrajectoryEntry,
@@ -14,6 +30,8 @@ from .trajectory import (
     verify_trajectory,
 )
 from .types import (
+    REWARD_SCHEMA_VERSION,
+    SCALARIZATION_VERSION,
     TASK_SCHEMA,
     TASK_VERSION,
     Action,
@@ -25,28 +43,44 @@ from .types import (
     Observation,
     RequestQuote,
     RewardComponents,
+    RewardTerm,
+    ScalarizationSpec,
     Skip,
     StepTransition,
     SubmitDesign,
     SubmitProduct,
+    scalarize_reward,
 )
 
 __all__ = [
+    "AGENT_REQUEST_SCHEMA",
+    "AGENT_RUN_SCHEMA",
     "ENVIRONMENT_VERSION",
     "PRICING_VERSION",
+    "REWARD_SCHEMA_VERSION",
+    "SCALARIZATION_VERSION",
     "TASK_SCHEMA",
     "TASK_VERSION",
     "TRAJECTORY_FORMAT",
     "Action",
+    "AgentActionError",
+    "AgentDecision",
+    "AgentEpisodeResult",
+    "AgentPolicy",
+    "AgentRequest",
     "AskClient",
+    "CommandAgentPolicy",
     "ConstraintSignals",
     "EnvironmentAction",
     "EpisodeTask",
     "InvalidAction",
     "MirageStructurerEnv",
+    "LLMAgentPolicy",
     "Observation",
     "RequestQuote",
     "RewardComponents",
+    "RewardTerm",
+    "ScalarizationSpec",
     "Skip",
     "StepTransition",
     "SubmitDesign",
@@ -55,4 +89,9 @@ __all__ = [
     "TrajectoryMetadata",
     "TrajectoryRecorder",
     "verify_trajectory",
+    "create_api_agent_policy",
+    "load_agent_system_prompt",
+    "parse_environment_action",
+    "run_agent_episode",
+    "scalarize_reward",
 ]

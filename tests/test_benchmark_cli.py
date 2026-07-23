@@ -25,8 +25,12 @@ from mirage.benchmark import (
     oracle_candidate_grid,
 )
 from mirage.benchmark_cli import (
+    RUN_OUTPUT_SCHEMA_VERSION,
+    _atomic_write_json,
     _cmd_calibrate_margin,
+    _cmd_aggregate,
     _cmd_judge_runs,
+    _completed_result_matches,
     _load_quote_policy,
 )
 from mirage.pricing import QuotePolicy
@@ -129,7 +133,13 @@ def test_calibrate_margin_end_to_end_report_structure(tmp_path, monkeypatch):
     assert "freeze" in report["warning"]
     assert len(report["sensitivity"]) == 3
     for row in report["sensitivity"]:
-        assert set(row) == {"sensitivity_factor", "positive_margin_rate", "ranking_nondegenerate", "n_cases"}
+        assert set(row) == {
+            "sensitivity_factor",
+            "positive_margin_rate",
+            "ranking_nondegenerate",
+            "n_cases",
+            "nonconverged_quotes",
+        }
     assert {row["sensitivity_factor"] for row in report["sensitivity"]} == {0.8, 1.0, 1.2}
 
     policy_payload = json.loads(args.policy_output.read_text(encoding="utf-8"))
@@ -267,6 +277,77 @@ def test_calibrate_budget_quote_policy_kwarg_accepted():
     )
     assert "selected_factor" in report
     assert "freeze" in report["warning"]
+
+
+# ---------------------------------------------------------------------------
+# run-manifest durability / provenance
+# ---------------------------------------------------------------------------
+
+
+def test_completed_result_is_skippable_only_for_exact_fingerprints(tmp_path):
+    path = tmp_path / "job.json"
+    payload = {
+        "schema_version": RUN_OUTPUT_SCHEMA_VERSION,
+        "complete": True,
+        "run_fingerprint": "run-a",
+        "job_fingerprint": "job-a",
+        "job": {"job_id": "J"},
+        "trace": {},
+        "metrics": {},
+    }
+    _atomic_write_json(path, payload)
+
+    assert _completed_result_matches(
+        path,
+        run_fingerprint="run-a",
+        job_fingerprint="job-a",
+        job_id="J",
+    )
+    assert not _completed_result_matches(
+        path,
+        run_fingerprint="run-b",
+        job_fingerprint="job-a",
+        job_id="J",
+    )
+
+    payload["complete"] = False
+    _atomic_write_json(path, payload)
+    assert not _completed_result_matches(
+        path,
+        run_fingerprint="run-a",
+        job_fingerprint="job-a",
+        job_id="J",
+    )
+
+
+def test_aggregate_rejects_mixed_run_fingerprints(tmp_path):
+    results = tmp_path / "results"
+    results.mkdir()
+    for index, fingerprint in enumerate(("run-a", "run-b")):
+        _atomic_write_json(
+            results / f"{index}.json",
+            {
+                "schema_version": RUN_OUTPUT_SCHEMA_VERSION,
+                "complete": True,
+                "run_fingerprint": fingerprint,
+                "job_fingerprint": f"job-{index}",
+                "job": {"job_id": str(index), "model": "m", "strategy": "s"},
+                "trace": {},
+                "metrics": {"episode_id": "E", "condition": "full_static"},
+            },
+        )
+    args = argparse.Namespace(
+        results_dir=results,
+        output_csv=tmp_path / "aggregate.csv",
+        output_md=None,
+        bootstrap_resamples=10,
+        n_permutations=10,
+        alpha=0.05,
+        seed=1,
+    )
+
+    with pytest.raises(SystemExit, match="mixed run fingerprints"):
+        _cmd_aggregate(args)
 
 
 # ---------------------------------------------------------------------------

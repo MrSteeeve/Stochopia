@@ -7,16 +7,33 @@ loops and the synchronous environment in :mod:`mirage.environment.core`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import json
+import math
+from dataclasses import asdict, dataclass, field
+from datetime import date
 from typing import Any, Literal, Mapping, TypeAlias
 
-from ..benchmark import MarketSnapshot, ProductDomainSpec, RiskBudget
+from ..benchmark import (
+    MarketSnapshot,
+    ProductDomainSpec,
+    RiskBudget,
+    resolve_client_profile,
+)
 from ..pricing import QuotePolicy
 from ..products import ClientProfile, ProductSpec
 
 
 TASK_SCHEMA = "mirage.environment.task.v3"
-TASK_VERSION = "v3-spine-level0"
+TASK_VERSION = "v3-spine-level0.1-economic-ledger"
+REWARD_SCHEMA_VERSION = "mirage.reward-vector.v2"
+SCALARIZATION_VERSION = "mirage.scalarization.explicit.v1"
+
+
+def _manifest_default(value: Any) -> Any:
+    if isinstance(value, date):
+        return value.isoformat()
+    raise TypeError(f"unsupported task manifest value: {type(value).__name__}")
 
 
 @dataclass(frozen=True)
@@ -36,6 +53,7 @@ class EpisodeTask:
     task_seed: int = 0
     schema: str = TASK_SCHEMA
     version: str = TASK_VERSION
+    _manifest_json: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # A tuple prevents callers from changing episode length/order through a
@@ -49,12 +67,114 @@ class EpisodeTask:
             raise ValueError("EpisodeTask.schema must be a non-empty string")
         if not isinstance(self.version, str) or not self.version.strip():
             raise ValueError("EpisodeTask.version must be a non-empty string")
+        episode_ids = {snapshot.episode_id for snapshot in self.snapshots}
+        if len(episode_ids) != 1:
+            raise ValueError("EpisodeTask snapshots must belong to one episode")
+        rounds = [snapshot.round_num for snapshot in self.snapshots]
+        if rounds != list(range(1, len(rounds) + 1)):
+            raise ValueError("EpisodeTask snapshot rounds must be contiguous from one")
+        for snapshot in self.snapshots:
+            required = (
+                snapshot.spot,
+                snapshot.risk_free_rate,
+                snapshot.carry_rate,
+                snapshot.trend_alpha,
+            )
+            optional = (
+                snapshot.return_20d,
+                snapshot.realized_vol_20d,
+                snapshot.realized_vol_60d,
+                snapshot.drawdown_6m,
+                snapshot.atm_iv_1m,
+                snapshot.atm_iv_3m,
+                snapshot.atm_iv_6m,
+            )
+            if not all(math.isfinite(value) for value in required):
+                raise ValueError("EpisodeTask market required numerics must be finite")
+            if snapshot.spot <= 0:
+                raise ValueError("EpisodeTask market spot must be positive")
+            if not all(
+                value is None or math.isfinite(value) for value in optional
+            ):
+                raise ValueError("EpisodeTask market optional numerics must be finite")
+            snapshot.pricing_volatility()
+            resolve_client_profile(self.client, snapshot.round_num)
+
+        payload = {
+            "snapshots": [asdict(snapshot) for snapshot in self.snapshots],
+            "client": asdict(self.client),
+            "risk_budget": asdict(self.risk_budget),
+            "domain": asdict(self.domain),
+            "quote_policy": asdict(self.quote_policy),
+            "task_seed": self.task_seed,
+            "schema": self.schema,
+            "version": self.version,
+        }
+        object.__setattr__(
+            self,
+            "_manifest_json",
+            json.dumps(
+                payload,
+                default=_manifest_default,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+        )
 
     @property
     def schema_version(self) -> str:
         """Explicit alias used by trajectory metadata."""
 
         return self.schema
+
+    @property
+    def manifest(self) -> dict[str, Any]:
+        """Canonical immutable-at-construction task preimage."""
+
+        return json.loads(self._manifest_json)
+
+    @property
+    def task_hash(self) -> str:
+        return hashlib.sha256(self._manifest_json.encode("utf-8")).hexdigest()
+
+    def materialize(self) -> tuple[
+        tuple[MarketSnapshot, ...],
+        ClientProfile,
+        RiskBudget,
+        ProductDomainSpec,
+        QuotePolicy,
+    ]:
+        """Reconstruct fresh runtime inputs from the captured manifest."""
+
+        payload = self.manifest
+        snapshots = tuple(
+            MarketSnapshot(
+                **{
+                    **row,
+                    "as_of": date.fromisoformat(row["as_of"]),
+                }
+            )
+            for row in payload["snapshots"]
+        )
+        client = ClientProfile(**payload["client"])
+        risk_budget = RiskBudget(**payload["risk_budget"])
+        domain_payload = payload["domain"]
+        for name in (
+            "product_types",
+            "notional_fractions",
+            "maturities",
+            "strikes",
+            "barriers",
+            "coupons",
+            "participations",
+            "principal_protected",
+        ):
+            domain_payload[name] = tuple(domain_payload[name])
+        domain = ProductDomainSpec(**domain_payload)
+        quote_policy = QuotePolicy(**payload["quote_policy"])
+        return snapshots, client, risk_budget, domain, quote_policy
 
 
 @dataclass(frozen=True)
@@ -193,44 +313,178 @@ Action: TypeAlias = EnvironmentAction
 
 
 @dataclass(frozen=True)
+class RewardTerm:
+    """One measured or explicitly unavailable reward component."""
+
+    value: float | None
+    available: bool
+    provenance: str
+    units: str
+    normalization: str | None = None
+    normalized_value: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.available != (self.value is not None):
+            raise ValueError("RewardTerm.available must agree with value presence")
+        for name, value in (
+            ("value", self.value),
+            ("normalized_value", self.normalized_value),
+        ):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"RewardTerm.{name} must be finite or None")
+        if not self.provenance:
+            raise ValueError("RewardTerm.provenance must be non-empty")
+        if not self.units:
+            raise ValueError("RewardTerm.units must be non-empty")
+
+    @classmethod
+    def unavailable(
+        cls,
+        provenance: str = "not-implemented-level0",
+        *,
+        units: str = "unavailable",
+    ) -> "RewardTerm":
+        return cls(None, False, provenance, units, None, None)
+
+    @classmethod
+    def measured(
+        cls,
+        value: float,
+        *,
+        provenance: str,
+        units: str,
+        normalization: str | None = None,
+        normalized_value: float | None = None,
+    ) -> "RewardTerm":
+        return cls(
+            float(value),
+            True,
+            provenance,
+            units,
+            normalization,
+            (
+                float(normalized_value)
+                if normalized_value is not None
+                else None
+            ),
+        )
+
+
+def _unavailable_reward() -> RewardTerm:
+    return RewardTerm.unavailable()
+
+
+@dataclass(frozen=True)
 class RewardComponents:
-    """Unscalarised outcome/cost vector for one environment action.
+    """Versioned raw/normalised reward vector without implicit scalarisation."""
 
-    The components intentionally use their native scales.  A downstream
-    experiment may scalarise them, but the environment never silently chooses
-    weights on the researcher's behalf.
-    """
-
-    client_utility: float = 0.0
-    dealer_economics: float = 0.0
-    capital_efficiency: float = 0.0
-    risk_change: float = 0.0
-    relationship_delta: float = 0.0
-    query_cost: float = 0.0
-    quote_cost: float = 0.0
-    communication_faithfulness: float = 0.0
-    operational_cost: float = 0.0
-    terminal_lifecycle_pnl: float = 0.0
+    client_utility: RewardTerm = field(default_factory=_unavailable_reward)
+    dealer_economics: RewardTerm = field(default_factory=_unavailable_reward)
+    capital_efficiency: RewardTerm = field(default_factory=_unavailable_reward)
+    risk_change: RewardTerm = field(default_factory=_unavailable_reward)
+    relationship_delta: RewardTerm = field(default_factory=_unavailable_reward)
+    query_cost: RewardTerm = field(default_factory=_unavailable_reward)
+    quote_cost: RewardTerm = field(default_factory=_unavailable_reward)
+    communication_faithfulness: RewardTerm = field(default_factory=_unavailable_reward)
+    operational_cost: RewardTerm = field(default_factory=_unavailable_reward)
+    terminal_lifecycle_pnl: RewardTerm = field(
+        default_factory=lambda: RewardTerm.unavailable(
+            "requires-realised-hedge-and-transaction-cost-ledger",
+            units="CNY",
+        )
+    )
+    schema_version: str = REWARD_SCHEMA_VERSION
 
     @property
-    def dealer_margin(self) -> float:
-        """Level-0 compatibility name for ``dealer_economics``."""
+    def dealer_margin(self) -> float | None:
+        return self.dealer_economics.value
 
-        return self.dealer_economics
-
-    def as_dict(self) -> dict[str, float]:
+    @property
+    def raw_reward_components(self) -> dict[str, float | None]:
         return {
-            "client_utility": self.client_utility,
-            "dealer_economics": self.dealer_economics,
-            "capital_efficiency": self.capital_efficiency,
-            "risk_change": self.risk_change,
-            "relationship_delta": self.relationship_delta,
-            "query_cost": self.query_cost,
-            "quote_cost": self.quote_cost,
-            "communication_faithfulness": self.communication_faithfulness,
-            "operational_cost": self.operational_cost,
-            "terminal_lifecycle_pnl": self.terminal_lifecycle_pnl,
+            name: getattr(self, name).value
+            for name in self.component_names()
         }
+
+    @property
+    def normalised_reward_components(self) -> dict[str, float | None]:
+        return {
+            name: getattr(self, name).normalized_value
+            for name in self.component_names()
+        }
+
+    @property
+    def available_components(self) -> tuple[str, ...]:
+        return tuple(
+            name for name in self.component_names() if getattr(self, name).available
+        )
+
+    @staticmethod
+    def component_names() -> tuple[str, ...]:
+        return (
+            "client_utility",
+            "dealer_economics",
+            "capital_efficiency",
+            "risk_change",
+            "relationship_delta",
+            "query_cost",
+            "quote_cost",
+            "communication_faithfulness",
+            "operational_cost",
+            "terminal_lifecycle_pnl",
+        )
+
+    def as_dict(self) -> dict[str, dict[str, Any]]:
+        return {
+            name: asdict(getattr(self, name))
+            for name in self.component_names()
+        }
+
+
+@dataclass(frozen=True)
+class ScalarizationSpec:
+    """Explicit, versioned downstream scalarisation contract."""
+
+    weights: Mapping[str, float]
+    version: str = SCALARIZATION_VERSION
+
+    def __post_init__(self) -> None:
+        unknown = set(self.weights) - set(RewardComponents.component_names())
+        if unknown:
+            raise ValueError(f"unknown scalarization components: {sorted(unknown)}")
+        if not all(
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+            for value in self.weights.values()
+        ):
+            raise ValueError("scalarization weights must be finite")
+
+
+def scalarize_reward(
+    reward: RewardComponents,
+    spec: ScalarizationSpec,
+) -> float:
+    """Scalarise only explicitly selected, available normalized components."""
+
+    total = 0.0
+    for name, weight in spec.weights.items():
+        term = getattr(reward, name)
+        if not term.available:
+            raise ValueError(f"cannot scalarize unavailable component {name!r}")
+        value = (
+            term.normalized_value
+            if term.normalized_value is not None
+            else term.value
+        )
+        if value is None:
+            raise ValueError(f"component {name!r} has no scalar value")
+        total += float(weight) * value
+    return total
 
 
 @dataclass(frozen=True)
@@ -298,6 +552,8 @@ class StepTransition:
 
 
 __all__ = [
+    "REWARD_SCHEMA_VERSION",
+    "SCALARIZATION_VERSION",
     "TASK_SCHEMA",
     "TASK_VERSION",
     "Action",
@@ -309,8 +565,11 @@ __all__ = [
     "Observation",
     "RequestQuote",
     "RewardComponents",
+    "RewardTerm",
+    "ScalarizationSpec",
     "Skip",
     "StepTransition",
     "SubmitDesign",
     "SubmitProduct",
+    "scalarize_reward",
 ]

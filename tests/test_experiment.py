@@ -5,6 +5,7 @@ import pytest
 from mirage.experiment import (
     DEFAULT_REPLICATES_BY_CONDITION,
     build_experiment_manifest,
+    manifest_payload,
     paired_condition_contrasts,
 )
 
@@ -50,6 +51,11 @@ def test_manifest_custom_replicates_by_condition():
     assert by_condition["partial_dynamic"] == 8
     # Untouched conditions keep the default.
     assert by_condition["full_dynamic"] == DEFAULT_REPLICATES_BY_CONDITION["full_dynamic"]
+
+    payload = manifest_payload(jobs)
+    assert payload["protocol"]["replicates_by_condition"]["full_static"] == 4
+    assert payload["protocol"]["replicates_by_condition"]["partial_dynamic"] == 8
+    assert payload["manifest_fingerprint"]
 
 
 def test_manifest_rejects_replicates_below_three():

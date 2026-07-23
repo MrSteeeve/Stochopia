@@ -133,7 +133,8 @@ def write_market_snapshots(path: str | Path, snapshots: list[MarketSnapshot]) ->
     fields = [
         "episode_id", "round", "date", "underlying", "spot", "risk_free_rate",
         "return_20d", "realized_vol_20d", "realized_vol_60d", "drawdown_6m",
-        "atm_iv_1m", "atm_iv_3m", "atm_iv_6m", "carry_rate", "regime", "source",
+        "atm_iv_1m", "atm_iv_3m", "atm_iv_6m", "carry_rate", "trend_alpha",
+        "regime", "source",
     ]
     with Path(path).open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -154,6 +155,7 @@ def write_market_snapshots(path: str | Path, snapshots: list[MarketSnapshot]) ->
                 "atm_iv_3m": item.atm_iv_3m,
                 "atm_iv_6m": item.atm_iv_6m,
                 "carry_rate": item.carry_rate,
+                "trend_alpha": item.trend_alpha,
                 "regime": item.regime,
                 "source": item.source,
             })

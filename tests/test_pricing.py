@@ -837,8 +837,9 @@ def test_hurdle_hit_prob_nonprotected_put_above_max_is_zero():
     # ATM 非保本 put：max payoff_frac = participation * K/S0 = 1.0 (strike_pct=1.0, spot=100)
     product = _product(product_type="vanilla_put", principal_protected=False, participation_rate=1.0)
     market = _market()
-    # 设 client_price = 0，hurdle = 1.5 → required_frac = 1.5 > max 1.0 → 0.0
-    prob = hurdle_hit_prob(product, market, 1.5, 0.0)
+    # 客户支付 50% notional，要求 150% 年收益：
+    # required payoff = 0.5 * (1 + 1.5) = 1.25 notional > max 1.0。
+    prob = hurdle_hit_prob(product, market, 1.5, 500_000.0)
     assert prob == 0.0
 
 
@@ -918,7 +919,7 @@ def test_barrier_hurdle_and_diagnostics_honor_explicit_fixed_direction():
     )
     market = _market()
 
-    probability = hurdle_hit_prob(product, market, 0.01, 0.0)
+    probability = hurdle_hit_prob(product, market, 0.01, 1.0)
     diag = mc_diagnostics(product, market, n_paths=64, seed=3)
 
     assert probability == 0.0

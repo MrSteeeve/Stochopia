@@ -75,14 +75,20 @@ def test_would_buy_conservative_accepts_protected_product():
     assert reason == "符合投资标准"
 
 
-def test_would_buy_rejects_notional_exceeds_capital():
-    """名义本金超过客户可投资金额，第二条规则拒绝。"""
+def test_would_buy_checks_cash_outlay_not_exposure_notional():
+    """客户资本约束按实际出资，而不是 standalone option 的风险名义。"""
     client = _client(capital=500_000.0)
-    product = _spec(principal_protected=True, notional=1_000_000.0)
-    pricing = {"client_price": 10_000.0, "expected_payoff": 50_000.0, "loss_frac": 0.0}
+    product = _spec(principal_protected=False, notional=1_000_000.0)
+    pricing = {
+        "client_price": 600_000.0,
+        "cash_outlay": 600_000.0,
+        "expected_payoff": 50_000.0,
+        "loss_frac": 0.0,
+        "hurdle_hit_prob": 1.0,
+    }
     ok, reason = client.would_buy(product, pricing)
     assert ok is False
-    assert "名义本金" in reason
+    assert "实际现金出资" in reason
 
 
 def test_would_buy_rejects_loss_frac_exceeds_tolerance():

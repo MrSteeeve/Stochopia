@@ -167,6 +167,22 @@ def test_option_implied_forward_absorbs_carry():
     assert result == pytest.approx(6010.10050167)
 
 
+def test_trend_alpha_reaches_runtime_quote_and_does_not_cross_contaminate_cache():
+    cli = permissive_client()
+    prod = product(maturity=3)
+    desk = TradingDesk(HardConstraintEngine(budget()), domain=SMALL_DOMAIN)
+    base = snapshots()[0]
+    down = replace(base, trend_alpha=-0.10)
+    up = replace(base, trend_alpha=0.10)
+
+    quote_down = desk.quote(prod, down, cli, PortfolioState(), "down", 1)
+    quote_up = desk.quote(prod, up, cli, PortfolioState(), "up", 1)
+
+    assert quote_down.hurdle_hit_prob is not None
+    assert quote_up.hurdle_hit_prob is not None
+    assert quote_up.hurdle_hit_prob > quote_down.hurdle_hit_prob
+
+
 def test_partial_information_topic_gate_and_budget():
     env = make_env(full=False)
     assert "client_constraints" not in env.get_round_brief()
@@ -328,9 +344,10 @@ def test_client_loss_budget_v2_is_continuous_not_boolean():
     env = make_env(full=True, max_loss=1.0)
     payload = env.request_quote(product(protected=False))
     loss_check = next(c for c in payload["checks"] if c["check_id"] == "CLIENT_LOSS_BUDGET_V2")
-    # A non-protected call is priced on its premium/stress loss, not a 100% floor.
+    # A standalone option's actual cash outlay is its premium.  That premium
+    # can be lost in full even though exposure notional is much larger.
     assert loss_check["status"] == "PASS"
-    assert 0.0 < loss_check["observed"] < 0.5
+    assert loss_check["observed"] == pytest.approx(1.0)
 
 
 def test_client_loss_budget_v2_fails_tight_client_and_cannot_be_overridden():
@@ -526,6 +543,57 @@ def test_quote_boundary_rejects_forged_lifecycle_state():
         env.request_quote(forged)
 
     assert env.quote_count == 0
+
+
+def test_quote_boundary_rejects_wrong_target_without_spending_budget():
+    env = make_env(cli=permissive_client())
+    wrong_target = replace(product(), target_client="some-other-client")
+
+    with pytest.raises(BenchmarkError, match="TARGET_CLIENT_MATCH"):
+        env.request_quote(wrong_target)
+
+    assert env.quote_count == 0
+    assert env.quotes == {}
+
+
+def test_maturity_closes_position_into_cashflow_and_zero_sum_pnl_ledger():
+    one_month_domain = ProductDomainSpec(
+        product_types=("vanilla_call",),
+        notional_fractions=(.05,),
+        maturities=(1,),
+        strikes=(1.0,),
+        barriers=(.85,),
+        coupons=(.08,),
+        participations=(1.0,),
+        principal_protected=(False,),
+    )
+    env = make_env(
+        dynamic=True,
+        cli=permissive_client(),
+        domain=one_month_domain,
+    )
+    one_month = product(maturity=1, protected=False, notional=1_000_000)
+    quote = env.request_quote(one_month)
+    result = env.submit_design(quote["quote_id"])
+    assert result["accepted"] is True
+    assert len(env.portfolio.cashflow_ledger) == 1
+    assert env.portfolio.cashflow_ledger[0].event_type == "issuance"
+
+    closed = env.advance_round()
+
+    assert len(closed) == 1
+    assert env.portfolio.positions == []
+    assert len(env.portfolio.closed_positions) == 1
+    assert len(env.portfolio.lifecycle_events) == 1
+    assert len(env.portfolio.cashflow_ledger) == 2
+    event = env.portfolio.lifecycle_events[0]
+    assert event.close_reason == "matured"
+    assert event.client_realized_pnl + event.dealer_liability_realized_pnl == pytest.approx(
+        0.0, abs=1e-12
+    )
+    assert event.dealer_hedge_pnl is None
+    assert event.transaction_costs is None
+    assert event.dealer_total_pnl is None
 
 
 def test_round_overrides_are_resolved_on_every_benchmark_round():

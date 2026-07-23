@@ -7,7 +7,9 @@ import asyncio
 import csv
 import hashlib
 import json
+import os
 import random
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
@@ -25,13 +27,22 @@ from .benchmark import (
     enumerate_domain,
     load_market_snapshots,
     oracle_candidate_grid,
+    resolve_client_profile,
 )
 from .products import ClientProfile, parse_product_spec
 from .market_builder import build_monthly_snapshots, load_daily_closes, write_market_snapshots
 from .benchmark_runner import STRATEGIES, compute_metrics, run_episode, trace_to_dict
 from .env_agents import EnvResponseCache, FrozenEnvAgent
+from .environment import (
+    CommandAgentPolicy,
+    EpisodeTask,
+    LLMAgentPolicy,
+    MirageStructurerEnv,
+    create_api_agent_policy,
+    run_agent_episode as run_v3_agent_episode,
+)
 from .role_config import RoleConfigError, load_judges_config, load_role_specs
-from .llm import BaseLLMClient, create_client, load_model_registry
+from .llm import BaseLLMClient, LLMError, create_client, load_model_registry
 from .experiment import build_experiment_manifest, manifest_payload, paired_condition_contrasts
 from .pricing import QuotePolicy, calibrate_quote_policy, evaluate_quote_policy, scale_quote_policy_markup
 from .stats import cluster_bootstrap_ci, derive_seed, holm_adjust
@@ -44,6 +55,96 @@ from .judge import (
     judge_soft_quality,
     reliability_summary,
 )
+
+RUN_OUTPUT_SCHEMA_VERSION = "mirage.run-output.v3"
+RUN_FINGERPRINT_VERSION = "mirage.run-fingerprint.v1"
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+        default=str,
+    ).encode("utf-8")
+
+
+def _sha256_json(value: object) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _source_implementation_sha256() -> str:
+    """Fingerprint the executable package sources and bundled prompts."""
+
+    package_root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    paths = sorted(
+        (
+            path
+            for pattern in ("*.py", "*.md")
+            for path in package_root.rglob(pattern)
+            if "__pycache__" not in path.parts
+        ),
+        key=lambda path: path.relative_to(package_root).as_posix(),
+    )
+    for path in paths:
+        relative = path.relative_to(package_root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _file_sha256(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _atomic_write_json(path: Path, payload: object) -> None:
+    """Durably replace one JSON result; partial files are never final results."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_name = handle.name
+            json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _quarantine_invalid_result(path: Path) -> Path:
+    """Move an incomplete/stale result aside so the job can be rerun safely."""
+
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    candidate = path.with_name(f"{path.name}.invalid-{digest}")
+    suffix = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}.invalid-{digest}-{suffix}")
+        suffix += 1
+    os.replace(path, candidate)
+    return candidate
 
 
 def _client() -> ClientProfile:
@@ -167,6 +268,91 @@ def build_parser() -> argparse.ArgumentParser:
         help="QuotePolicy JSON (e.g. data/derived/quote_policy.v2.candidate.json); "
              "when omitted the environment uses the default QuotePolicy",
     )
+    agent = sub.add_parser(
+        "test-agent",
+        help="run a local CLI agent or API-backed LLM against the v3 environment",
+    )
+    agent.add_argument("csv", type=Path)
+    agent.add_argument("--episode", required=True)
+    agent.add_argument("--client-json", type=Path, required=True)
+    agent.add_argument("--risk-budget-json", type=Path, required=True)
+    backend = agent.add_mutually_exclusive_group(required=True)
+    backend.add_argument(
+        "--agent-command",
+        help="local executable command; receives one JSON request on stdin per step",
+    )
+    backend.add_argument(
+        "--model",
+        help="registered model name from --models-config",
+    )
+    backend.add_argument(
+        "--api-model",
+        help="direct API model id; does not require editing models.yaml",
+    )
+    agent.add_argument(
+        "--models-config",
+        type=Path,
+        default=Path("config/models.yaml"),
+    )
+    agent.add_argument(
+        "--api-provider",
+        choices=("openai-compatible", "anthropic"),
+        default="openai-compatible",
+    )
+    agent.add_argument(
+        "--api-base-url",
+        help="direct API base URL, e.g. https://api.openai.com/v1",
+    )
+    agent.add_argument(
+        "--api-key-env",
+        help="environment variable containing the direct API key",
+    )
+    agent.add_argument("--temperature", type=float, default=0.0)
+    agent.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="agent response limit (registered model default when omitted)",
+    )
+    agent.add_argument(
+        "--api-timeout",
+        type=float,
+        default=120.0,
+        help="direct API request timeout in seconds",
+    )
+    agent.add_argument(
+        "--command-timeout",
+        type=float,
+        default=180.0,
+        help="per-step local command timeout in seconds",
+    )
+    agent.add_argument("--seed", type=int, default=None)
+    agent.add_argument("--max-steps-per-round", type=int, default=12)
+    agent.add_argument("--history-records", type=int, default=32)
+    agent.add_argument("--history-chars", type=int, default=96_000)
+    agent.add_argument(
+        "--quote-policy-json",
+        type=Path,
+        default=None,
+        help="optional frozen QuotePolicy JSON",
+    )
+    agent.add_argument(
+        "--redact-raw-output",
+        action="store_true",
+        help="store only the response hash, not raw agent text, in the trajectory",
+    )
+    agent.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="verified v3 trajectory JSON",
+    )
+    agent.add_argument(
+        "--summary-output",
+        type=Path,
+        default=None,
+        help="optional compact run-summary JSON",
+    )
     manifest = sub.add_parser("make-manifest", help="freeze the factorial experiment job list")
     manifest.add_argument("--episodes", nargs="+", required=True)
     manifest.add_argument("--models", nargs="+", required=True)
@@ -192,6 +378,12 @@ def build_parser() -> argparse.ArgumentParser:
     margin.add_argument("csv", type=Path)
     margin.add_argument("--episodes", nargs="+", required=True)
     margin.add_argument("--client-json", type=Path, required=True)
+    margin.add_argument(
+        "--risk-budget-json",
+        type=Path,
+        default=None,
+        help="frozen risk budget whose notional capacity runtime quotes use",
+    )
     margin.add_argument(
         "--sensitivity-factors", nargs="+", type=float, default=[0.8, 1.0, 1.2],
         help="post-calibration overall a_* scale multipliers to report robustness for",
@@ -259,6 +451,107 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _registered_v3_policy(args: argparse.Namespace) -> LLMAgentPolicy:
+    """Create a v3 policy from the existing model registry, failing early."""
+
+    registry = load_model_registry(args.models_config)
+    if args.model not in registry:
+        available = ", ".join(sorted(registry)) or "(none)"
+        raise SystemExit(
+            f"model {args.model!r} is not registered; available: {available}"
+        )
+    config = registry[args.model]
+    if config.provider != "mock":
+        if not config.api_key_env:
+            raise SystemExit(
+                f"registered model {args.model!r} has no api_key_env"
+            )
+        if not os.environ.get(config.api_key_env, "").strip():
+            raise SystemExit(
+                f"missing API key: environment variable "
+                f"{config.api_key_env} is empty"
+            )
+    max_tokens = args.max_tokens or config.max_tokens
+    return LLMAgentPolicy(
+        create_client(args.model, registry),
+        name=args.model,
+        temperature=args.temperature,
+        max_tokens=max_tokens,
+    )
+
+
+def _cmd_test_agent(args: argparse.Namespace, snapshots: list) -> int:
+    """Run one external policy through the canonical v3 reset/step boundary."""
+
+    selected = tuple(
+        snapshot
+        for snapshot in snapshots
+        if snapshot.episode_id == args.episode
+    )
+    if not selected:
+        raise SystemExit(f"unknown episode: {args.episode}")
+    client = ClientProfile(
+        **json.loads(args.client_json.read_text(encoding="utf-8"))
+    )
+    risk_budget = RiskBudget(
+        **json.loads(args.risk_budget_json.read_text(encoding="utf-8"))
+    )
+    task = EpisodeTask(
+        snapshots=selected,
+        client=client,
+        risk_budget=risk_budget,
+        quote_policy=_load_quote_policy(args.quote_policy_json) or QuotePolicy(),
+        task_seed=0 if args.seed is None else args.seed,
+    )
+    environment = MirageStructurerEnv(
+        task,
+        max_steps_per_round=args.max_steps_per_round,
+        expose_privileged_info=False,
+    )
+
+    try:
+        if args.agent_command is not None:
+            policy = CommandAgentPolicy(
+                args.agent_command,
+                timeout=args.command_timeout,
+            )
+        elif args.model is not None:
+            policy = _registered_v3_policy(args)
+        else:
+            if not args.api_base_url:
+                raise SystemExit("--api-base-url is required with --api-model")
+            if not args.api_key_env:
+                raise SystemExit("--api-key-env is required with --api-model")
+            policy = create_api_agent_policy(
+                provider=args.api_provider,
+                base_url=args.api_base_url,
+                model=args.api_model,
+                api_key_env=args.api_key_env,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens or 4000,
+                timeout=args.api_timeout,
+            )
+    except (LLMError, ValueError) as exc:
+        raise SystemExit(f"failed to configure v3 agent: {exc}") from exc
+
+    result = asyncio.run(
+        run_v3_agent_episode(
+            environment,
+            policy,
+            seed=args.seed,
+            trajectory_path=args.output,
+            max_history_records=args.history_records,
+            max_history_chars=args.history_chars,
+            record_raw_output=not args.redact_raw_output,
+        )
+    )
+    summary = result.summary()
+    if args.summary_output is not None:
+        _atomic_write_json(args.summary_output, summary)
+    print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def _condition_from_id(condition_id: str) -> BenchmarkCondition:
     try:
         info, horizon = condition_id.split("_")
@@ -278,13 +571,17 @@ def _cmd_calibrate(args: argparse.Namespace, snapshots: list) -> int:
     if missing:
         raise SystemExit(f"unknown development episodes: {sorted(missing)}")
     cases = [
-        (snapshot, client, PortfolioState())
+        (
+            snapshot,
+            resolve_client_profile(client, snapshot.round_num),
+            PortfolioState(),
+        )
         for snapshot in snapshots
         if snapshot.episode_id in wanted
     ]
     kwargs = {"factors": tuple(args.factors)} if args.factors else {}
     kwargs["policy"] = _load_quote_policy(args.quote_policy_json)
-    report = calibrate_risk_budget(oracle_candidate_grid(client), cases, base, **kwargs)
+    report = calibrate_risk_budget(ProductDomainSpec(), cases, base, **kwargs)
     report["development_episodes"] = sorted(wanted)
     args.report_output.parent.mkdir(parents=True, exist_ok=True)
     args.report_output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -323,30 +620,51 @@ def _cmd_calibrate_margin(args: argparse.Namespace, snapshots: list) -> int:
         raise SystemExit("no snapshots found for the requested development episodes")
 
     domain = ProductDomainSpec()
-    candidates = list(enumerate_domain(client, domain))
-    if not candidates:
-        raise SystemExit("product domain lattice is empty for this client")
-
     # Deterministic per-snapshot subsample: seeded from (episode_id, round_num,
     # --seed) so re-running with the same inputs reproduces the same dev cases
     # regardless of csv row order.
     dev_cases: list[tuple] = []
     for snapshot in wanted_snapshots:
+        round_client = resolve_client_profile(client, snapshot.round_num)
+        candidates = list(enumerate_domain(round_client, domain))
+        if not candidates:
+            raise SystemExit(
+                f"product domain lattice is empty for round {snapshot.round_num}"
+            )
         sample_size = min(args.candidates_per_snapshot, len(candidates))
         stratum_seed = derive_seed(
             "mirage.calibrate_margin.snapshot", snapshot.episode_id, snapshot.round_num, args.seed,
         )
         for product in random.Random(stratum_seed).sample(candidates, sample_size):
             market = snapshot.to_market_state(product.maturity_months)
-            dev_cases.append((product, market, client))
+            dev_cases.append((product, market, round_client))
 
     kwargs = {"factors": tuple(args.factors)} if args.factors else {}
-    calibrated, report = calibrate_quote_policy(dev_cases, seed=args.seed, **kwargs)
+    risk_budget_path = getattr(args, "risk_budget_json", None)
+    if risk_budget_path is not None:
+        frozen_budget = RiskBudget(
+            **json.loads(risk_budget_path.read_text(encoding="utf-8"))
+        )
+        capacity_fn = lambda _client: frozen_budget.notional
+    else:
+        frozen_budget = None
+        capacity_fn = lambda current_client: current_client.capital
+    calibrated, report = calibrate_quote_policy(
+        dev_cases,
+        seed=args.seed,
+        capacity_fn=capacity_fn,
+        **kwargs,
+    )
 
     sensitivity_rows = []
     for factor in args.sensitivity_factors:
         scaled = scale_quote_policy_markup(calibrated, float(factor))
-        result = evaluate_quote_policy(scaled, dev_cases, seed=args.seed)
+        result = evaluate_quote_policy(
+            scaled,
+            dev_cases,
+            seed=args.seed,
+            capacity_fn=capacity_fn,
+        )
         sensitivity_rows.append({"sensitivity_factor": float(factor), **result})
 
     report["development_episodes"] = sorted(wanted)
@@ -354,6 +672,9 @@ def _cmd_calibrate_margin(args: argparse.Namespace, snapshots: list) -> int:
     report["n_snapshots"] = len(wanted_snapshots)
     report["n_dev_cases"] = len(dev_cases)
     report["seed"] = args.seed
+    report["capacity_source"] = (
+        "risk_budget.notional" if frozen_budget is not None else "client.capital"
+    )
     report["sensitivity"] = sensitivity_rows
 
     args.report_output.parent.mkdir(parents=True, exist_ok=True)
@@ -375,8 +696,61 @@ def _cmd_calibrate_margin(args: argparse.Namespace, snapshots: list) -> int:
     return 0
 
 
+def _run_fingerprint(
+    *,
+    manifest: dict,
+    snapshots: list,
+    client_payload: dict,
+    budget_payload: dict,
+    quote_policy: QuotePolicy | None,
+    models_config: Path,
+    roles_config: Path | None,
+) -> tuple[str, dict]:
+    inputs = {
+        "fingerprint_version": RUN_FINGERPRINT_VERSION,
+        "run_output_schema_version": RUN_OUTPUT_SCHEMA_VERSION,
+        "manifest": manifest,
+        "market_snapshots": [asdict(snapshot) for snapshot in snapshots],
+        "client": client_payload,
+        "risk_budget": budget_payload,
+        "quote_policy": asdict(quote_policy or QuotePolicy()),
+        "models_config_sha256": _file_sha256(models_config),
+        "roles_config_sha256": _file_sha256(roles_config),
+        "implementation_sha256": _source_implementation_sha256(),
+    }
+    return _sha256_json(inputs), inputs
+
+
+def _completed_result_matches(
+    path: Path,
+    *,
+    run_fingerprint: str,
+    job_fingerprint: str,
+    job_id: str,
+) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    job = payload.get("job")
+    return (
+        payload.get("schema_version") == RUN_OUTPUT_SCHEMA_VERSION
+        and payload.get("complete") is True
+        and payload.get("run_fingerprint") == run_fingerprint
+        and payload.get("job_fingerprint") == job_fingerprint
+        and isinstance(job, dict)
+        and job.get("job_id") == job_id
+        and isinstance(payload.get("trace"), dict)
+        and isinstance(payload.get("metrics"), dict)
+    )
+
+
 def _cmd_run_manifest(args: argparse.Namespace, snapshots: list) -> int:
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("jobs"), list):
+        raise SystemExit(f"invalid experiment manifest: {args.manifest}")
     jobs = manifest["jobs"]
     if args.only_models:
         keep = set(args.only_models)
@@ -395,43 +769,89 @@ def _cmd_run_manifest(args: argparse.Namespace, snapshots: list) -> int:
         env_cache = _env_cache(args.env_cache_dir)
         npc_lineup_id, roles_sha = _roles_config_meta(args.roles_config)
         roles_meta = {"npc_lineup_id": npc_lineup_id, "roles_config_sha256": roles_sha}
+    run_fingerprint, fingerprint_inputs = _run_fingerprint(
+        manifest=manifest,
+        snapshots=snapshots,
+        client_payload=client_payload,
+        budget_payload=budget_payload,
+        quote_policy=quote_policy,
+        models_config=args.models_config,
+        roles_config=args.roles_config,
+    )
     by_episode: dict[str, list] = {}
     for snapshot in snapshots:
         by_episode.setdefault(snapshot.episode_id, []).append(snapshot)
     args.outputs_dir.mkdir(parents=True, exist_ok=True)
     done = skipped = failed = 0
     for index, job in enumerate(jobs, start=1):
+        if not isinstance(job, dict) or not isinstance(job.get("job_id"), str):
+            raise SystemExit(f"manifest contains an invalid job at index {index - 1}")
         out_path = args.outputs_dir / f"{job['job_id']}.json"
+        job_fingerprint = _sha256_json(
+            {"run_fingerprint": run_fingerprint, "job": job}
+        )
         if out_path.exists():
-            skipped += 1
-            continue
+            if _completed_result_matches(
+                out_path,
+                run_fingerprint=run_fingerprint,
+                job_fingerprint=job_fingerprint,
+                job_id=job["job_id"],
+            ):
+                skipped += 1
+                continue
+            quarantined = _quarantine_invalid_result(out_path)
+            print(
+                json.dumps(
+                    {
+                        "job_id": job["job_id"],
+                        "quarantined_stale_or_incomplete_result": str(quarantined),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
         episode_snapshots = by_episode.get(job["episode_id"])
         if not episode_snapshots:
             raise SystemExit(f"manifest references unknown episode: {job['episode_id']}")
-        env_agents = (
-            _make_env_agents(env_specs, registry, env_cache) if env_specs is not None else None
-        )
-        env = LongHorizonEnvironment(
-            episode_snapshots,
-            ClientProfile(**client_payload),
-            RiskBudget(**budget_payload),
-            _condition_from_id(job["condition"]),
-            quote_policy=quote_policy,
-            env_agents=env_agents,
-        )
-        llm = create_client(job["model"], registry)
         print(f"[{index}/{len(jobs)}] {job['job_id']} ...", flush=True)
         try:
+            env_agents = (
+                _make_env_agents(env_specs, registry, env_cache) if env_specs is not None else None
+            )
+            env = LongHorizonEnvironment(
+                episode_snapshots,
+                ClientProfile(**client_payload),
+                RiskBudget(**budget_payload),
+                _condition_from_id(job["condition"]),
+                quote_policy=quote_policy,
+                env_agents=env_agents,
+            )
+            llm = create_client(job["model"], registry)
             trace = asyncio.run(run_episode(env, llm, strategy=job["strategy"], seed=job.get("seed")))
         except Exception as exc:  # noqa: BLE001 — 单个作业失败不应终止整批夜跑
             failed += 1
             print(json.dumps({"job_id": job["job_id"], "error": str(exc)[:300]}, ensure_ascii=False), flush=True)
             continue
         job_record = {**job, **roles_meta} if roles_meta else job
-        payload = {"job": job_record, "trace": trace_to_dict(trace), "metrics": compute_metrics(trace)}
-        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload = {
+            "schema_version": RUN_OUTPUT_SCHEMA_VERSION,
+            "complete": True,
+            "run_fingerprint": run_fingerprint,
+            "job_fingerprint": job_fingerprint,
+            "fingerprint_inputs": fingerprint_inputs,
+            "job": job_record,
+            "trace": trace_to_dict(trace),
+            "metrics": compute_metrics(trace),
+        }
+        _atomic_write_json(out_path, payload)
         done += 1
-    print(json.dumps({"done": done, "skipped": skipped, "failed": failed, "total": len(jobs)}, ensure_ascii=False))
+    print(json.dumps({
+        "done": done,
+        "skipped": skipped,
+        "failed": failed,
+        "total": len(jobs),
+        "run_fingerprint": run_fingerprint,
+    }, ensure_ascii=False))
     return 1 if failed else 0
 
 
@@ -837,20 +1257,41 @@ def _judge_markdown_lines(results_dir: Path) -> list[str]:
 
 def _cmd_aggregate(args: argparse.Namespace) -> int:
     rows: list[dict] = []
+    run_fingerprints: set[str] = set()
+    legacy_unfingerprinted = 0
     for path in sorted(args.results_dir.glob("*.json")):
         payload = json.loads(path.read_text(encoding="utf-8"))
         metrics = payload.get("metrics")
         if not isinstance(metrics, dict):
             continue
+        fingerprint = payload.get("run_fingerprint")
+        if fingerprint is None:
+            legacy_unfingerprinted += 1
+        elif isinstance(fingerprint, str) and fingerprint:
+            run_fingerprints.add(fingerprint)
+        else:
+            raise SystemExit(f"invalid run_fingerprint in result: {path}")
+        if (
+            payload.get("schema_version") == RUN_OUTPUT_SCHEMA_VERSION
+            and payload.get("complete") is not True
+        ):
+            raise SystemExit(f"incomplete v3 result cannot be aggregated: {path}")
         job = payload.get("job") or {}
         rows.append({
             "file": path.name,
             "model": job.get("model") or payload.get("model") or "",
             "strategy": job.get("strategy"),
+            "run_fingerprint": fingerprint,
             **metrics,
         })
     if not rows:
         raise SystemExit(f"no result json with metrics found in {args.results_dir}")
+    if len(run_fingerprints) > 1 or (run_fingerprints and legacy_unfingerprinted):
+        details = sorted(run_fingerprints)
+        raise SystemExit(
+            "refusing to aggregate mixed run fingerprints: "
+            f"fingerprints={details}, legacy_unfingerprinted={legacy_unfingerprinted}"
+        )
 
     missing_counts = {
         name: sum(1 for row in rows if not isinstance(row.get(name), (int, float)))
@@ -883,6 +1324,8 @@ def _cmd_aggregate(args: argparse.Namespace) -> int:
         "rows": len(rows),
         "csv": str(args.output_csv),
         "md": str(args.output_md) if args.output_md else None,
+        "run_fingerprint": next(iter(run_fingerprints), None),
+        "legacy_unfingerprinted_rows": legacy_unfingerprinted,
         "fully_missing_metrics": fully_missing,
         "partially_missing_metrics": partially_missing,
     }, ensure_ascii=False))
@@ -1019,6 +1462,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_calibrate_margin(args, snapshots)
     if args.command == "run-manifest":
         return _cmd_run_manifest(args, snapshots)
+    if args.command == "test-agent":
+        return _cmd_test_agent(args, snapshots)
 
     selected = [snapshot for snapshot in snapshots if snapshot.episode_id == args.episode]
     if not selected:

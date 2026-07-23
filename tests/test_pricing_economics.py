@@ -21,8 +21,11 @@ from mirage.pricing import (
     calibrate_quote_policy,
     client_loss_measure,
     evaluate_product,
+    fair_value_stress_profile,
+    hurdle_hit_prob,
     mc_diagnostics,
     quote_economics,
+    solve_quote_equilibrium,
 )
 from mirage.products import ClientProfile, MarketState, ProductSpec
 
@@ -262,3 +265,82 @@ def test_calibrate_quote_policy_hits_target_band():
     assert report["ranking_nondegenerate"] is True
     assert report["within_target"] is True
     assert "freeze" in report["warning"]
+
+
+def test_unhedged_stress_is_zero_sum_scenario_by_scenario():
+    """同一压力情景下，客户价值 P&L 与 dealer liability P&L 必须严格零和。"""
+    profile = fair_value_stress_profile(product("vanilla_call"), market())
+
+    assert profile.scenarios
+    for scenario in profile.scenarios:
+        assert scenario.client_pnl + scenario.dealer_liability_pnl == pytest.approx(
+            0.0, abs=1e-12
+        )
+
+
+def test_quote_equilibrium_recomputes_probability_at_returned_price():
+    """保存的 price/probability/suitability 是同一个固定点，而不是两遍近似。"""
+    prod = product("vanilla_call")
+    cli = client()
+    cli.min_hit_prob = 0.8
+    mkt = market()
+    pricing = evaluate_product(prod, mkt)
+    diag = mc_diagnostics(prod, mkt, n_paths=512, seed=19)
+    profile = fair_value_stress_profile(prod, mkt)
+    policy = QuotePolicy(diagnostic_paths=512)
+
+    equilibrium = solve_quote_equilibrium(
+        prod,
+        mkt,
+        cli,
+        pricing,
+        diag,
+        dealer_stress_loss=profile.dealer_hedged_stress_loss,
+        post_notional=prod.notional,
+        capacity_notional=cli.capital,
+        policy=policy,
+    )
+
+    assert equilibrium.converged is True
+    recomputed_probability = hurdle_hit_prob(
+        prod,
+        mkt,
+        cli.min_return_pct,
+        equilibrium.economics.client_price,
+    )
+    assert equilibrium.hurdle_hit_prob == pytest.approx(
+        recomputed_probability, abs=1e-12
+    )
+    pricing_at_fixed_point = {
+        **pricing,
+        "hurdle_hit_prob": recomputed_probability,
+    }
+    recomputed_economics = quote_economics(
+        pricing_at_fixed_point,
+        diag,
+        dealer_stress_loss=profile.dealer_hedged_stress_loss,
+        post_notional=prod.notional,
+        capacity_notional=cli.capital,
+        policy=policy,
+        product=prod,
+        client=cli,
+    )
+    assert recomputed_economics.client_price == pytest.approx(
+        equilibrium.economics.client_price,
+        abs=max(prod.notional * 1e-8, 1e-8),
+    )
+
+
+def test_funded_note_is_par_and_reports_separate_cash_fields():
+    """Level-0 funded note 不再把 exposure、cash、premium 和 protection 混为一项。"""
+    prod = product("vanilla_call", protected=True)
+    cli = client()
+    qe = econ(prod, cli)
+
+    assert qe.funding_style == "funded_note"
+    assert qe.face_value == prod.notional
+    assert qe.issue_price_pct == pytest.approx(1.0)
+    assert qe.cash_outlay == pytest.approx(qe.face_value)
+    assert qe.premium is None
+    assert qe.protected_amount == pytest.approx(qe.face_value)
+    assert qe.dealer_fee == pytest.approx(qe.cash_outlay - qe.fair_value)

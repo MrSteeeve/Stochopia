@@ -9,7 +9,7 @@ MIRAGE 评估 LLM 能否在部分可观测、有限的交易台/客户/风控交
 ## 协议状态
 
 - `mirage.environment` 是新的 **v3-spine / Level-0** 训练接口：部分可观测与动态状态是环境不变量，动作和转移都有类型，`MirageStructurerEnv.reset()/step()` 内不调用 LLM，也不包含 forced prompt、策略规则或 oracle。默认不返回 evaluator 特权状态，并以有限的每轮 step 上限阻止 rollout 无限挂起。
-- 现有 CLI 与 `LongHorizonEnvironment` 明确保留为 **v2 遗留 benchmark**，用于复现已经冻结的 v2 运行。Full/Static 不再是 v3 任务条件，v2 与 v3 产物不得混合汇总。
+- CLI 现在提供 v3 原生的`test-agent`入口；其余析因命令与`LongHorizonEnvironment`明确保留为 **v2 遗留 benchmark**，用于复现已经冻结的 v2 运行。Full/Static 不再是 v3 任务条件，v2 与 v3 产物不得混合汇总。
 - v2 的动态头寸也已改为保存发行定盘价与绝对合约水平，处理障碍/敲入/自动赎回观察，并在下一市场快照重新计算 FV、delta、vega 与压力损失。
 
 > 早期的纳斯达克100“Structurer Playground”原型（`run.py`、`mirage.cli`、`mirage.engine`）已下线，这条入口在当前仓库中已不存在。`scenarios/structurer_nasdaq/`目录仅作为历史场景数据保留，无法通过任何现有命令运行。
@@ -19,7 +19,7 @@ MIRAGE 评估 LLM 能否在部分可观测、有限的交易台/客户/风控交
 - **设计一份合约，而不只是给它定价**：被测模型（`structurer`）可以查询客户、就交易台/风控/客户做定性咨询、请求确定性报价、提交设计方案——每轮受固定预算约束：3次查询、3次咨询、3次报价。
 - **在部分可观测下工作**：Partial条件下，客户的硬性门槛（可投资金额、亏损容忍度、期限、产品白名单、保本要求）从不直接公开，只能通过`query_client`主动获取。
 - **跨决策承担风险**：v3 环境始终动态；v2 兼容 runner 仍保留历史 Static 消融以便复现旧协议。
-- **不能靠固定加价率取巧**：`dealer_margin`是一个成本加成函数，取决于价内程度、vega敞口、路径依赖度、蒙特卡洛定价不确定性、压力损失与容量占用率，并再乘以一个客户适配度系数——因此“永远报最大名义本金的vanilla”不再是占优策略。精确公式见协议文档。
+- **不能靠固定加价率取巧**：`dealer_margin`采用显式资金语义，取决于价内程度、vega敞口、路径依赖度、蒙特卡洛定价不确定性、静态delta对冲后的dealer压力损失与容量占用率；premium-paid 报价还会计入客户适配度。负margin不会被截成零。Level-0平价票据仍缺少payoff solve-for，因此在大规模训练前还需补完。精确公式见协议文档。
 
 ## 双层架构
 
@@ -63,7 +63,72 @@ cp .env.example .env
 # 全部已注册模型见 config/models.yaml。
 ```
 
-命令行工具安装为`mirage-benchmark`（`python -m mirage.benchmark_cli`效果相同）：
+v3 主接口是类型化的 partial-dynamic 环境。下面的冒烟运行完全确定性，
+不需要 API key：
+
+```python
+import json
+from pathlib import Path
+
+from mirage.benchmark import RiskBudget, load_market_snapshots
+from mirage.environment import EpisodeTask, MirageStructurerEnv, Skip
+from mirage.products import ClientProfile
+
+root = Path.cwd()
+snapshots = tuple(
+    row for row in load_market_snapshots(
+        root / "scenarios/mirage_csi/market_snapshots.example.csv"
+    )
+    if row.episode_id == "SYNTHETIC_CSI500_DEMO"
+)
+client = ClientProfile(**json.loads(
+    (root / "scenarios/mirage_csi/client.example.json").read_text()
+))
+budget = RiskBudget(**json.loads(
+    (root / "scenarios/mirage_csi/risk_budget.example.json").read_text()
+))
+env = MirageStructurerEnv(EpisodeTask(snapshots, client, budget, task_seed=7))
+observation, info = env.reset()
+transition = env.step(Skip("typed v3 smoke test"))
+print(observation.available_actions, transition.observation.round_num, info["seed_role"])
+```
+
+真实 Agent 通过 v3 原生的`test-agent`命令测试。本地可执行程序每一步从
+stdin 接收一个带版本的 JSON 请求，并向 stdout 输出一个动作 JSON：
+
+```bash
+mirage-benchmark test-agent scenarios/mirage_csi/market_snapshots.example.csv \
+  --episode SYNTHETIC_CSI500_DEMO \
+  --client-json scenarios/mirage_csi/client.example.json \
+  --risk-budget-json scenarios/mirage_csi/risk_budget.example.json \
+  --agent-command 'python my_agent.py' \
+  --output outputs/v3-cli-agent.trajectory.json
+```
+
+API 模型既可以用`--model deepseek-v4-flash`从`config/models.yaml`选择，
+也可以不修改注册表而直接接入。密钥只从指定的环境变量读取，不会进入 Agent
+请求或轨迹：
+
+```bash
+export OPENAI_API_KEY='...'
+mirage-benchmark test-agent scenarios/mirage_csi/market_snapshots.example.csv \
+  --episode SYNTHETIC_CSI500_DEMO \
+  --client-json scenarios/mirage_csi/client.example.json \
+  --risk-budget-json scenarios/mirage_csi/risk_budget.example.json \
+  --api-provider openai-compatible \
+  --api-base-url https://api.openai.com/v1 \
+  --api-model gpt-4o --api-key-env OPENAI_API_KEY \
+  --output outputs/v3-api-agent.trajectory.json \
+  --summary-output outputs/v3-api-agent.summary.json
+```
+
+Python 侧使用`CommandAgentPolicy`、`LLMAgentPolicy`/
+`create_api_agent_policy`和`run_agent_episode`走同一边界。传输或 schema
+错误会成为轨迹中可见的 invalid action，并消耗正常 step 预算；隐藏客户状态
+永远不会发给策略。
+
+`mirage-benchmark`还保留了下面的 legacy v2 析因命令，以便复现冻结的 v2
+实验（`python -m mirage.benchmark_cli`效果相同）：
 
 ```bash
 # 校验市场快照 CSV（schema、来源、轮次连续性）。
@@ -127,7 +192,7 @@ MIRAGE/
 |   |-- models.yaml                 # 模型注册表：各模型的接入信息
 |   `-- benchmark_roles.yaml        # v2 角色行为：structurer + 3 个环境 NPC + judges
 |-- mirage/
-|   |-- environment/                 # v3-spine typed reset/step 与轨迹记录
+|   |-- environment/                 # v3 reset/step、CLI/API Agent 适配与轨迹
 |   |-- benchmark.py                # MarketSnapshot、RiskBudget、ProductDomainSpec、
 |   |                               #   TradingDesk、HardConstraintEngine、结算
 |   |-- benchmark_runner.py         # run_episode 主循环、compute_metrics

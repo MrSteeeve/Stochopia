@@ -74,6 +74,7 @@ def build_spec(
     numeric_authority: str = "supplied_facts_only",
     history_scope: str = "episode",
     seed_offset: int = 0,
+    seed_policy: str = "derived",
 ) -> RoleSpecV2:
     return RoleSpecV2(
         id=role,
@@ -85,7 +86,7 @@ def build_spec(
             temperature=0.0,
             max_tokens=500,
             timeout_s=30.0,
-            seed_policy="derived",
+            seed_policy=seed_policy,  # type: ignore[arg-type]
             seed_offset=seed_offset,
         ),
         retry=RetryPolicy(transport_retries=1, format_retries=1),
@@ -469,6 +470,68 @@ def test_cache_different_seed_different_key():
     k1 = EnvResponseCache.make_key("client", "mock", 0.0, 1, msgs)
     k2 = EnvResponseCache.make_key("client", "mock", 0.0, 2, msgs)
     assert k1 != k2
+
+
+def test_cache_key_commits_full_inference_contract():
+    msgs = [{"role": "user", "content": "hi"}]
+    base = EnvResponseCache.make_key(
+        "client",
+        "mock",
+        0.0,
+        1,
+        msgs,
+        max_tokens=100,
+        output_schema="client_response_v1",
+    )
+    different_tokens = EnvResponseCache.make_key(
+        "client",
+        "mock",
+        0.0,
+        1,
+        msgs,
+        max_tokens=200,
+        output_schema="client_response_v1",
+    )
+    different_schema = EnvResponseCache.make_key(
+        "client",
+        "mock",
+        0.0,
+        1,
+        msgs,
+        max_tokens=100,
+        output_schema="risk_response_v1",
+    )
+    assert len({base, different_tokens, different_schema}) == 3
+
+
+def test_seed_policy_derived_fixed_and_none_have_distinct_semantics():
+    request_a = make_request(turn_id=1)
+    request_b = make_request(turn_id=2)
+    derived = FrozenEnvAgent(
+        build_spec("client", "client_response_v1", "abstain", seed_policy="derived"),
+        MockLLMClient([]),
+        system_prompt="SYS",
+    )
+    fixed = FrozenEnvAgent(
+        build_spec(
+            "client",
+            "client_response_v1",
+            "abstain",
+            seed_policy="fixed",
+            seed_offset=17,
+        ),
+        MockLLMClient([]),
+        system_prompt="SYS",
+    )
+    unseeded = FrozenEnvAgent(
+        build_spec("client", "client_response_v1", "abstain", seed_policy="none"),
+        MockLLMClient([]),
+        system_prompt="SYS",
+    )
+
+    assert derived._seed(request_a) != derived._seed(request_b)
+    assert fixed._seed(request_a) == fixed._seed(request_b) == 17
+    assert unseeded._seed(request_a) is None
 
 
 def test_cache_persistence_reload(tmp_path):

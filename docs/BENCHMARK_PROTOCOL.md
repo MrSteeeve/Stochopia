@@ -1,11 +1,12 @@
 # MIRAGE CSI Protocol: v2 Legacy Benchmark and v3 Environment Spine
 
-> **Version boundary.** The CLI and `LongHorizonEnvironment` described by the
-> factorial sections below are the reproducible **v2 legacy benchmark**. The
-> new `mirage.environment` package is a **v3-spine / Level-0** synchronous
-> training interface in which partial observability and dynamic state are
-> invariants rather than experimental conditions. v2 and v3 trajectories are
-> versioned separately and must never be pooled in one result table.
+> **Version boundary.** The factorial CLI commands and
+> `LongHorizonEnvironment` described below are the reproducible **v2 legacy
+> benchmark**. `mirage.environment` and `mirage-benchmark test-agent` are the
+> **v3-spine / Level-0** synchronous interface, in which partial observability
+> and dynamic state are invariants rather than experimental conditions. v2
+> and v3 trajectories are versioned separately and must never be pooled in
+> one result table.
 
 ## Research claim
 
@@ -47,11 +48,15 @@ passed to a policy. Partial quote and settlement payloads expose client check
 IDs/statuses but redact their exact observed values, limits and reasons.
 
 The core contains no LLM call, prompt, strategy, forced completion or oracle.
-`TrajectoryRecorder` stores complete typed transitions with schema/environment/
-pricing/task versions and a SHA-256 state/record chain. This is an architectural
-spine, not yet a claim that the planned payoff DSL, solve-for tools, task
-generator, teacher hierarchy, Pareto evaluator or lifecycle-P&L reward are
-complete.
+`RewardComponents` stores measured or explicitly unavailable terms with
+provenance, units and normalization metadata; downstream scalarization requires
+an explicit versioned `ScalarizationSpec`. `TrajectoryRecorder` canonicalizes
+and deep-freezes each transition at record time, embeds the complete task
+manifest, records package/git/pricing implementation provenance, verifies its
+own chain before saving and writes atomically with an end-of-file root hash.
+This is an architectural spine, not yet a claim that the planned payoff DSL,
+solve-for tools, task generator, teacher hierarchy, Pareto evaluator or
+realised hedge-P&L reward are complete.
 
 Typed product actions are canonicalised through the same parser as JSON
 actions; policies cannot set `reference_spot`, barrier-history or elapsed-time
@@ -60,6 +65,39 @@ post-quote mutation before submission. Invalid actions cannot run forever:
 `max_steps_per_round` ends the rollout with `truncated=True`. Reward/termination
 configuration and reset options are committed into the state hash, and the
 trajectory metadata commits an environment-configuration hash.
+
+### v3 external Agent interface
+
+`mirage.environment.agent_runner` is the only implemented policy-facing
+rollout layer for v3. It does not move LLM calls into the deterministic core:
+it converts an external response into a typed action and calls the same
+`MirageStructurerEnv.step()` entrypoint used by a training loop.
+
+Two adapters share the versioned `mirage.agent-request.v1` request:
+
+- `CommandAgentPolicy` invokes a local executable directly, without a shell.
+  Each step sends one JSON object on stdin and requires one action JSON on
+  stdout. The request carries the packaged action contract, current public
+  observation and a bounded public interaction history.
+- `LLMAgentPolicy` accepts any existing `BaseLLMClient`.
+  `create_api_agent_policy` constructs an OpenAI-compatible or Anthropic
+  client directly from provider/base URL/model/API-key-environment-variable
+  arguments, without requiring a `models.yaml` edit.
+
+The CLI exposes both through `mirage-benchmark test-agent`: use
+`--agent-command`, `--model` (registered), or the direct
+`--api-model/--api-base-url/--api-key-env` path. These choices are mutually
+exclusive. Literal secret values are not accepted; only the environment
+variable name is configured, and its value is neither serialized nor sent to
+the model.
+
+The Agent request includes `task_hash` but never the task manifest, hidden
+client profile or evaluator-only `privileged_state`. The complete task
+manifest remains in the evaluator's saved trajectory so the run can be
+verified. Transport failures, malformed JSON, unknown fields and unavailable
+actions become explicit `InvalidAction` transitions and consume the ordinary
+step limit rather than receiving hidden retries. Raw policy output is hashed
+and recorded by default; `--redact-raw-output` retains only its hash.
 
 ## Frozen episode design
 
@@ -207,7 +245,7 @@ required for acceptance.
 
 **Quote-time HARD checks** (`Quote.checks`, computed by `TradingDesk.quote`;
 `quote.hard_pass` is true iff every check with `severity == "HARD"` passes):
-`DOMAIN` (lattice membership), `CLIENT_ACCEPTING`, `CLIENT_CAPITAL`,
+`DOMAIN` (lattice membership), `TARGET_CLIENT_MATCH`, `CLIENT_ACCEPTING`, `CLIENT_CAPITAL`,
 `CLIENT_MATURITY`, `CLIENT_PRODUCT_WHITELIST`, `CLIENT_LOSS_BUDGET_V2`
 (continuous loss proxy, see below), `CLIENT_PROTECTION` (a
 principal-protection-seeking client requires a deterministic bond floor of 1),
@@ -216,14 +254,15 @@ structural payoff floor within `description_tolerance_bp`, default 1 bp),
 `DESCRIPTION_PROTECTION` (a natural-language protection claim in `pitch`, e.g.
 "保本"/"本金保障", must match the structural floor), and five post-trade
 portfolio budget checks (`PORTFOLIO_NOTIONAL`, `PORTFOLIO_NET_DELTA`,
-`PORTFOLIO_GROSS_DELTA`, `PORTFOLIO_NET_VEGA`, `PORTFOLIO_STRESS_LOSS`) against
+`PORTFOLIO_GROSS_DELTA`, `PORTFOLIO_NET_VEGA`,
+`PORTFOLIO_DEALER_STRESS_LOSS`) against
 the frozen `RiskBudget`, cumulative with the current dynamic-condition
 portfolio. Any HARD failure makes the quote non-executable; an LLM (structurer
 or any env role) cannot waive it.
 
 **Settlement-time CONTRACT checks** (`client_contract_pass`, `severity ==
 "CONTRACT"`, evaluated only at `submit_design`/`submit_product` against the
-already-priced quote): `CONTRACT_ACCEPTING`, `CONTRACT_CAPITAL`,
+already-priced quote): `CONTRACT_TARGET_CLIENT_MATCH`, `CONTRACT_ACCEPTING`, `CONTRACT_CAPITAL`,
 `CONTRACT_MATURITY`, `CONTRACT_WHITELIST`, `CONTRACT_PROTECTION`,
 `CONTRACT_LOSS` (the same continuous loss proxy as `CLIENT_LOSS_BUDGET_V2`,
 re-derived at settlement) and `CONTRACT_HURDLE` (`hurdle_hit_prob >=
@@ -240,35 +279,75 @@ they are never collapsed into one boolean before being recorded.
 
 `mirage.pricing.client_loss_measure` reports
 `observed_loss_frac = max(expected_loss_frac, premium_at_risk_frac,
-stress_loss_frac)` against `client.max_loss_pct`:
+stress_loss_frac)` against `client.max_loss_pct`. All three legs use the
+client's actual cash funding denominator once a quote exists:
 
 - `expected_loss_frac`: Monte Carlo expected loss for coupon-style structures
-  (`pricing_details.expected_loss_frac`; 0 for principal-protected non-MC
-  structures).
-- `premium_at_risk_frac`: for non-protected vanilla/barrier structures, the
-  option premium as a fraction of notional (`pricing.loss_frac`); this leg is
-  derived from `evaluate_product`'s fixed 3% markup convention
-  (`MARKUP` in `mirage.pricing`), **deliberately** independent of the v2
-  `QuotePolicy` coefficients used for the actual client price (see below).
-  `CLIENT_LOSS_BUDGET_V2` is a hard constraint (an upper bound on client loss),
-  so this leg is pinned to a policy-independent baseline pricing convention on
-  purpose: if it instead tracked the current `QuotePolicy`, the same product
-  could flip between passing and failing the loss constraint purely because
-  `calibrate-margin` re-scaled the markup coefficients, making the constraint's
-  meaning drift with every recalibration. Pinning it keeps `CLIENT_LOSS_BUDGET_V2`'s
-  semantics stable across `QuotePolicy` freezes, recalibrations and sensitivity
-  runs.
-- `stress_loss_frac`: `stress_loss / notional`, from a frozen 3-scenario fair-
-  value stress grid (spot -20%, spot +20%, vol +10 vol-points;
-  `_fair_value_stress_loss`). Stress copies freeze `reference_spot` at the
-  issue/base snapshot, so explicit strike/barrier levels and implicit
-  snowball/autocall trigger levels all keep their *absolute* price level under
-  spot shocks. `worst_stress_id` records which scenario binds.
+  (`pricing_details.expected_loss_frac`), converted from face-value units to
+  cash-outlay units for funded notes.
+- `premium_at_risk_frac`: `max(cash_outlay - protected_amount, 0) /
+  cash_outlay`. A standalone option can therefore lose 100% of its premium;
+  a client paying 106 for a minimum redemption of 100 has a 6/106 contractual
+  funding gap rather than a false zero.
+- `stress_loss_frac`: `client_value_loss / cash_outlay`, where
+  `client_value_loss` is the worst client-long value decline on the frozen
+  three-scenario grid.
 
 This is a **continuous loss proxy**, explicitly not a mathematical worst-case
 bound: it blends an expectation, a premium-at-risk figure and a 3-point stress
 grid rather than enumerating the true worst path. `ClientLossMeasure` names
 this contract in code.
+
+## Funding, bilateral stress and lifecycle accounting
+
+`ProductSpec` separates risk exposure from client funding:
+
+```text
+notional                         # risk/participation exposure
+funding_style                    # premium_paid | funded_note
+face_value
+issue_price_pct
+protected_amount                 # deterministic payoff floor
+```
+
+Every quote additionally reports `cash_outlay`, `premium` and `dealer_fee`.
+For a standalone premium-paid option, `cash_outlay = premium = quoted price`.
+For a Level-0 funded note, issuance is at par
+(`issue_price_pct = 1`, `cash_outlay = face_value`) and `premium = null`.
+`CLIENT_CAPITAL` and `CONTRACT_CAPITAL` check cash outlay; portfolio risk limits
+continue to check exposure notional. A protection claim must cover actual cash
+outlay and be supported by the deterministic payoff floor.
+
+The current Level-0 grammar does **not** yet solve participation or coupon to a
+target par-note economics. Consequently a par funded note can have negative
+dealer inception margin. That value is retained, never clamped or relabelled
+as profit; a payoff solve-for is required before this can be treated as a
+production training objective.
+
+Stress quantities are directionally separate:
+
+```text
+client_pnl                  = stressed_fair_value - base_fair_value
+dealer_liability_pnl        = -client_pnl
+dealer_hedged_pnl           = dealer_liability_pnl + static_delta_hedge_pnl
+client_value_loss           = max(-client_pnl)
+dealer_unhedged_liability_loss = max(-dealer_liability_pnl)
+dealer_hedged_stress_loss   = max(-dealer_hedged_pnl)
+```
+
+The client loss gate uses `client_value_loss`. Dealer quote/risk-budget inputs
+use `dealer_hedged_stress_loss`, whose provenance is explicitly
+`static_delta_v1`. The scenario ledger enforces
+`client_pnl + dealer_liability_pnl == 0`; the static-delta proxy is not called a
+realised hedge result.
+
+Accepted dynamic trades record an issuance cashflow. Maturity, knock-out and
+autocall closures move the contract into `closed_positions`, append a
+settlement cashflow and a `LifecycleEvent`, and calculate client realised P&L
+and the equal-and-opposite dealer-liability P&L. Actual hedge trades,
+transaction costs and `dealer_total_pnl` remain unavailable. Accordingly the
+v3 reward schema represents `terminal_lifecycle_pnl` as `value=null,
+available=false`, not as a measured zero.
 
 ## Risk budget calibration
 
@@ -280,25 +359,21 @@ falls closest to the midpoint of the target band `[0.20, 0.40]`
 (`scenarios/mirage_csi/benchmark.yaml: risk_budget_calibration`). The full grid
 and a `"freeze this result before evaluating held-out episodes"` warning are
 written to `--report-output`; the selected budget is written to
-`--budget-output`. The frozen result on file
-(`data/derived/budget_calibration_report.json`) selects factor 0.003
-(`notional=600,000`, `net_delta=300,000`, `gross_delta=750,000`,
-`net_vega=60,000`, `stress_loss=300,000`), feasibility rate 38.7%, within
-target.
-
-`scenarios/mirage_csi/benchmark.yaml` commits to reporting 0.8x/1.0x/1.2x
-budget-scale sensitivity; as of this writing no dedicated sensitivity-run
-artifact exists yet (`data/derived/` has no file at these factors) -- this is
-outstanding protocol work, not a reported result.
+`--budget-output`. Both budget and margin calibration resolve the client's
+`round_overrides` separately for every snapshot and enumerate the domain for
+that resolved client.
 
 `calibrate-budget`, `run-episode` and `run-manifest` all accept an optional
 `--quote-policy-json` (a JSON-serialised `mirage.pricing.QuotePolicy`, e.g.
 `data/derived/quote_policy.v2.candidate.json`): when given, quotes are priced
 with that policy instead of `QuotePolicy()`'s code defaults (`calibrate-budget`
 passes it through to `calibrate_risk_budget`'s new `policy` kwarg;
-`run-episode`/`run-manifest` pass it to `LongHorizonEnvironment`, which already
-had a `quote_policy` parameter). Omitting the flag leaves every existing byte-
-for-byte behaviour unchanged.
+`run-episode`/`run-manifest` pass it to `LongHorizonEnvironment`).
+
+All calibration numbers created before the funding, bilateral-stress and quote
+equilibrium migration are stale and must not be used for a result claim.
+`data/derived/*v2*` files are historical inputs, not a current frozen v3
+calibration bundle.
 
 ## `dealer_margin` economics
 
@@ -311,7 +386,7 @@ F/N`):
   0, 1)` over the structure's MC touch/knock-in/knock-out event probabilities.
 - `B = 2 * 1.96 * pv_se_frac`, an approximate 95% Monte Carlo uncertainty band
   on the price estimate, as a fraction of notional.
-- `L = stress_loss / N`.
+- `L = dealer_hedged_stress_loss / N`.
 - `Q = post_notional / capacity_notional` (post-trade notional utilization;
   `capacity_notional = risk_budget.notional`).
 
@@ -320,9 +395,12 @@ r_c = clip(a_f*f + a_v*V + a_p*P + a_b*B,                         0, client_cap)
 r_h = clip(b_f*f + b_v*V + b_p*P + b_b*B + b_l*L + b_q*Q^2,        0, hedge_cap)
 suitability = clip(s_type^w_type * s_protect^w_protect
                     * s_maturity^w_maturity * s_hurdle^w_hurdle,   0, 1)
-client_price   = F + N * r_c * suitability
+suggested_price = F + N * r_c * suitability
+cash_outlay     = suggested_price                    # premium_paid
+cash_outlay     = face_value * issue_price_pct       # funded_note
 hedging_cost   = F + N * r_h
-dealer_margin  = N * (r_c * suitability - r_h)      # can be negative; never truncated
+dealer_fee     = cash_outlay - F
+dealer_margin  = cash_outlay - hedging_cost          # can be negative; never truncated
 ```
 
 `suitability` (draft_opus §3.2) is a four-factor product of client fit: product
@@ -334,6 +412,15 @@ client-side markup and (independently) feeds the `CONTRACT_*` gate, so a
 mis-sold product is penalised on price and can still be hard-blocked at
 settlement. The `b_q*Q^2` term makes "always quote the maximum notional" a
 strictly dominated strategy as utilization approaches the risk budget.
+
+For premium-paid products, price, hurdle probability and hurdle suitability
+form a fixed point. `solve_quote_equilibrium` uses a bounded bisection plus a
+canonical refinement and returns price/probability residuals. Runtime fails
+closed on non-convergence. `evaluate_quote_policy` calls the same solver and
+counts non-converged candidates rather than silently using the old two-pass
+approximation. Funded notes pass through the same function at their fixed par
+cash price. `MarketSnapshot.trend_alpha` is propagated into `MarketState` and
+is part of the hurdle cache key.
 
 The coefficients currently frozen in code (`mirage.pricing.QuotePolicy`
 defaults) are: `a_f=0.030, a_v=0.25, a_p=0.002, a_b=0.75`,
@@ -356,26 +443,10 @@ market snapshots, runs `calibrate_quote_policy`, and additionally reports
 0.8x/1.0x/1.2x sensitivity of the *selected* policy (scaling its `a_*` a
 second time on top of the calibrated factor).
 
-**Development-set calibration result** (`data/derived/quote_policy_calibration_report.json`,
-reproducible via the `calibrate-margin` command below): 12 snapshots from
-`CSI1000_2023H1` + `CSI500_2023H1` (6 rounds each), 30 sampled lattice
-candidates per snapshot (`n_dev_cases=360`, seed 42) select an overall `a_*`
-scale of **0.9x** the code defaults above, giving a **36.9%** positive-margin
-rate (within the 20-60% target band) and a non-degenerate margin ranking.
-Sensitivity of that selected (0.9x) policy: scaling its `a_*` by a further
-0.8x collapses the positive-margin rate to 4.2% (*outside* the target band --
-the calibration is not robust to a further 20% marquee-coefficient cut), 1.0x
-reproduces the selected 36.9%, and 1.2x gives 47.8% (still within band); the
-ranking stays non-degenerate at all three points. The run took about 8.5
-minutes wall time. The resulting policy is written to
-`data/derived/quote_policy.v2.candidate.json` as a **candidate** -- it is not
-yet substituted for `mirage.pricing.QuotePolicy`'s code defaults (which are
-still the coefficients quoted above); `--quote-policy-json` on `run-episode` /
-`run-manifest` / `calibrate-budget` is how a run opts into pricing with this
-candidate instead of the code defaults. Freezing this specific candidate as
-the evaluation-time default (or re-running the calibration with different
-episodes/sampling before 7/24) is a protocol decision, not automated by this
-command.
+No post-migration calibration result is frozen in this revision. A new bundle
+must include the input manifest, implementation/run fingerprint, per-round
+client resolution, selected policy/budget, the full grid and sensitivity
+report before held-out evaluation begins.
 
 ## LLM-native roles
 
@@ -603,9 +674,9 @@ at temperature 0). It makes two narrower, implemented claims instead:
   identically every time, with no LLM call involved.
 - **`conversation_replay`**: env-role dialogue is reproducible from the
   `EnvResponseCache` JSONL artifact (keyed by `role_id|model|temperature|
-  seed|canonical(messages)`): replaying the same request sequence against the
-  same cache file reproduces the exact same NPC replies byte-for-byte, without
-  re-calling any model.
+  seed|max_tokens|output_schema|inference_contract|canonical(messages)`):
+  replaying the same request sequence against the same cache file reproduces
+  the exact same NPC replies byte-for-byte, without re-calling any model.
 
 ## Reproduction
 
@@ -663,8 +734,10 @@ python -m mirage.benchmark_cli make-manifest \
   --models gpt-4o claude-sonnet deepseek-v4-flash minimax \
   --output outputs/experiment_manifest.json
 
-# Execute a frozen manifest sequentially; reruns resume (existing output
-# files are skipped) and a single failed job never aborts the batch.
+# Execute a frozen manifest sequentially. Reruns skip only complete outputs
+# whose run/job fingerprints still match. Stale or partial files are
+# quarantined and rerun; writes are atomic. A single failed job does not abort
+# the batch, and aggregate refuses mixed run fingerprints.
 # --quote-policy-json is optional (default QuotePolicy if omitted).
 python -m mirage.benchmark_cli run-manifest market_snapshots.csv \
   --manifest outputs/experiment_manifest.json \

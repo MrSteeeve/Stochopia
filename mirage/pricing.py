@@ -9,6 +9,7 @@ import math
 import random
 from dataclasses import dataclass, replace
 
+from .cache import BoundedLRUCache
 from .products import ClientProfile, MarketState, ProductSpec
 
 MARKUP = 1.03
@@ -572,8 +573,9 @@ def expected_payoff(product: ProductSpec, market: MarketState) -> float | None:
         else:
             e_points = math.exp(mu * T) * bs_put(S, K, T, mu, sigma, q)
         if product.principal_protected:
-            return product.notional * (
-                1.0 + product.participation_rate * e_points / reference
+            return (
+                product.effective_face_value
+                + product.notional * product.participation_rate * e_points / reference
             )
         return m * product.participation_rate * e_points
 
@@ -600,8 +602,9 @@ def expected_payoff(product: ProductSpec, market: MarketState) -> float | None:
             already_touched=product.barrier_touched,
         )
         if product.principal_protected:
-            return product.notional * (
-                1.0 + product.participation_rate * e_points / reference
+            return (
+                product.effective_face_value
+                + product.notional * product.participation_rate * e_points / reference
             )
         return m * product.participation_rate * e_points
 
@@ -731,8 +734,9 @@ def price_product(product: ProductSpec, market: MarketState) -> dict | None:
         greeks["vega_pct"] = greeks["vega"] / reference
 
         if product.principal_protected:
-            fair_value = product.notional * (
-                math.exp(-r * T) + participation * price_points / reference
+            fair_value = (
+                product.effective_face_value * math.exp(-r * T)
+                + product.notional * participation * price_points / reference
             )
         else:
             fair_value = m * participation * price_points
@@ -786,8 +790,9 @@ def price_product(product: ProductSpec, market: MarketState) -> dict | None:
         }
 
         if product.principal_protected:
-            fair_value = product.notional * (
-                math.exp(-r * T) + participation * price_points / reference
+            fair_value = (
+                product.effective_face_value * math.exp(-r * T)
+                + product.notional * participation * price_points / reference
             )
         else:
             fair_value = m * participation * price_points
@@ -966,7 +971,8 @@ def hurdle_hit_prob(
     Broadie-Glasserman-Kou 精确修正，属销售端合理近似）。
 
     定义：
-        realized_annual = (payoff_yuan − client_price) / notional × 12 / t_months
+        realized_annual = (payoff_yuan − client_price) / client_price
+                          × 12 / t_months
     其中 t_months 为从当前估值日到提前赎回/到期的剩余月数。
     """
     if (
@@ -993,17 +999,26 @@ def hurdle_hit_prob(
     participation = product.participation_rate
     protected = product.principal_protected
     notional = product.notional
+    protected_floor_frac = product.effective_protected_amount / notional
+    if (
+        isinstance(client_price, bool)
+        or not isinstance(client_price, (int, float))
+        or not math.isfinite(client_price)
+        or client_price <= 0
+    ):
+        raise PricingError("hurdle_hit_prob requires a positive finite client_price")
 
     # payoff_frac ≥ required_frac ⟺ realized_annual ≥ hurdle_annual（定期到期精确）
-    required_frac = client_price / notional + hurdle_annual * T
+    price_frac = client_price / notional
+    required_frac = price_frac * (1.0 + hurdle_annual * T)
 
     if product.product_type in _VANILLA_TYPES:
         is_call = product.product_type == "vanilla_call"
 
         if is_call:
             if protected:
-                # payoff_frac = 1 + participation * max(S_T − K, 0) / reference
-                excess = required_frac - 1.0
+                # payoff_frac = protected floor + option participation.
+                excess = required_frac - protected_floor_frac
                 if excess <= 0.0:
                     return 1.0  # 保本地板已超过门槛
                 S_T_star = K + excess * reference / participation
@@ -1024,11 +1039,12 @@ def hurdle_hit_prob(
 
         else:  # vanilla_put
             if protected:
-                # payoff_frac = 1 + participation * max(K − S_T, 0) / reference
-                excess = required_frac - 1.0
+                excess = required_frac - protected_floor_frac
                 if excess <= 0.0:
                     return 1.0
-                max_payoff_frac = 1.0 + participation * K / reference
+                max_payoff_frac = (
+                    protected_floor_frac + participation * K / reference
+                )
                 if required_frac > max_payoff_frac + 1e-12:
                     return 0.0
                 S_T_star = K - excess * reference / participation
@@ -1079,6 +1095,7 @@ def _mc_hit_prob(
     notional = product.notional
     participation = product.participation_rate
     protected = product.principal_protected
+    protected_floor_frac = product.effective_protected_amount / notional
 
     dt = 1.0 / 12.0
     drift_term = (drift - q - 0.5 * sigma * sigma) * dt
@@ -1127,7 +1144,9 @@ def _mc_hit_prob(
                 barrier_type == "knock_in" and touched
             )
             option_part = opt_frac if active else 0.0
-            cashflow_frac = (1.0 + option_part) if protected else option_part
+            cashflow_frac = (
+                protected_floor_frac + option_part if protected else option_part
+            )
             term_t = remaining_months
 
         elif product.product_type == "snowball":
@@ -1197,14 +1216,17 @@ def _mc_hit_prob(
         else:
             continue
 
+        price_frac = client_price / notional
         if term_t <= 0:
             realized_annual = (
                 math.inf
-                if cashflow_frac >= client_price / notional
+                if cashflow_frac >= price_frac
                 else -math.inf
             )
         else:
-            realized_annual = (cashflow_frac - client_price / notional) * 12.0 / term_t
+            realized_annual = (
+                (cashflow_frac - price_frac) / price_frac * 12.0 / term_t
+            )
         if realized_annual >= hurdle_annual - 1e-12:
             hits += 1
 
@@ -1511,7 +1533,8 @@ class MCDiagnostics:
 
 
 # 结构键 -> MCDiagnostics 的进程内缓存；oracle 枚举时同结构不同名义共享一次算力。
-_DIAG_CACHE: dict = {}
+# Bounded so randomised task generation cannot grow a worker forever.
+_DIAG_CACHE: BoundedLRUCache[tuple, MCDiagnostics] = BoundedLRUCache(maxsize=4096)
 
 
 def _diag_cache_key(product: ProductSpec, market: MarketState, n_paths: int, seed: int) -> tuple:
@@ -1526,6 +1549,10 @@ def _diag_cache_key(product: ProductSpec, market: MarketState, n_paths: int, see
         product.coupon_rate,
         product.participation_rate,
         product.principal_protected,
+        product.effective_funding_style,
+        product.effective_face_value / product.notional,
+        product.effective_issue_price_pct,
+        product.effective_protected_amount / product.notional,
         product.reference_spot,
         product.barrier_touched,
         product.knock_in_active,
@@ -1559,6 +1586,7 @@ def _mc_vanilla_barrier_stats(
     T = remaining_months / 12.0
     participation = product.participation_rate
     protected = product.principal_protected
+    protected_floor_frac = product.effective_protected_amount / product.notional
     K_frac = product.strike_pct
     disc = math.exp(-r * T)
 
@@ -1616,9 +1644,15 @@ def _mc_vanilla_barrier_stats(
         else:
             opt_part = opt
 
-        payoff_frac = (1.0 + opt_part) if protected else opt_part
+        payoff_frac = (
+            protected_floor_frac + opt_part if protected else opt_part
+        )
         pvs.append(payoff_frac * disc)
-        losses.append(max(0.0, 1.0 - payoff_frac) if protected else 0.0)
+        losses.append(
+            max(0.0, protected_floor_frac - payoff_frac)
+            if protected
+            else 0.0
+        )
 
     n = n_paths
     pv_mean = sum(pvs) / n
@@ -1755,6 +1789,34 @@ class QuotePolicy:
     suit_whitelist_miss: float = 0.20
     suit_protection_miss: float = 0.10
 
+    def __post_init__(self) -> None:
+        numeric = {
+            name: value
+            for name, value in self.__dict__.items()
+            if name != "diagnostic_paths"
+        }
+        for name, value in numeric.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise PricingError(f"QuotePolicy.{name} must be finite")
+            if value < 0:
+                raise PricingError(f"QuotePolicy.{name} must be non-negative")
+        if (
+            isinstance(self.diagnostic_paths, bool)
+            or not isinstance(self.diagnostic_paths, int)
+            or self.diagnostic_paths < 1
+        ):
+            raise PricingError("QuotePolicy.diagnostic_paths must be a positive integer")
+        if self.client_cap <= 0 or self.hedge_cap <= 0:
+            raise PricingError("QuotePolicy caps must be positive")
+        if not 0 <= self.suit_whitelist_miss <= 1:
+            raise PricingError("QuotePolicy.suit_whitelist_miss must be in [0, 1]")
+        if not 0 <= self.suit_protection_miss <= 1:
+            raise PricingError("QuotePolicy.suit_protection_miss must be in [0, 1]")
+
 
 @dataclass(frozen=True)
 class QuoteEconomics:
@@ -1768,6 +1830,13 @@ class QuoteEconomics:
     risk_adjusted_margin: float
     suitability: float
     breakdown: dict
+    funding_style: str
+    face_value: float
+    issue_price_pct: float | None
+    cash_outlay: float
+    premium: float | None
+    protected_amount: float
+    dealer_fee: float
 
 
 def _suitability(
@@ -1836,7 +1905,8 @@ def quote_economics(
     pricing: dict,
     diag: MCDiagnostics,
     *,
-    stress_loss: float,
+    stress_loss: float | None = None,
+    dealer_stress_loss: float | None = None,
     post_notional: float,
     capacity_notional: float,
     policy: QuotePolicy,
@@ -1849,13 +1919,22 @@ def quote_economics(
     dealer_margin = N·(r_c·suit − r_h)（允许为负，不截断）。
     Q²（容量冲击）进 r_h，破除"永远上满 100% 名义"哑策略。
     """
+    if dealer_stress_loss is None:
+        if stress_loss is None:
+            raise PricingError("dealer_stress_loss is required")
+        # Compatibility for direct v2 callers.  Runtime v3 always supplies the
+        # explicitly dealer-sided quantity.
+        dealer_stress_loss = float(stress_loss)
+    if not math.isfinite(dealer_stress_loss) or dealer_stress_loss < 0:
+        raise PricingError("dealer_stress_loss must be a finite non-negative number")
+
     N = product.notional
     F = pricing["fair_value"]
     f = F / N if N else 0.0
     V = abs(pricing["greeks"].get("vega_pct", 0.0))
     P = _path_dependence(diag.event_probs)
     B = 2.0 * 1.96 * diag.pv_se_frac
-    L = stress_loss / N if N else 0.0
+    L = dealer_stress_loss / N if N else 0.0
     Q = post_notional / capacity_notional if capacity_notional > 0 else 0.0
 
     r_c = _clip(policy.a_f * f + policy.a_v * V + policy.a_p * P + policy.a_b * B, 0.0, policy.client_cap)
@@ -1873,11 +1952,28 @@ def quote_economics(
     suit, suit_detail = _suitability(product, client, pricing, policy)
     r_c_eff = r_c * suit
 
-    client_price = F + N * r_c_eff
+    suggested_client_price = F + N * r_c_eff
+    funding_style = product.effective_funding_style
+    face_value = product.effective_face_value
+    issue_price_pct = product.effective_issue_price_pct
+    protected_amount = product.effective_protected_amount
+    if funding_style == "funded_note":
+        if issue_price_pct is None:
+            raise PricingError("funded_note requires issue_price_pct")
+        cash_outlay = face_value * issue_price_pct
+        premium = None
+    elif funding_style == "premium_paid":
+        cash_outlay = suggested_client_price
+        premium = cash_outlay
+    else:
+        raise PricingError(f"unknown funding style: {funding_style!r}")
+
+    client_price = cash_outlay
     hedging_cost = F + N * r_h
-    dealer_margin = N * (r_c_eff - r_h)
+    dealer_fee = cash_outlay - F
+    dealer_margin = cash_outlay - hedging_cost
     margin_rate = dealer_margin / N if N else 0.0
-    risk_adjusted_margin = dealer_margin / max(stress_loss, 0.01 * N)
+    risk_adjusted_margin = dealer_margin / max(dealer_stress_loss, 0.01 * N)
 
     breakdown = {
         "f": f,
@@ -1890,7 +1986,16 @@ def quote_economics(
         "r_h": r_h,
         "r_c_effective": r_c_eff,
         "markup_amount": N * r_c_eff,
+        "suggested_client_price": suggested_client_price,
         "hedge_amount": N * r_h,
+        "dealer_stress_loss": dealer_stress_loss,
+        "funding_style": funding_style,
+        "face_value": face_value,
+        "issue_price_pct": issue_price_pct,
+        "cash_outlay": cash_outlay,
+        "premium": premium,
+        "protected_amount": protected_amount,
+        "dealer_fee": dealer_fee,
         "suitability": suit,
         **{f"suit_{k}": v for k, v in suit_detail.items()},
     }
@@ -1904,6 +2009,204 @@ def quote_economics(
         risk_adjusted_margin=risk_adjusted_margin,
         suitability=suit,
         breakdown=breakdown,
+        funding_style=funding_style,
+        face_value=face_value,
+        issue_price_pct=issue_price_pct,
+        cash_outlay=cash_outlay,
+        premium=premium,
+        protected_amount=protected_amount,
+        dealer_fee=dealer_fee,
+    )
+
+
+@dataclass(frozen=True)
+class QuoteEquilibrium:
+    """Converged quote/hurdle/suitability fixed point."""
+
+    economics: QuoteEconomics
+    hurdle_hit_prob: float | None
+    converged: bool
+    iterations: int
+    price_residual: float
+    probability_residual: float | None
+    solver_version: str = "quote-equilibrium-bisection-v1"
+
+
+def solve_quote_equilibrium(
+    product: ProductSpec,
+    market: MarketState,
+    client: ClientProfile,
+    pricing: dict,
+    diag: MCDiagnostics,
+    *,
+    dealer_stress_loss: float,
+    post_notional: float,
+    capacity_notional: float,
+    policy: QuotePolicy,
+    hurdle_probability=None,
+    price_tolerance: float | None = None,
+    probability_tolerance: float = 1e-10,
+    max_iterations: int = 80,
+) -> QuoteEquilibrium:
+    """Solve the only runtime/calibration quote pipeline.
+
+    Premium-paid products have a genuine fixed point because the hurdle
+    probability depends on price and price depends on hurdle suitability.  The
+    mapping is bounded by ``[fair_value, fair_value + N*client_cap]`` and is
+    solved by bisection.  A funded note has a contractually fixed issue cash
+    outlay, so the same function evaluates its single consistent point.
+
+    ``hurdle_probability`` is an optional cache-aware callable taking a cash
+    price.  The default calls :func:`hurdle_hit_prob` directly.
+    """
+
+    if (
+        isinstance(max_iterations, bool)
+        or not isinstance(max_iterations, int)
+        or max_iterations < 1
+    ):
+        raise PricingError("max_iterations must be a positive integer")
+    if price_tolerance is None:
+        price_tolerance = max(1e-8 * max(product.notional, 1.0), 1e-8)
+    if not math.isfinite(price_tolerance) or price_tolerance <= 0:
+        raise PricingError("price_tolerance must be positive and finite")
+    if not math.isfinite(probability_tolerance) or probability_tolerance <= 0:
+        raise PricingError("probability_tolerance must be positive and finite")
+
+    probability_fn = hurdle_probability or (
+        lambda cash_price: hurdle_hit_prob(
+            product,
+            market,
+            client.min_return_pct,
+            cash_price,
+        )
+    )
+
+    def evaluate_at(cash_price: float) -> tuple[float | None, QuoteEconomics]:
+        probability = probability_fn(cash_price)
+        local_pricing = dict(pricing)
+        local_pricing["hurdle_hit_prob"] = probability
+        economics = quote_economics(
+            local_pricing,
+            diag,
+            dealer_stress_loss=dealer_stress_loss,
+            post_notional=post_notional,
+            capacity_notional=capacity_notional,
+            policy=policy,
+            product=product,
+            client=client,
+        )
+        return probability, economics
+
+    if product.effective_funding_style == "funded_note":
+        issue_pct = product.effective_issue_price_pct
+        if issue_pct is None:
+            raise PricingError("funded_note requires issue_price_pct")
+        fixed_price = product.effective_face_value * issue_pct
+        probability, economics = evaluate_at(fixed_price)
+        probability_check = probability_fn(economics.client_price)
+        probability_residual = (
+            None
+            if probability is None or probability_check is None
+            else abs(probability_check - probability)
+        )
+        return QuoteEquilibrium(
+            economics=economics,
+            hurdle_hit_prob=probability_check,
+            converged=(
+                abs(economics.client_price - fixed_price) <= price_tolerance
+                and (
+                    probability_residual is None
+                    or probability_residual <= probability_tolerance
+                )
+            ),
+            iterations=1,
+            price_residual=abs(economics.client_price - fixed_price),
+            probability_residual=probability_residual,
+        )
+
+    fair_value = float(pricing["fair_value"])
+    lower = fair_value
+    upper = fair_value + product.notional * policy.client_cap
+
+    def residual(price: float) -> tuple[float, float | None, QuoteEconomics]:
+        probability, economics = evaluate_at(price)
+        return economics.client_price - price, probability, economics
+
+    low_residual, _, _ = residual(lower)
+    high_residual, _, _ = residual(upper)
+    if low_residual < -price_tolerance or high_residual > price_tolerance:
+        raise PricingError("quote equilibrium is not bracketed by policy caps")
+
+    iterations = 0
+    midpoint = (lower + upper) / 2.0
+    midpoint_probability: float | None = None
+    midpoint_economics: QuoteEconomics | None = None
+    midpoint_residual = math.inf
+    while iterations < max_iterations:
+        iterations += 1
+        midpoint = (lower + upper) / 2.0
+        midpoint_residual, midpoint_probability, midpoint_economics = residual(midpoint)
+        if (
+            abs(midpoint_residual) <= price_tolerance
+            and upper - lower <= 2.0 * price_tolerance
+        ):
+            break
+        if midpoint_residual > 0:
+            lower = midpoint
+        else:
+            upper = midpoint
+
+    if midpoint_economics is None:
+        raise PricingError("quote equilibrium solver produced no candidate")
+
+    # Canonicalise the returned pair: the stored probability must be evaluated
+    # at the returned price, and re-running economics with that probability
+    # must reproduce the price.  This refinement also detects a discontinuous
+    # empirical-MC mapping that has no admissible fixed point.
+    anchor_price = midpoint_economics.client_price
+    final_probability: float | None = None
+    final_economics = midpoint_economics
+    probability_residual: float | None = None
+    final_price_residual = math.inf
+    for _ in range(16):
+        probability_at_anchor, economics_at_anchor = evaluate_at(anchor_price)
+        probability_at_output = probability_fn(economics_at_anchor.client_price)
+        final_price_residual = abs(economics_at_anchor.client_price - anchor_price)
+        probability_residual = (
+            None
+            if probability_at_anchor is None or probability_at_output is None
+            else abs(probability_at_output - probability_at_anchor)
+        )
+        final_probability = probability_at_output
+        final_economics = economics_at_anchor
+        if (
+            final_price_residual <= price_tolerance
+            and (
+                probability_residual is None
+                or probability_residual <= probability_tolerance
+            )
+        ):
+            # If the probability is unchanged at the output price, the current
+            # economics object was already computed from the canonical value.
+            break
+        anchor_price = economics_at_anchor.client_price
+
+    converged = (
+        abs(midpoint_residual) <= price_tolerance
+        and final_price_residual <= price_tolerance
+        and (
+            probability_residual is None
+            or probability_residual <= probability_tolerance
+        )
+    )
+    return QuoteEquilibrium(
+        economics=final_economics,
+        hurdle_hit_prob=final_probability,
+        converged=converged,
+        iterations=iterations,
+        price_residual=max(abs(midpoint_residual), final_price_residual),
+        probability_residual=probability_residual,
     )
 
 
@@ -1921,6 +2224,8 @@ class ClientLossMeasure:
     stress_loss_frac: float
     observed_loss_frac: float
     worst_stress_id: str
+    cash_outlay: float | None = None
+    protected_amount: float | None = None
 
 
 def client_loss_measure(
@@ -1929,6 +2234,8 @@ def client_loss_measure(
     stress_loss: float,
     *,
     worst_stress_id: str,
+    cash_outlay: float | None = None,
+    protected_amount: float | None = None,
 ) -> ClientLossMeasure:
     """expected / premium / stress 三路损失取 max 作为连续观测损失。
 
@@ -1944,8 +2251,43 @@ def client_loss_measure(
     # 的基准定价口径，使这条硬约束的含义在 QuotePolicy 冻结、重标定或做敏感性
     # 分析时都保持不变。
     expected = float(pricing.get("pricing_details", {}).get("expected_loss_frac", 0.0))
-    premium = float(pricing.get("loss_frac", 0.0))
-    stress = stress_loss / product.notional if product.notional else 0.0
+    resolved_cash = (
+        pricing.get("cash_outlay") if cash_outlay is None else cash_outlay
+    )
+    resolved_protected = (
+        pricing.get("protected_amount")
+        if protected_amount is None
+        else protected_amount
+    )
+    if resolved_cash is None:
+        # Frozen v2 compatibility path for direct callers that have not yet
+        # entered the quote/funding pipeline.
+        premium = float(pricing.get("loss_frac", 0.0))
+        stress = stress_loss / product.notional if product.notional else 0.0
+        cash_value: float | None = None
+        protected_value: float | None = None
+    else:
+        cash_value = float(resolved_cash)
+        if not math.isfinite(cash_value) or cash_value <= 0:
+            raise PricingError("cash_outlay must be a positive finite number")
+        protected_value = float(
+            product.effective_protected_amount
+            if resolved_protected is None
+            else resolved_protected
+        )
+        if not math.isfinite(protected_value) or protected_value < 0:
+            raise PricingError("protected_amount must be a finite non-negative number")
+        # This explicitly catches "pay 106, guaranteed 100": the contractual
+        # shortfall is 6/106 rather than silently zero.
+        premium = max(cash_value - protected_value, 0.0) / cash_value
+        stress = stress_loss / cash_value
+        # pricing_details expresses expected note loss as a notional fraction.
+        # Convert it to the client's actual funding denominator.
+        expected = (
+            expected * product.effective_face_value / cash_value
+            if product.effective_funding_style == "funded_note"
+            else expected
+        )
     observed = max(expected, premium, stress)
     return ClientLossMeasure(
         expected_loss_frac=expected,
@@ -1953,6 +2295,8 @@ def client_loss_measure(
         stress_loss_frac=stress,
         observed_loss_frac=observed,
         worst_stress_id=worst_stress_id,
+        cash_outlay=cash_value,
+        protected_amount=protected_value,
     )
 
 
@@ -1964,14 +2308,56 @@ def client_loss_measure(
 _STRESS_SCENARIOS = (("spot_down_20", 0.8, 0.0), ("spot_up_20", 1.2, 0.0), ("vol_up_10", 1.0, 0.10))
 
 
-def _fair_value_stress_loss(product: ProductSpec, market: MarketState) -> tuple[float, str]:
-    """压力网格下 fair value 的最大跌幅（人民币）及最坏情景 id。"""
+@dataclass(frozen=True)
+class StressScenarioPnL:
+    """Zero-sum unhedged liability P&L for one deterministic stress."""
+
+    stress_id: str
+    base_fair_value: float
+    stressed_fair_value: float
+    client_pnl: float
+    dealer_liability_pnl: float
+    hedge_pnl: float
+    dealer_hedged_pnl: float
+
+
+@dataclass(frozen=True)
+class StressLossProfile:
+    """Separate client-long and dealer-short loss conventions."""
+
+    client_value_loss: float
+    client_worst_stress_id: str
+    dealer_unhedged_liability_loss: float
+    dealer_worst_stress_id: str
+    dealer_hedged_stress_loss: float
+    dealer_hedged_worst_stress_id: str
+    hedge_model: str
+    scenarios: tuple[StressScenarioPnL, ...]
+
+
+def fair_value_stress_profile(
+    product: ProductSpec,
+    market: MarketState,
+) -> StressLossProfile:
+    """Return both sides of the frozen stress grid without sign conflation."""
+
     base = price_product(product, market)
     if base is None:
-        return 0.0, ""
+        return StressLossProfile(
+            0.0, "", 0.0, "", 0.0, "", "static_delta_v1", ()
+        )
     base_fv = base["fair_value"]
-    worst_loss = 0.0
-    worst_id = ""
+    # ``price_product`` always supplies greeks in production.  The defensive
+    # fallback also keeps stress-path instrumentation/mocks focused on contract
+    # anchoring without inventing a hedge.
+    delta_dollars = float(base.get("greeks", {}).get("delta", 0.0)) * product.notional
+    client_worst = 0.0
+    client_worst_id = ""
+    dealer_worst = 0.0
+    dealer_worst_id = ""
+    dealer_hedged_worst = 0.0
+    dealer_hedged_worst_id = ""
+    scenarios: list[StressScenarioPnL] = []
     for stress_id, spot_factor, vol_add in _STRESS_SCENARIOS:
         # 压力仅扰动现货/波动率，不改写合约条款。对旧式
         # reference_spot=None 的发行时产品，在压力副本上显式冻结
@@ -1994,11 +2380,54 @@ def _fair_value_stress_loss(product: ProductSpec, market: MarketState) -> tuple[
         stressed = price_product(stressed_product, stressed_market)
         if stressed is None:
             continue
-        loss = max(base_fv - stressed["fair_value"], 0.0)
-        if loss > worst_loss:
-            worst_loss = loss
-            worst_id = stress_id
-    return worst_loss, worst_id
+        stressed_fv = float(stressed["fair_value"])
+        client_pnl = stressed_fv - base_fv
+        dealer_pnl = -client_pnl
+        spot_return = stressed_market.spot / market.spot - 1.0
+        # A dealer short the client liability holds +client-delta of underlying
+        # to offset its negative liability delta at inception.
+        hedge_pnl = delta_dollars * spot_return
+        dealer_hedged_pnl = dealer_pnl + hedge_pnl
+        scenarios.append(
+            StressScenarioPnL(
+                stress_id=stress_id,
+                base_fair_value=base_fv,
+                stressed_fair_value=stressed_fv,
+                client_pnl=client_pnl,
+                dealer_liability_pnl=dealer_pnl,
+                hedge_pnl=hedge_pnl,
+                dealer_hedged_pnl=dealer_hedged_pnl,
+            )
+        )
+        client_loss = max(-client_pnl, 0.0)
+        dealer_loss = max(-dealer_pnl, 0.0)
+        dealer_hedged_loss = max(-dealer_hedged_pnl, 0.0)
+        if client_loss > client_worst:
+            client_worst = client_loss
+            client_worst_id = stress_id
+        if dealer_loss > dealer_worst:
+            dealer_worst = dealer_loss
+            dealer_worst_id = stress_id
+        if dealer_hedged_loss > dealer_hedged_worst:
+            dealer_hedged_worst = dealer_hedged_loss
+            dealer_hedged_worst_id = stress_id
+    return StressLossProfile(
+        client_value_loss=client_worst,
+        client_worst_stress_id=client_worst_id,
+        dealer_unhedged_liability_loss=dealer_worst,
+        dealer_worst_stress_id=dealer_worst_id,
+        dealer_hedged_stress_loss=dealer_hedged_worst,
+        dealer_hedged_worst_stress_id=dealer_hedged_worst_id,
+        hedge_model="static_delta_v1",
+        scenarios=tuple(scenarios),
+    )
+
+
+def _fair_value_stress_loss(product: ProductSpec, market: MarketState) -> tuple[float, str]:
+    """Deprecated v2 alias for the client-long value-loss convention."""
+
+    profile = fair_value_stress_profile(product, market)
+    return profile.client_value_loss, profile.client_worst_stress_id
 
 
 def scale_quote_policy_markup(policy: QuotePolicy, factor: float) -> QuotePolicy:
@@ -2051,23 +2480,32 @@ def evaluate_quote_policy(
     """
     margins: list[float] = []
     infos: list[tuple[ProductSpec, float]] = []
+    nonconverged = 0
     for product, market, client in dev_cases:
         pricing = evaluate_product(product, market)
         if pricing is None:
             continue
         diag = mc_diagnostics(product, market, n_paths=policy.diagnostic_paths, seed=seed)
-        stress_loss, _ = _fair_value_stress_loss(product, market)
+        stress = fair_value_stress_profile(product, market)
         capacity = capacity_fn(client) if capacity_fn is not None else client.capital
-        qe = quote_economics(
+        equilibrium = solve_quote_equilibrium(
+            product,
+            market,
+            client,
             pricing,
             diag,
-            stress_loss=stress_loss,
+            dealer_stress_loss=stress.dealer_hedged_stress_loss,
             post_notional=product.notional,
             capacity_notional=capacity,
             policy=policy,
-            product=product,
-            client=client,
         )
+        if not equilibrium.converged:
+            # Runtime fails this quote closed.  Calibration must mirror that
+            # outcome without aborting the whole development grid.
+            nonconverged += 1
+            margins.append(-math.inf)
+            continue
+        qe = equilibrium.economics
         margins.append(qe.dealer_margin)
         infos.append((product, qe.dealer_margin))
     n = len(margins)
@@ -2076,6 +2514,7 @@ def evaluate_quote_policy(
         "positive_margin_rate": positive_rate,
         "ranking_nondegenerate": _ranking_nondegenerate(infos),
         "n_cases": n,
+        "nonconverged_quotes": nonconverged,
     }
 
 

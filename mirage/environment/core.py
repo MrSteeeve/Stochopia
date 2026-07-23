@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -29,6 +30,8 @@ from .types import (
     Observation,
     RequestQuote,
     RewardComponents,
+    RewardTerm,
+    REWARD_SCHEMA_VERSION,
     Skip,
     StepTransition,
     SubmitDesign,
@@ -36,8 +39,8 @@ from .types import (
 )
 
 
-ENVIRONMENT_VERSION = "v3-spine-level0"
-PRICING_VERSION = "benchmark-pricing-v2"
+ENVIRONMENT_VERSION = "v3-spine-level0.1-economic-ledger"
+PRICING_VERSION = "benchmark-pricing-v3-funding-stress-equilibrium"
 
 
 def _jsonable(value: Any) -> Any:
@@ -58,7 +61,7 @@ def _jsonable(value: Any) -> Any:
         return str(value)
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
-    return repr(value)
+    raise TypeError(f"unsupported canonical value: {type(value).__name__}")
 
 
 def _stable_hash(value: Any) -> str:
@@ -116,10 +119,24 @@ class MirageStructurerEnv:
         if not isinstance(task, EpisodeTask):
             raise TypeError("task must be an EpisodeTask")
         self.task = task
-        self.query_cost = float(query_cost)
-        self.quote_cost = float(quote_cost)
-        self.invalid_action_cost = float(invalid_action_cost)
-        self.skip_cost = float(skip_cost)
+        costs = {
+            "query_cost": query_cost,
+            "quote_cost": quote_cost,
+            "invalid_action_cost": invalid_action_cost,
+            "skip_cost": skip_cost,
+        }
+        converted_costs: dict[str, float] = {}
+        for name, value in costs.items():
+            if isinstance(value, bool):
+                raise TypeError(f"{name} must be a finite number")
+            converted = float(value)
+            if not math.isfinite(converted):
+                raise ValueError(f"{name} must be finite")
+            converted_costs[name] = converted
+        self.query_cost = converted_costs["query_cost"]
+        self.quote_cost = converted_costs["quote_cost"]
+        self.invalid_action_cost = converted_costs["invalid_action_cost"]
+        self.skip_cost = converted_costs["skip_cost"]
         if (
             isinstance(max_steps_per_round, bool)
             or not isinstance(max_steps_per_round, int)
@@ -180,13 +197,14 @@ class MirageStructurerEnv:
         # The v2 client is mutable, and the backend mutates portfolio/client
         # memory.  Fresh deep copies make reset genuinely deterministic and
         # prevent one rollout from contaminating another.
+        snapshots, client, risk_budget, domain, quote_policy = self.task.materialize()
         backend = LongHorizonEnvironment(
-            copy.deepcopy(self.task.snapshots),
-            copy.deepcopy(self.task.client),
-            copy.deepcopy(self.task.risk_budget),
+            snapshots,
+            client,
+            risk_budget,
             BenchmarkCondition(full_information=False, dynamic=True),
-            quote_policy=copy.deepcopy(self.task.quote_policy),
-            domain=copy.deepcopy(self.task.domain),
+            quote_policy=quote_policy,
+            domain=domain,
             env_agents=None,
         )
         self._state = _EpisodeState(
@@ -250,7 +268,12 @@ class MirageStructurerEnv:
                 exhausted_budgets=exhausted,
                 error=message,
             )
-            rewards = RewardComponents(operational_cost=self.invalid_action_cost)
+            rewards = RewardComponents(
+                operational_cost=self._cost_term(
+                    self.invalid_action_cost,
+                    "invalid-action-cost-v1",
+                )
+            )
             state.last_event = {
                 "type": "action_error",
                 "action": effective_action.action,
@@ -300,7 +323,12 @@ class MirageStructurerEnv:
                 "raw": _jsonable(action.raw),
             }
             return (
-                RewardComponents(operational_cost=self.invalid_action_cost),
+                RewardComponents(
+                    operational_cost=self._cost_term(
+                        self.invalid_action_cost,
+                        "invalid-action-cost-v1",
+                    )
+                ),
                 ConstraintSignals(action_valid=False, error=action.reason),
                 False,
             )
@@ -312,7 +340,12 @@ class MirageStructurerEnv:
             state.disclosed_client[action.topic] = copy.deepcopy(result.get("answer"))
             state.last_event = {"type": "client_answer", "payload": copy.deepcopy(result)}
             return (
-                RewardComponents(query_cost=self.query_cost),
+                RewardComponents(
+                    query_cost=self._cost_term(
+                        self.query_cost,
+                        "client-query-cost-v1",
+                    )
+                ),
                 ConstraintSignals(),
                 False,
             )
@@ -324,7 +357,12 @@ class MirageStructurerEnv:
             state.last_event = {"type": "quote", "payload": copy.deepcopy(quote)}
             hard_failures = self._failed_check_ids(quote.get("checks", ()), severity="HARD")
             return (
-                RewardComponents(quote_cost=self.quote_cost),
+                RewardComponents(
+                    quote_cost=self._cost_term(
+                        self.quote_cost,
+                        "desk-quote-cost-v1",
+                    )
+                ),
                 ConstraintSignals(
                     hard_pass=bool(quote.get("hard_pass")),
                     hard_failures=hard_failures,
@@ -365,7 +403,12 @@ class MirageStructurerEnv:
                 "round": backend.snapshot.round_num,
             }
             return (
-                RewardComponents(operational_cost=self.skip_cost),
+                RewardComponents(
+                    operational_cost=self._cost_term(
+                        self.skip_cost,
+                        "round-skip-cost-v1",
+                    )
+                ),
                 ConstraintSignals(),
                 True,
             )
@@ -384,13 +427,24 @@ class MirageStructurerEnv:
         contract_pass = bool(result.get("client_contract_pass"))
         hard_failures = self._failed_check_ids(result.get("hard_failures", ()))
         contract_failures = self._failed_check_ids(result.get("contract_failures", ()))
+        dealer_value = float(result.get("dealer_margin", 0.0))
+        face_value = float(result.get("face_value", 0.0))
         rewards = RewardComponents(
-            # Level 0 has no calibrated utility/RAROC model yet.  Until later
-            # curriculum levels land, acceptance and realised quote margin are
-            # explicit proxies in the appropriately named vector slots.
-            client_utility=1.0 if accepted else 0.0,
-            dealer_economics=float(result.get("dealer_margin", 0.0)),
-            quote_cost=quote_cost,
+            # Acceptance belongs to ConstraintSignals.  Level 0 has no
+            # calibrated client utility model.
+            dealer_economics=RewardTerm.measured(
+                dealer_value,
+                provenance="quote-equilibrium-inception-margin-v1",
+                units="CNY",
+                normalization="per_face_value",
+                normalized_value=(
+                    dealer_value / face_value if face_value > 0 else 0.0
+                ),
+            ),
+            quote_cost=self._cost_term(
+                quote_cost,
+                "desk-quote-cost-v1",
+            ),
         )
         constraints = ConstraintSignals(
             hard_pass=hard_pass,
@@ -400,6 +454,16 @@ class MirageStructurerEnv:
             contract_failures=contract_failures,
         )
         return rewards, constraints
+
+    @staticmethod
+    def _cost_term(value: float, provenance: str) -> RewardTerm:
+        return RewardTerm.measured(
+            value,
+            provenance=provenance,
+            units="reward_units",
+            normalization="identity",
+            normalized_value=value,
+        )
 
     @staticmethod
     def _failed_check_ids(
@@ -453,6 +517,10 @@ class MirageStructurerEnv:
             "target_client": product.target_client,
             "pitch": product.pitch,
             "hedging_plan": product.hedging_plan,
+            "funding_style": product.funding_style,
+            "face_value": product.face_value,
+            "issue_price_pct": product.issue_price_pct,
+            "protected_amount": product.protected_amount,
         })
 
     def _finish_round(self, state: _EpisodeState) -> None:
@@ -461,15 +529,47 @@ class MirageStructurerEnv:
         if backend.round_index >= len(backend.snapshots) - 1:
             state.terminated = True
             event["episode_terminated"] = True
+            event["open_at_horizon"] = [
+                {
+                    "position_id": position.position_id,
+                    "status": position.status,
+                    "remaining_months": position.remaining_months,
+                    "current_fair_value": position.current_fair_value,
+                    "issue_cash_outlay": position.issue_cash_outlay,
+                }
+                for position in backend.portfolio.positions
+            ]
             state.last_event = event
             return
 
-        matured = backend.advance_round()
+        closed_ids = backend.advance_round()
+        lifecycle_events = list(backend.portfolio.last_lifecycle_events)
         state.round_step_index = 0
         state.disclosed_client.clear()
         state.quote_payloads.clear()
         event["advanced_to_round"] = backend.snapshot.round_num
-        event["matured_positions"] = matured
+        event["closed_position_ids"] = closed_ids
+        event["closed_positions"] = [
+            {
+                "position_id": item.position_id,
+                "close_reason": item.close_reason,
+                "settlement_amount": item.settlement_amount,
+                "client_realized_pnl": item.client_realized_pnl,
+                "dealer_liability_realized_pnl": (
+                    item.dealer_liability_realized_pnl
+                ),
+                "dealer_total_pnl": item.dealer_total_pnl,
+            }
+            for item in lifecycle_events
+        ]
+        event["lifecycle_events"] = _jsonable(lifecycle_events)
+        # Deprecated compatibility field, now correctly restricted to actual
+        # maturity rather than every closure reason.
+        event["matured_positions"] = [
+            item.position_id
+            for item in lifecycle_events
+            if item.close_reason == "matured"
+        ]
         state.last_event = event
 
     def _observation(self, state: _EpisodeState) -> Observation:
@@ -496,9 +596,15 @@ class MirageStructurerEnv:
         if state.terminated or state.truncated:
             actions = ()
         else:
-            base = ["ask_client", "request_quote", "submit_product", "skip"]
+            base: list[str] = []
+            if budgets["client_queries_left"] > 0:
+                base.append("ask_client")
+            if budgets["quotes_left"] > 0:
+                base.append("request_quote")
+                base.append("submit_product")
             if state.quote_payloads:
-                base.insert(2, "submit_design")
+                base.append("submit_design")
+            base.append("skip")
             actions = tuple(base)
 
         return Observation(
@@ -552,9 +658,14 @@ class MirageStructurerEnv:
             "schema_version": self.task.schema,
             "environment_version": self.environment_version,
             "pricing_version": self.pricing_version,
+            "reward_schema_version": REWARD_SCHEMA_VERSION,
             "task_version": self.task.version,
             "level": self.level,
+            # reset(seed=...) is run identity only; economic common-random
+            # numbers remain frozen by the pricing protocol.
+            "run_id_seed": state.seed,
             "seed": state.seed,
+            "seed_role": "run_id_only",
             "options_hash": _stable_hash(state.options),
         }
         if self.expose_privileged_info:
@@ -568,6 +679,7 @@ class MirageStructurerEnv:
             "task_version": self.task.version,
             "environment_version": self.environment_version,
             "pricing_version": self.pricing_version,
+            "reward_schema_version": REWARD_SCHEMA_VERSION,
             "environment_configuration": self.configuration,
             "seed": state.seed,
             "options": state.options,

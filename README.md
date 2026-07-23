@@ -22,9 +22,11 @@ This README is a quick-start pointer, not the protocol of record.
   LLM calls, forced prompt, strategy logic or oracle. Privileged evaluator
   state is off by default, and finite per-round step limits prevent hanging
   rollouts.
-- The existing CLI and `LongHorizonEnvironment` remain the explicitly legacy
-  **v2 benchmark** so frozen v2 runs can still be reproduced. Full/Static are
-  not v3 task conditions and v2/v3 artifacts must not be pooled.
+- The CLI now exposes the v3-native `test-agent` entry point. Its other
+  factorial commands and `LongHorizonEnvironment` remain the explicitly
+  legacy **v2 benchmark** so frozen v2 runs can still be reproduced.
+  Full/Static are not v3 task conditions and v2/v3 artifacts must not be
+  pooled.
 - Issued v2 dynamic positions now retain issue fixing and absolute contract
   levels, process barrier/knock-in/autocall observations, and revalue FV,
   delta, vega and stress on the next market snapshot.
@@ -46,11 +48,12 @@ This README is a quick-start pointer, not the protocol of record.
   be drawn out through `query_client`.
 - **Carrying risk across decisions.** The v3 environment is always dynamic.
   The v2 compatibility runner still exposes its historical Static ablation.
-- **Not gaming a fixed markup.** `dealer_margin` is a cost-plus function of
+- **Not gaming a fixed markup.** `dealer_margin` is a funding-aware cost-plus function of
   moneyness, vega exposure, path dependence, Monte Carlo pricing uncertainty,
-  stress loss and capacity utilization, further scaled by a client-suitability
-  factor -- so "always quote the biggest notional vanilla" is not the
-  dominant strategy. See the protocol doc for the exact formula.
+  static-delta-hedged dealer stress and capacity utilization. Premium-paid
+  quotes also use a client-suitability factor. Negative margins are retained,
+  and Level-0 par notes still require a future payoff solve-for before
+  large-scale training. See the protocol doc for the exact formula.
 
 ## Two-layer architecture
 
@@ -103,8 +106,75 @@ cp .env.example .env
 # enough to get started; config/models.yaml lists every registered model.
 ```
 
-The CLI is installed as `mirage-benchmark` (`python -m mirage.benchmark_cli`
-works identically):
+The canonical v3 interface is the typed partial-dynamic environment. This
+smoke run is deterministic and needs no API key:
+
+```python
+import json
+from pathlib import Path
+
+from mirage.benchmark import RiskBudget, load_market_snapshots
+from mirage.environment import EpisodeTask, MirageStructurerEnv, Skip
+from mirage.products import ClientProfile
+
+root = Path.cwd()
+snapshots = tuple(
+    row for row in load_market_snapshots(
+        root / "scenarios/mirage_csi/market_snapshots.example.csv"
+    )
+    if row.episode_id == "SYNTHETIC_CSI500_DEMO"
+)
+client = ClientProfile(**json.loads(
+    (root / "scenarios/mirage_csi/client.example.json").read_text()
+))
+budget = RiskBudget(**json.loads(
+    (root / "scenarios/mirage_csi/risk_budget.example.json").read_text()
+))
+env = MirageStructurerEnv(EpisodeTask(snapshots, client, budget, task_seed=7))
+observation, info = env.reset()
+transition = env.step(Skip("typed v3 smoke test"))
+print(observation.available_actions, transition.observation.round_num, info["seed_role"])
+```
+
+Real agents use the v3-native `test-agent` command. A local executable receives
+one versioned JSON request on stdin per step and must print one action JSON on
+stdout:
+
+```bash
+mirage-benchmark test-agent scenarios/mirage_csi/market_snapshots.example.csv \
+  --episode SYNTHETIC_CSI500_DEMO \
+  --client-json scenarios/mirage_csi/client.example.json \
+  --risk-budget-json scenarios/mirage_csi/risk_budget.example.json \
+  --agent-command 'python my_agent.py' \
+  --output outputs/v3-cli-agent.trajectory.json
+```
+
+An API model can be selected from `config/models.yaml` with
+`--model deepseek-v4-flash`, or used directly without editing that file. The
+key is read only from the named environment variable and is never put in the
+request or trajectory:
+
+```bash
+export OPENAI_API_KEY='...'
+mirage-benchmark test-agent scenarios/mirage_csi/market_snapshots.example.csv \
+  --episode SYNTHETIC_CSI500_DEMO \
+  --client-json scenarios/mirage_csi/client.example.json \
+  --risk-budget-json scenarios/mirage_csi/risk_budget.example.json \
+  --api-provider openai-compatible \
+  --api-base-url https://api.openai.com/v1 \
+  --api-model gpt-4o --api-key-env OPENAI_API_KEY \
+  --output outputs/v3-api-agent.trajectory.json \
+  --summary-output outputs/v3-api-agent.summary.json
+```
+
+The same boundary is available from Python through `CommandAgentPolicy`,
+`LLMAgentPolicy`/`create_api_agent_policy`, and `run_agent_episode`. Policy
+transport or schema failures become visible invalid actions and consume the
+normal step budget; hidden client state is never sent to the policy.
+
+The `mirage-benchmark` executable also retains the legacy v2 factorial
+commands below so frozen v2 runs can still be reproduced
+(`python -m mirage.benchmark_cli` works identically):
 
 ```bash
 # Validate a market snapshot CSV (schema, provenance, contiguous rounds).
@@ -168,7 +238,7 @@ MIRAGE/
 |   |-- models.yaml                 # model registry: connection info per model
 |   `-- benchmark_roles.yaml        # v2 role behaviour: structurer + 3 env NPCs + judges
 |-- mirage/
-|   |-- environment/                 # v3-spine typed reset/step + trajectory records
+|   |-- environment/                 # v3 reset/step, CLI/API agent adapters, trajectories
 |   |-- benchmark.py                # MarketSnapshot, RiskBudget, ProductDomainSpec,
 |   |                               #   TradingDesk, HardConstraintEngine, settlement
 |   |-- benchmark_runner.py         # run_episode loop, compute_metrics

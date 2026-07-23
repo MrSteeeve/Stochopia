@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 from dataclasses import asdict, dataclass
 from itertools import product
 from typing import Mapping
@@ -30,6 +32,7 @@ DEFAULT_REPLICATES_BY_CONDITION: dict[str, int] = {
 }
 
 SEED_NAMESPACE = "mirage.experiment.v2"
+MANIFEST_SCHEMA_VERSION = "mirage.experiment-manifest.v3"
 
 
 @dataclass(frozen=True)
@@ -86,24 +89,53 @@ def build_experiment_manifest(
 
 
 def manifest_payload(jobs: list[ExperimentJob]) -> dict:
+    job_rows = [asdict(job) for job in jobs]
+    replicate_sets: dict[str, set[int]] = {}
+    for job in jobs:
+        replicate_sets.setdefault(job.condition, set()).add(job.replicate)
+    actual_replicates = {
+        condition.id: len(replicate_sets.get(condition.id, set()))
+        for condition in CONDITIONS
+    }
+    protocol = {
+        "conditions": [condition.id for condition in CONDITIONS],
+        # Derive this from the frozen jobs. Reporting the module defaults here
+        # silently mis-described custom manifests.
+        "replicates_by_condition": actual_replicates,
+        "hard_condition_oversampled": (
+            "partial_dynamic"
+            if actual_replicates.get("partial_dynamic", 0)
+            > max(
+                (count for name, count in actual_replicates.items() if name != "partial_dynamic"),
+                default=0,
+            )
+            else None
+        ),
+        "seed_namespace": SEED_NAMESPACE,
+        # Pre-registered primary outcomes (Holm-corrected family); every
+        # other metric is exploratory.
+        "primary_outcomes": [
+            "hard_execution_rate",
+            "settlement_acceptance_rate",
+            "total_dealer_margin",
+        ],
+    }
+    fingerprint_payload = {"jobs": job_rows, "protocol": protocol}
+    manifest_fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
     return {
-        "jobs": [asdict(job) for job in jobs],
-        "count": len(jobs),
-        "protocol": {
-            "conditions": [condition.id for condition in CONDITIONS],
-            "replicates_by_condition": DEFAULT_REPLICATES_BY_CONDITION,
-            "hard_condition_oversampled": "partial_dynamic",
-            "seed_namespace": SEED_NAMESPACE,
-            # Pre-registered primary outcomes (Holm-corrected family); every
-            # other metric is exploratory. Names are the v2 canonical fields
-            # (see REDESIGN_PLAN.md §4): hard_executable feasibility plus the
-            # margin-family economic outcome.
-            "primary_outcomes": [
-                "hard_execution_rate",
-                "settlement_acceptance_rate",
-                "total_dealer_margin",
-            ],
-        },
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "manifest_fingerprint": manifest_fingerprint,
+        "jobs": job_rows,
+        "count": len(job_rows),
+        "protocol": protocol,
     }
 
 
