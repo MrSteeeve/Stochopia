@@ -567,7 +567,7 @@ class CommandAgentPolicy:
                 process.communicate(request_bytes),
                 timeout=self.timeout,
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
             await _terminate_process_tree(process)
             raise LLMError(
                 f"agent command exceeded {self.timeout:g}s timeout"
@@ -739,7 +739,7 @@ async def _terminate_process_tree(
         process.kill()
     try:
         await asyncio.wait_for(process.wait(), timeout=5.0)
-    except TimeoutError:
+    except asyncio.TimeoutError:
         if process.returncode is None:
             process.kill()
         await process.wait()
