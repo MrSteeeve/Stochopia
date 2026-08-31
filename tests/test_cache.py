@@ -1,6 +1,6 @@
 """Bounded deterministic cache primitives used by pricing and domain enumeration."""
 
-from mirage.cache import BoundedLRUCache
+from stochopia.cache import BoundedLRUCache
 
 
 def test_bounded_lru_cache_evicts_oldest_and_refreshes_hits():

@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-import mirage.llm as llm_module
-from mirage.llm import LLMError, LLMTruncationError, ModelConfig, OpenAICompatClient
+import stochopia.llm as llm_module
+from stochopia.llm import LLMError, LLMTruncationError, ModelConfig, OpenAICompatClient
 
 
 def _response(content: str, finish_reason: str) -> "_FakeResponse":

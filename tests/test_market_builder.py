@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from mirage.market_builder import DailyClose, build_monthly_snapshots
+from stochopia.market_builder import DailyClose, build_monthly_snapshots
 
 
 def test_month_end_builder_uses_warmup_and_creates_half_year_rounds():

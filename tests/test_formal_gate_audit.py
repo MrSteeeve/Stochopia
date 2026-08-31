@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from mirage.formal_gate_audit import evaluate_gates
+from stochopia.formal_gate_audit import evaluate_gates
 
 
 def _passing_inputs():

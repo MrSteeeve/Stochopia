@@ -11,7 +11,7 @@ import math
 
 import pytest
 
-from mirage.pricing import (
+from stochopia.pricing import (
     ClientLossMeasure,
     MCDiagnostics,
     QuoteEconomics,
@@ -27,7 +27,7 @@ from mirage.pricing import (
     quote_economics,
     solve_quote_equilibrium,
 )
-from mirage.products import ClientProfile, MarketState, ProductSpec
+from stochopia.products import ClientProfile, MarketState, ProductSpec
 
 
 def market() -> MarketState:

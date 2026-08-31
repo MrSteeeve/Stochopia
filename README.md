@@ -1,32 +1,38 @@
-# MIRAGE: CSI Structured-Product Design Benchmark
+# Stochopia
+
+**A Stateful Environment for Training Trading-Desk Agents**
+
+> A constructed world for learning to act under uncertainty.
 
 [Chinese README](README_zh.md)
 
-MIRAGE evaluates whether an LLM can repeatedly synthesize executable
+Stochopia is a stateful, partially observable financial decision environment.
+Its current CSI benchmark evaluates whether an LLM can repeatedly synthesize executable
 structured products -- vanilla/barrier options, autocallables, snowballs --
 linked to the CSI500/CSI1000 indices under partial observability, limited
 desk/client/risk interaction and portfolio risk carried across a run of
 month-end decisions. It does not claim open-ended financial invention or
 production-grade market pricing.
 
-The full protocol -- episode design, the deterministic pricing/settlement
+The current protocol -- episode design, the deterministic pricing/settlement
 engine, the LLM-native environment roles, the offline judge, and the
-statistics -- is frozen in [docs/BENCHMARK_PROTOCOL.md](docs/BENCHMARK_PROTOCOL.md).
+statistics -- is defined in [docs/BENCHMARK_PROTOCOL.md](docs/BENCHMARK_PROTOCOL.md).
 This README is a quick-start pointer, not the protocol of record.
 
 ## Protocol status
 
-- `mirage.environment` is the new **v3-spine / Level-0** training interface:
+- `stochopia.environment` is the new **v3-spine / Level-0** training interface:
   partial observability and dynamic state are invariants, actions and
-  transitions are typed, and `MirageStructurerEnv.reset()/step()` contains no
+  transitions are typed, and `StochopiaStructurerEnv.reset()/step()` contains no
   LLM calls, forced prompt, strategy logic or oracle. Privileged evaluator
   state is off by default, and finite per-round step limits prevent hanging
   rollouts.
 - The CLI now exposes the v3-native `test-agent` entry point. Its other
   factorial commands and `LongHorizonEnvironment` remain the explicitly
-  legacy **v2 benchmark** so frozen v2 runs can still be reproduced.
-  Full/Static are not v3 task conditions and v2/v3 artifacts must not be
-  pooled.
+  legacy **v2 engine surface** for newly generated Stochopia v1 runs.
+  Pre-migration trajectories, manifests, hashes and seeds are incompatible;
+  Full/Static are not v3 task conditions and v2/v3 engine artifacts must not
+  be pooled.
 - Every Agent request includes the complete machine-readable action contract.
   Accepted positions update authoritative client/dealer accounts, lifecycle
   outcomes enter the reward vector, and all open contracts are liquidated at
@@ -35,12 +41,7 @@ This README is a quick-start pointer, not the protocol of record.
   levels, process barrier/knock-in/autocall observations, and revalue FV,
   delta, vega and stress on the next market snapshot.
 
-> An earlier NASDAQ-100 "Structurer Playground" prototype (`run.py`,
-> `mirage.cli`, `mirage.engine`) has been retired; that entry point no longer
-> exists in this repository. `scenarios/structurer_nasdaq/` remains only as
-> historical scenario data and is not runnable through any current command.
-
-## What MIRAGE evaluates
+## What Stochopia evaluates
 
 - **Synthesizing a contract, not just pricing one.** The tested model
   (`structurer`) can query the client, consult the trading desk/risk
@@ -93,10 +94,10 @@ metric byte-for-byte identical to the fully deterministic path.
 
 ## Quick start
 
-MIRAGE requires Python 3.10+.
+Stochopia requires Python 3.10+.
 
 ```bash
-cd MIRAGE
+cd Stochopia
 uv sync --locked --all-extras --dev
 ```
 
@@ -119,24 +120,24 @@ smoke run is deterministic and needs no API key:
 import json
 from pathlib import Path
 
-from mirage.benchmark import RiskBudget, load_market_snapshots
-from mirage.environment import EpisodeTask, MirageStructurerEnv, Skip
-from mirage.products import ClientProfile
+from stochopia.benchmark import RiskBudget, load_market_snapshots
+from stochopia.environment import EpisodeTask, StochopiaStructurerEnv, Skip
+from stochopia.products import ClientProfile
 
 root = Path.cwd()
 snapshots = tuple(
     row for row in load_market_snapshots(
-        root / "scenarios/mirage_csi/market_snapshots.example.csv"
+        root / "scenarios/stochopia_csi/market_snapshots.example.csv"
     )
     if row.episode_id == "SYNTHETIC_CSI500_DEMO"
 )
 client = ClientProfile(**json.loads(
-    (root / "scenarios/mirage_csi/client.example.json").read_text()
+    (root / "scenarios/stochopia_csi/client.example.json").read_text()
 ))
 budget = RiskBudget(**json.loads(
-    (root / "scenarios/mirage_csi/risk_budget.example.json").read_text()
+    (root / "scenarios/stochopia_csi/risk_budget.example.json").read_text()
 ))
-env = MirageStructurerEnv(EpisodeTask(snapshots, client, budget, task_seed=7))
+env = StochopiaStructurerEnv(EpisodeTask(snapshots, client, budget, task_seed=7))
 observation, info = env.reset()
 transition = env.step(Skip("typed v3 smoke test"))
 print(observation.available_actions, transition.observation.round_num, info["seed_role"])
@@ -154,7 +155,7 @@ print(observation.available_actions, transition.observation.round_num, info["see
 The last snapshot in every v3 task is terminal valuation truth, not another
 decision round. Thus a contract issued on the last decision snapshot must
 experience at least one market interval before maturity or horizon
-liquidation. Training code can opt into `ScalarizedMirageEnv` with an explicit
+liquidation. Training code can opt into `ScalarizedStochopiaEnv` with an explicit
 versioned `ScalarizationSpec`; the core never silently chooses weights.
 
 Real agents use the v3-native `test-agent` command. A local executable receives
@@ -162,10 +163,10 @@ one versioned JSON request on stdin per step and must print one action JSON on
 stdout:
 
 ```bash
-mirage-benchmark test-agent scenarios/mirage_csi/market_snapshots.example.csv \
+stochopia-benchmark test-agent scenarios/stochopia_csi/market_snapshots.example.csv \
   --episode SYNTHETIC_CSI500_DEMO \
-  --client-json scenarios/mirage_csi/client.example.json \
-  --risk-budget-json scenarios/mirage_csi/risk_budget.example.json \
+  --client-json scenarios/stochopia_csi/client.example.json \
+  --risk-budget-json scenarios/stochopia_csi/risk_budget.example.json \
   --agent-command 'python my_agent.py' \
   --output outputs/v3-cli-agent.trajectory.json
 ```
@@ -177,10 +178,10 @@ request or trajectory:
 
 ```bash
 export OPENAI_API_KEY='...'
-mirage-benchmark test-agent scenarios/mirage_csi/market_snapshots.example.csv \
+stochopia-benchmark test-agent scenarios/stochopia_csi/market_snapshots.example.csv \
   --episode SYNTHETIC_CSI500_DEMO \
-  --client-json scenarios/mirage_csi/client.example.json \
-  --risk-budget-json scenarios/mirage_csi/risk_budget.example.json \
+  --client-json scenarios/stochopia_csi/client.example.json \
+  --risk-budget-json scenarios/stochopia_csi/risk_budget.example.json \
   --api-provider openai-compatible \
   --api-base-url https://api.openai.com/v1 \
   --api-model gpt-4o --api-key-env OPENAI_API_KEY \
@@ -192,26 +193,26 @@ For a reproducible evaluation rather than a one-off smoke run, freeze a suite,
 run a policy over every task, then independently replay and aggregate:
 
 ```bash
-mirage-benchmark make-v3-suite market_snapshots.csv \
+stochopia-benchmark make-v3-suite market_snapshots.csv \
   --episodes CSI500_2024H1 CSI500_2024H2 \
   --client-json client.json --risk-budget-json risk_budget.json \
-  --name mirage-dev --version 1 --split dev \
-  --output tasks/mirage-dev.v3.json
+  --name stochopia-dev --version 1 --split dev \
+  --output tasks/stochopia-dev.v1.json
 
-mirage-benchmark run-v3-suite tasks/mirage-dev.v3.json \
+stochopia-benchmark run-v3-suite tasks/stochopia-dev.v1.json \
   --agent-command 'python my_agent.py' \
   --replicates 3 \
-  --output-dir outputs/mirage-dev \
+  --output-dir outputs/stochopia-dev \
   --bootstrap-resamples 10000
 
-mirage-benchmark evaluate-trajectory \
-  outputs/mirage-dev/0000-r000-TASKHASH.trajectory.json \
-  --suite tasks/mirage-dev.v3.json \
+stochopia-benchmark evaluate-trajectory \
+  outputs/stochopia-dev/0000-r000-TASKHASH.trajectory.json \
+  --suite tasks/stochopia-dev.v1.json \
   --output outputs/replayed.evaluation.json
 
-mirage-benchmark aggregate-v3 outputs/mirage-dev \
-  --output-json outputs/mirage-dev.aggregate.json \
-  --output-csv outputs/mirage-dev.aggregate.csv
+stochopia-benchmark aggregate-v3 outputs/stochopia-dev \
+  --output-json outputs/stochopia-dev.aggregate.json \
+  --output-csv outputs/stochopia-dev.aggregate.csv
 ```
 
 `run-v3-suite` resumes only trajectories whose task, public run seed,
@@ -227,7 +228,7 @@ environment step or contaminating invalid-action counts; timed-out command
 process groups are cleaned up. Hidden client state is never sent to the
 policy.
 
-Saved trajectories include the public action schema, environment configuration,
+Stochopia v1 trajectories include the public action schema, environment configuration,
 reset options and public run seed, prompt/model parameters, dependency
 versions, implementation hash and Git worktree provenance. Hash verification
 alone is not treated as economic verification: `evaluate-trajectory` rebuilds
@@ -236,54 +237,55 @@ summaries expose cumulative reward and constraint totals. These additions do
 not implement the still-planned TaskGenerator, repair teacher,
 counterfactual-pair exporter, payoff DSL/solve-for, or fast/reference pricer.
 
-The `mirage-benchmark` executable also retains the legacy v2 factorial
-commands below so frozen v2 runs can still be reproduced
-(`python -m mirage.benchmark_cli` works identically):
+The `stochopia-benchmark` executable also exposes the inherited v2 factorial
+workflows below, but every new artifact uses the Stochopia v1 identity.
+Pre-migration artifacts are not accepted (`python -m stochopia.benchmark_cli`
+invokes the same current CLI):
 
 ```bash
 # Validate a market snapshot CSV (schema, provenance, contiguous rounds).
-mirage-benchmark validate-market scenarios/mirage_csi/market_snapshots.example.csv
+stochopia-benchmark validate-market scenarios/stochopia_csi/market_snapshots.example.csv
 
 # Smoke-test the deterministic desk with the bundled synthetic example.
-mirage-benchmark demo scenarios/mirage_csi/market_snapshots.example.csv \
+stochopia-benchmark demo scenarios/stochopia_csi/market_snapshots.example.csv \
   --episode SYNTHETIC_CSI500_DEMO \
-  --product-json scenarios/mirage_csi/product.example.json --full
+  --product-json scenarios/stochopia_csi/product.example.json --full
 
 # Calibrate and freeze the risk budget on development episodes only.
-mirage-benchmark calibrate-budget scenarios/mirage_csi/market_snapshots.example.csv \
+stochopia-benchmark calibrate-budget scenarios/stochopia_csi/market_snapshots.example.csv \
   --episodes SYNTHETIC_CSI500_DEMO \
-  --client-json scenarios/mirage_csi/client.example.json \
-  --base-budget-json scenarios/mirage_csi/risk_budget.example.json \
+  --client-json scenarios/stochopia_csi/client.example.json \
+  --base-budget-json scenarios/stochopia_csi/risk_budget.example.json \
   --report-output outputs/budget_report.json \
   --budget-output outputs/risk_budget.frozen.json
 
 # Run one registered model against one frozen episode. Add
 # --roles-config config/benchmark_roles.yaml to switch on the LLM-native
 # client/risk/desk roles (optional; omit it to stay pure-deterministic).
-mirage-benchmark run-episode scenarios/mirage_csi/market_snapshots.example.csv \
+stochopia-benchmark run-episode scenarios/stochopia_csi/market_snapshots.example.csv \
   --episode SYNTHETIC_CSI500_DEMO \
-  --client-json scenarios/mirage_csi/client.example.json \
+  --client-json scenarios/stochopia_csi/client.example.json \
   --risk-budget-json outputs/risk_budget.frozen.json \
   --model deepseek-v4-flash --strategy ledger_archive \
   --output outputs/demo_run.json
 
 # Freeze the full factorial manifest (Full/Partial x Static/Dynamic, n>=3
 # replicates, partial_dynamic n=5), then execute it (reruns resume).
-mirage-benchmark make-manifest --episodes SYNTHETIC_CSI500_DEMO \
+stochopia-benchmark make-manifest --episodes SYNTHETIC_CSI500_DEMO \
   --models deepseek-v4-flash --output outputs/experiment_manifest.json
-mirage-benchmark run-manifest scenarios/mirage_csi/market_snapshots.example.csv \
+stochopia-benchmark run-manifest scenarios/stochopia_csi/market_snapshots.example.csv \
   --manifest outputs/experiment_manifest.json \
-  --client-json scenarios/mirage_csi/client.example.json \
+  --client-json scenarios/stochopia_csi/client.example.json \
   --risk-budget-json outputs/risk_budget.frozen.json \
   --outputs-dir outputs/csi_benchmark
 
 # Aggregate: per-(model, condition) cluster-bootstrap CIs, paired
 # dynamic/partial-observability degradation contrasts with Holm correction.
-mirage-benchmark aggregate outputs/csi_benchmark \
+stochopia-benchmark aggregate outputs/csi_benchmark \
   --output-csv outputs/aggregate.csv --output-md outputs/aggregate.md
 
 # Offline blind judge batch over frozen voluntary submissions.
-mirage-benchmark judge-runs outputs/csi_benchmark \
+stochopia-benchmark judge-runs outputs/csi_benchmark \
   --judge-models deepseek-v4-pro qwen-max --salt "$(openssl rand -hex 16)"
 ```
 
@@ -296,17 +298,17 @@ Run tests:
 ## Repository layout
 
 ```text
-MIRAGE/
-|-- pyproject.toml                  # mirage-benchmark console script
+Stochopia/
+|-- pyproject.toml                  # stochopia-benchmark console script
 |-- config/
 |   |-- models.yaml                 # model registry: connection info per model
 |   `-- benchmark_roles.yaml        # v2 role behaviour: structurer + 3 env NPCs + judges
-|-- mirage/
+|-- stochopia/
 |   |-- environment/                 # v3 reset/step, CLI/API agent adapters, trajectories
 |   |-- benchmark.py                # MarketSnapshot, RiskBudget, ProductDomainSpec,
 |   |                               #   TradingDesk, HardConstraintEngine, settlement
 |   |-- benchmark_runner.py         # run_episode loop, compute_metrics
-|   |-- benchmark_cli.py            # mirage-benchmark CLI (see Quick start)
+|   |-- benchmark_cli.py            # stochopia-benchmark CLI (see Quick start)
 |   |-- pricing.py                  # Black-Scholes, barriers, Monte Carlo, quote_economics
 |   |-- products.py                 # ProductSpec, ClientProfile, MarketState
 |   |-- env_agents.py               # FrozenEnvAgent, grounding, response cache
@@ -318,8 +320,7 @@ MIRAGE/
 |   `-- market_builder.py, cffex_data.py, tushare_*.py, formal_*.py, raw_data_audit.py
 |                                   # market-data acquisition, provenance audit pipeline
 |-- scenarios/
-|   |-- mirage_csi/                 # v2 episodes: snapshots, prompts/, benchmark.yaml
-|   `-- structurer_nasdaq/          # legacy Playground scenario data (no runnable entry point)
+|   `-- stochopia_csi/              # inherited v2 engine inputs under Stochopia v1
 |-- docs/
 |   |-- BENCHMARK_PROTOCOL.md       # protocol of record
 |   |-- DATA_AUDIT.md               # source audit and go/no-go gates
@@ -335,7 +336,7 @@ MIRAGE/
 
 Production market data must carry explicit source provenance and pass the
 gates frozen in [docs/DATA_AUDIT.md](docs/DATA_AUDIT.md); the checked-in
-`scenarios/mirage_csi/market_snapshots.example.csv` is synthetic and cannot be
+`scenarios/stochopia_csi/market_snapshots.example.csv` is synthetic and cannot be
 used for reported results. Only abstract workflow, schemas and synthetic
 rules may be derived from private institutional material -- no private
 document, client, institution, limit or identifying metadata may enter

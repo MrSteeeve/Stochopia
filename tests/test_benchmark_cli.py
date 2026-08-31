@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from mirage.benchmark import (
+from stochopia.benchmark import (
     BenchmarkCondition,
     LongHorizonEnvironment,
     MarketSnapshot,
@@ -24,7 +24,7 @@ from mirage.benchmark import (
     enumerate_domain,
     oracle_candidate_grid,
 )
-from mirage.benchmark_cli import (
+from stochopia.benchmark_cli import (
     RUN_OUTPUT_SCHEMA_VERSION,
     _atomic_write_json,
     _cmd_calibrate_margin,
@@ -33,8 +33,8 @@ from mirage.benchmark_cli import (
     _completed_result_matches,
     _load_quote_policy,
 )
-from mirage.pricing import QuotePolicy
-from mirage.products import ClientProfile, ProductSpec
+from stochopia.pricing import QuotePolicy
+from stochopia.products import ClientProfile, ProductSpec
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -109,7 +109,7 @@ def _margin_args(tmp_path: Path, **overrides) -> argparse.Namespace:
 
 
 def test_calibrate_margin_end_to_end_report_structure(tmp_path, monkeypatch):
-    import mirage.benchmark_cli as cli_mod
+    import stochopia.benchmark_cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "ProductDomainSpec", lambda: SMALL_DOMAIN)
 
@@ -148,7 +148,7 @@ def test_calibrate_margin_end_to_end_report_structure(tmp_path, monkeypatch):
 
 
 def test_calibrate_margin_is_deterministic(tmp_path, monkeypatch):
-    import mirage.benchmark_cli as cli_mod
+    import stochopia.benchmark_cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "ProductDomainSpec", lambda: SMALL_DOMAIN)
     snapshots = _snapshots("E1", n_rounds=2)
@@ -171,7 +171,7 @@ def test_calibrate_margin_is_deterministic(tmp_path, monkeypatch):
 
 
 def test_calibrate_margin_unknown_episode_rejected(tmp_path, monkeypatch):
-    import mirage.benchmark_cli as cli_mod
+    import stochopia.benchmark_cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "ProductDomainSpec", lambda: SMALL_DOMAIN)
     snapshots = _snapshots("E1")

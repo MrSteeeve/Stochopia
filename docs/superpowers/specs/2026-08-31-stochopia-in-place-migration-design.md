@@ -1,9 +1,9 @@
 # Stochopia In-Place Migration Design
 
 **Date:** 2026-08-31  
-**Status:** Approved in conversation; written review pending  
+**Status:** Approved
 **Target repository:** `MrSteeeve/Stochopia`  
-**Target local directory:** `/Users/williamqian/GitHub/Stochopia`
+**Target local directory:** `<workspace-root>/Stochopia`
 
 ## Objective
 
@@ -33,7 +33,7 @@ The migration will apply consistently across source code, tests, schemas, scenar
 - Repository title, examples, commands, paths, badges, comments, and current documentation to Stochopia terminology.
 - File and directory names containing the former project name to Stochopia equivalents.
 
-The selected untracked market-generator implementation and test are part of the migration and will be included in the resulting commit. The current untracked research notes under `docs/research/` will be preserved, renamed where needed, updated to the new terminology, and included unless a validation check identifies private or redistributable third-party content.
+The selected untracked market-generator implementation and test are part of the migration and will be included in the resulting commit. Current untracked research notes under `docs/research/` will be preserved and reviewed individually. A reviewed research decision may be committed; full private conversation transcripts remain local-only.
 
 ## Compatibility Boundary
 
@@ -68,9 +68,9 @@ The repository remains private during this operation. Deleting or archiving anot
 5. Scan the versioned working tree and selected source files for residual case-insensitive occurrences of the former name.
 6. Run targeted packaging, import, CLI, and protocol tests, then the full test suite.
 7. Review the complete diff for accidental content changes, secret inclusion, third-party data, and unintended deletions.
-8. Commit the migration on `main` and push normal branch refs only.
-9. Rename the currently configured private GitHub repository to `MrSteeeve/Stochopia`, set `origin` to the canonical new URL, and verify remote visibility and default branch.
-10. Rename the local directory from `eqd_simulation` to `Stochopia` only after remote verification. The Codex task may need to be reopened at the new path.
+8. Commit the migration on `main`, then rename the currently configured private GitHub repository to `MrSteeeve/Stochopia`.
+9. Set `origin` to the canonical new URL, push only `main` through the normal branch push path, and verify remote visibility, default branch, and remote commit identity.
+10. Rename the local directory from `eqd_simulation` to `Stochopia` only after remote verification, then rebuild the local virtual environment because its scripts and editable-package metadata contain absolute paths. The Codex task may need to be reopened at the new path.
 
 If any test or remote operation fails, stop at the last recoverable state, keep all local changes, and report the exact failure rather than deleting, resetting, or forcing history.
 
@@ -86,4 +86,4 @@ The migration is complete only when all of the following hold:
 - Protocol/schema tests assert the new `stochopia.*.v1` identifiers and updated deterministic fixtures.
 - The final diff contains no secrets, `blobs/`, caches, or unintended generated files.
 - GitHub reports the private repository as `MrSteeeve/Stochopia`, `origin` uses its canonical URL, and `main` contains the migration commits.
-- The local directory is `/Users/williamqian/GitHub/Stochopia`, or the only remaining action is reopening the Codex task after that final filesystem rename.
+- The local directory is `<workspace-root>/Stochopia`, its virtual environment has been rebuilt and smoke-tested there, or the only remaining action is reopening the Codex task after that final filesystem rename.

@@ -7,10 +7,10 @@ from datetime import date
 
 import pytest
 
-from mirage.benchmark import MarketSnapshot, RiskBudget
-from mirage.environment import (
+from stochopia.benchmark import MarketSnapshot, RiskBudget
+from stochopia.environment import (
     EpisodeTask,
-    MirageStructurerEnv,
+    StochopiaStructurerEnv,
     RequestQuote,
     Skip,
     SubmitDesign,
@@ -19,7 +19,7 @@ from mirage.environment import (
     aggregate_evaluations,
     replay_and_evaluate,
 )
-from mirage.products import ClientProfile, ProductSpec
+from stochopia.products import ClientProfile, ProductSpec
 
 
 def _task() -> EpisodeTask:
@@ -58,7 +58,7 @@ def _task() -> EpisodeTask:
 
 
 def _record_complete_trajectory(path):
-    environment = MirageStructurerEnv(_task())
+    environment = StochopiaStructurerEnv(_task())
     _, info = environment.reset(seed=23, options={"replicate": 2})
     recorder = TrajectoryRecorder(
         environment,
@@ -132,7 +132,7 @@ def test_trajectory_evaluator_replays_economics_and_emits_metrics(tmp_path):
 
 
 def test_quote_checks_are_not_double_counted_as_submissions(tmp_path):
-    environment = MirageStructurerEnv(_task())
+    environment = StochopiaStructurerEnv(_task())
     _, info = environment.reset(seed=23)
     recorder = TrajectoryRecorder(
         environment,
@@ -161,7 +161,7 @@ def test_quote_checks_are_not_double_counted_as_submissions(tmp_path):
 
 
 def test_economic_replay_uses_top_level_run_seed_even_for_partial_run(tmp_path):
-    environment = MirageStructurerEnv(_task())
+    environment = StochopiaStructurerEnv(_task())
     _, info = environment.reset(seed=71)
     recorder = TrajectoryRecorder(
         environment,

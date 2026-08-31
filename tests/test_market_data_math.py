@@ -7,7 +7,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from mirage.market_data_math import (
+from stochopia.market_data_math import (
     ExpiryPair,
     ExpiryPoint,
     ShiborCurve,

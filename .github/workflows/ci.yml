@@ -46,5 +46,5 @@ jobs:
         run: |
           uv venv --python 3.12 .wheel-smoke
           uv pip install --python .wheel-smoke/bin/python dist/*.whl
-          .wheel-smoke/bin/mirage-benchmark --help
-          .wheel-smoke/bin/python -c "from mirage.environment import load_agent_system_prompt; assert 'action_schema' in load_agent_system_prompt()"
+          .wheel-smoke/bin/stochopia-benchmark --help
+          .wheel-smoke/bin/python -c "from stochopia.environment import load_agent_system_prompt; assert 'action_schema' in load_agent_system_prompt()"

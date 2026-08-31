@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from mirage.llm import MockLLMClient  # noqa: E402
+from stochopia.llm import MockLLMClient  # noqa: E402
 
 SCENARIOS_ROOT = ROOT / "scenarios"
 

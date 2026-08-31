@@ -1,7 +1,7 @@
-"""Golden-value tests for mirage/stats.py: seeding, bootstrap CIs, paired
+"""Golden-value tests for stochopia/stats.py: seeding, bootstrap CIs, paired
 significance tests, and Holm correction.
 
-The Wilcoxon exact-method tests cross-check mirage.stats against an
+The Wilcoxon exact-method tests cross-check stochopia.stats against an
 independently written brute-force reference (enumerating every sign-flip
 pattern directly) rather than a memorized textbook number, so the "golden"
 value is derived from first principles inside the test itself and does not
@@ -15,7 +15,8 @@ import random
 
 import pytest
 
-from mirage.stats import (
+from stochopia.experiment import SEED_NAMESPACE as EXPERIMENT_SEED_NAMESPACE
+from stochopia.stats import (
     StatsError,
     bootstrap_ci,
     cluster_bootstrap_ci,
@@ -31,9 +32,10 @@ from mirage.stats import (
 # --------------------------------------------------------------------------
 
 def test_derive_seed_deterministic_for_same_input():
-    a = derive_seed("mirage.experiment", "E01", "gpt-5", "ledger_archive", "full_static", 0)
-    b = derive_seed("mirage.experiment", "E01", "gpt-5", "ledger_archive", "full_static", 0)
-    assert a == b
+    parts = ("E01", "gpt-5", "ledger_archive", "full_static", 0)
+    a = derive_seed(EXPERIMENT_SEED_NAMESPACE, *parts)
+    b = derive_seed(EXPERIMENT_SEED_NAMESPACE, *parts)
+    assert a == b == 4_233_541_484
 
 
 def test_derive_seed_varies_with_namespace():

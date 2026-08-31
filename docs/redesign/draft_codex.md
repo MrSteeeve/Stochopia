@@ -1,23 +1,23 @@
-# MIRAGE 全角色 LLM 化重设计方案（Codex 独立第二视角）
+# Stochopia 全角色 LLM 化重设计方案（Codex 独立第二视角）
 
 **日期：2026-07-17｜目标：ICAIF 2026，8 月 2 日截稿**
 
 ## 结论先行
 
-推荐把 MIRAGE 重构为“**多 LLM 交互层 + 单一确定性真值层 + 双层结果**”。结构师、客户、风控、交易台都有独立 system prompt、模型、上下文和结构化动作；客户可表示接受/拒绝，风控可批准/退回，交易台可出具/拒绝报价。但正式价格、硬约束、技术可执行性、组合状态、结算算术、technical margin 和主指标只由确定性核心产生。LLM 角色共同形成的 `workflow_deal` 作为次级多智能体结果，不能替代主榜的 `hard_executable/technical_margin`。否则主榜测到的是“结构师 × NPC 阵容”的随机配对，而不是受测结构师能力。
+推荐把 Stochopia 重构为“**多 LLM 交互层 + 单一确定性真值层 + 双层结果**”。结构师、客户、风控、交易台都有独立 system prompt、模型、上下文和结构化动作；客户可表示接受/拒绝，风控可批准/退回，交易台可出具/拒绝报价。但正式价格、硬约束、技术可执行性、组合状态、结算算术、technical margin 和主指标只由确定性核心产生。LLM 角色共同形成的 `workflow_deal` 作为次级多智能体结果，不能替代主榜的 `hard_executable/technical_margin`。否则主榜测到的是“结构师 × NPC 阵容”的随机配对，而不是受测结构师能力。
 
 主论文应表述为：LLM 能否在多角色、部分可观测、长周期工作流中合成可执行结构化产品；不要声称模拟真实交易台定价、真实流动性或真实客户成交。
 
 ## 0. 事实核验与行号校正
 
-1. CLI 单跑链路在 `mirage/benchmark_cli.py:286-300`，manifest 链路在 `:149-186`。`run_episode` 只接收一个 `client`（`mirage/benchmark_runner.py:144-151`），唯一角色调用是 `client.chat(...)`（`:177-179`），唯一 system prompt 定义于 `:73-97`、装入消息于 `:155`。客户 query 是字典映射（`mirage/benchmark.py:573-589`），风控是 `HardConstraintEngine`（`:342-406`），交易台是确定性 `TradingDesk.quote`（`:434-487`）。审计结论成立。
-2. `MARKUP=1.03`、`HEDGE_COST_RATIO=1.02` 位于 `mirage/pricing.py:13-16`；hedging cost 在 `:716-722`，client price 在 `:725-761`（赋值 `:739`），margin 取差在 `mirage/benchmark.py:475-483`，故严格为 `0.01×FV`。FV 对 notional 线性（`pricing.py:584-587,619-622,690-691`），最大名义策略会机械放大利润。
-3. oracle 最大 fraction 常数确在 `mirage/benchmark.py:701`，实际生成在 `:745-754`；agent 的客户资金上限是 100% capital（`:380-381`，另受组合限额），attainment 未截断（`benchmark_runner.py:323-328`）。相同结构且其他约束不绑定时可约达 10；当前 oracle 不是 agent 域上界。
-4. 六维 judge 入口在 `mirage/judge.py:94-113`，一致性/翻转工具在 `:169-195`；全仓生产 Python 无调用，只有 `tests/test_judge.py` 使用。`docs/BENCHMARK_PROTOCOL.md:72-87` 却承诺 judge 结果，审计成立。
-5. 环境自动选择 archive 最佳可行报价并替交在 `mirage/benchmark_runner.py:263-270`。旧 playground 只是再要求模型 `submit_product|skip_round`（`mirage/agents.py:300-337`；`HEAD:mirage/engine.py:301-328`），并不替模型选最优。
-6. `worst_case_payoff_ratio` 只有 0/1（`mirage/benchmark.py:329-339`），`CLIENT_MAX_LOSS` 使用 `1-floor`（`:361-388`），确已退化。行号措辞需纠偏：`_stress_loss` 实际在 `benchmark.py:409-431`，不在 `pricing.py`；连续 `loss_frac` 在 `pricing.py:725-762`，MC `expected_loss_frac` 由 `:287-358` 产出。
-7. 仅 `partial_dynamic` 有 3 seeds，其他格子 n=1（`mirage/experiment.py:30-50`）；contrast 只求均值（`:69-105`），CLI aggregate 也仅求均值（`benchmark_cli.py:230-245`），无 CI。
-8. 旧实现可复用：`AgentSpec` 有 prompt/model（`mirage/scenario.py:35-43`），`EnvironmentAgent` 有独立 history/system prompt（`mirage/agents.py:104-129`），历史引擎持有 `env_agents`（`HEAD:mirage/engine.py:57-78`）并按轮注入客户状态（`:85-119`）。但有合法草案时 desk/risk 会跳过 LLM、返回确定性块（`:253-264`）；新架构应把 LLM 表达与正式事实显式拆开，而非直接恢复旧文件。
+1. CLI 单跑链路在 `stochopia/benchmark_cli.py:286-300`，manifest 链路在 `:149-186`。`run_episode` 只接收一个 `client`（`stochopia/benchmark_runner.py:144-151`），唯一角色调用是 `client.chat(...)`（`:177-179`），唯一 system prompt 定义于 `:73-97`、装入消息于 `:155`。客户 query 是字典映射（`stochopia/benchmark.py:573-589`），风控是 `HardConstraintEngine`（`:342-406`），交易台是确定性 `TradingDesk.quote`（`:434-487`）。审计结论成立。
+2. `MARKUP=1.03`、`HEDGE_COST_RATIO=1.02` 位于 `stochopia/pricing.py:13-16`；hedging cost 在 `:716-722`，client price 在 `:725-761`（赋值 `:739`），margin 取差在 `stochopia/benchmark.py:475-483`，故严格为 `0.01×FV`。FV 对 notional 线性（`pricing.py:584-587,619-622,690-691`），最大名义策略会机械放大利润。
+3. oracle 最大 fraction 常数确在 `stochopia/benchmark.py:701`，实际生成在 `:745-754`；agent 的客户资金上限是 100% capital（`:380-381`，另受组合限额），attainment 未截断（`benchmark_runner.py:323-328`）。相同结构且其他约束不绑定时可约达 10；当前 oracle 不是 agent 域上界。
+4. 六维 judge 入口在 `stochopia/judge.py:94-113`，一致性/翻转工具在 `:169-195`；全仓生产 Python 无调用，只有 `tests/test_judge.py` 使用。`docs/BENCHMARK_PROTOCOL.md:72-87` 却承诺 judge 结果，审计成立。
+5. 环境自动选择 archive 最佳可行报价并替交在 `stochopia/benchmark_runner.py:263-270`。旧 playground 只是再要求模型 `submit_product|skip_round`（`stochopia/agents.py:300-337`；`HEAD:stochopia/engine.py:301-328`），并不替模型选最优。
+6. `worst_case_payoff_ratio` 只有 0/1（`stochopia/benchmark.py:329-339`），`CLIENT_MAX_LOSS` 使用 `1-floor`（`:361-388`），确已退化。行号措辞需纠偏：`_stress_loss` 实际在 `benchmark.py:409-431`，不在 `pricing.py`；连续 `loss_frac` 在 `pricing.py:725-762`，MC `expected_loss_frac` 由 `:287-358` 产出。
+7. 仅 `partial_dynamic` 有 3 seeds，其他格子 n=1（`stochopia/experiment.py:30-50`）；contrast 只求均值（`:69-105`），CLI aggregate 也仅求均值（`benchmark_cli.py:230-245`），无 CI。
+8. 旧实现可复用：`AgentSpec` 有 prompt/model（`stochopia/scenario.py:35-43`），`EnvironmentAgent` 有独立 history/system prompt（`stochopia/agents.py:104-129`），历史引擎持有 `env_agents`（`HEAD:stochopia/engine.py:57-78`）并按轮注入客户状态（`:85-119`）。但有合法草案时 desk/risk 会跳过 LLM、返回确定性块（`:253-264`）；新架构应把 LLM 表达与正式事实显式拆开，而非直接恢复旧文件。
 
 ---
 
@@ -131,7 +131,7 @@ def settle_submission(
 
 `settle_submission` 是无 I/O 纯函数。主榜的成交/portfolio 更新仅依据 `technical.hard_executable && client_contract_pass`；`workflow_deal = hard_executable && desk.issue && risk.approve && client.accept` 单列为行为结果，不改变 technical settlement。另报 `llm_action_vs_formal_truth` 分歧率。Judge 永不参与结算。
 
-`client_contract_pass` 确定性检查 capital、maturity、whitelist、protection、连续 loss proxy 和 `hurdle_hit_prob >= min_hit_prob`；旧 `ClientProfile.would_buy` 的相应逻辑在 `mirage/products.py:94-141`。客户 LLM 的态度不覆盖合同门。
+`client_contract_pass` 确定性检查 capital、maturity、whitelist、protection、连续 loss proxy 和 `hurdle_hit_prob >= min_hit_prob`；旧 `ClientProfile.would_buy` 的相应逻辑在 `stochopia/products.py:94-141`。客户 LLM 的态度不覆盖合同门。
 
 ### 1.2 交互协议
 
@@ -175,7 +175,7 @@ def validate_grounding(
 - `economic_replay`：给定冻结动作/角色响应 trace，定价、硬检查、技术结算和指标完全一致；这是论文可主张的确定性复现。
 - `conversation_replay`：保存 canonical request/response、真实模型 ID、provider、system prompt SHA256、generation config、usage、时间和 response SHA256；从 artifact 回放逐字节一致。重新 live 调 API 只称同配置重复，不能称精确复现。
 
-现 OpenAI-compatible client 只是尽力传 seed（`mirage/llm.py:123-146`），Anthropic 路径明确忽略 seed（`:243-272`），所以不能承诺 fresh-call 位级复现。
+现 OpenAI-compatible client 只是尽力传 seed（`stochopia/llm.py:123-146`），Anthropic 路径明确忽略 seed（`:243-272`），所以不能承诺 fresh-call 位级复现。
 
 ```python
 def derive_seed(namespace: str, *parts: str | int) -> int:
@@ -219,23 +219,23 @@ class RoleFailure:
 
 ## 2. 角色配置 schema
 
-当前 `ModelConfig` 只允许 provider/base_url/model/api_key/temperature/max_tokens/timeout（`mirage/llm.py:27-38,58-88`）。连接信息继续放 `config/models.yaml`，角色行为放新 `config/benchmark_roles.yaml`：
+当前 `ModelConfig` 只允许 provider/base_url/model/api_key/temperature/max_tokens/timeout（`stochopia/llm.py:27-38,58-88`）。连接信息继续放 `config/models.yaml`，角色行为放新 `config/benchmark_roles.yaml`：
 
 ```yaml
-protocol_version: mirage-csi-v2.0
-main_npc_lineup_id: npc-fixed-v1
+protocol_version: stochopia.csi.legacy.v1
+main_npc_lineup_id: stochopia.npc-lineup.fixed.v1
 roles:
   structurer:
     role: structurer
     model_ref: ${job.model}
-    system_prompt_file: scenarios/mirage_csi/prompts/structurer.md
+    system_prompt_file: scenarios/stochopia_csi/prompts/structurer.md
     temperature: 0.0
     max_tokens: 1800
     timeout_s: 60
     seed_policy: derived
     seed_offset: 1000
     retry: {transport_retries: 2, format_retries: 1}
-    output_schema: structurer_action_v1
+    output_schema: stochopia.role.structurer-action.v1
     tools: [query_client, review_desk, review_risk, submit_design, skip_round]
     max_calls_per_round: 9
     history_scope: episode
@@ -243,15 +243,15 @@ roles:
   client_main:
     role: client
     model_ref: deepseek-v4-flash
-    system_prompt_file: scenarios/mirage_csi/prompts/client_main.md
-    private_state_file: scenarios/mirage_csi/client.example.json
+    system_prompt_file: scenarios/stochopia_csi/prompts/client_main.md
+    private_state_file: scenarios/stochopia_csi/client.example.json
     temperature: 0.2
     max_tokens: 500
     timeout_s: 30
     seed_policy: derived
     seed_offset: 2000
     retry: {transport_retries: 2, format_retries: 1}
-    output_schema: client_response_v1
+    output_schema: stochopia.role.client-response.v1
     tools: []
     max_calls_per_round: 4
     history_scope: episode
@@ -260,14 +260,14 @@ roles:
   risk_control:
     role: risk_control
     model_ref: deepseek-v4-flash
-    system_prompt_file: scenarios/mirage_csi/prompts/risk_control.md
+    system_prompt_file: scenarios/stochopia_csi/prompts/risk_control.md
     temperature: 0.0
     max_tokens: 600
     timeout_s: 30
     seed_policy: derived
     seed_offset: 3000
     retry: {transport_retries: 2, format_retries: 1}
-    output_schema: risk_response_v1
+    output_schema: stochopia.role.risk-response.v1
     tools: []
     max_calls_per_round: 3
     history_scope: round
@@ -276,14 +276,14 @@ roles:
   trading_desk:
     role: trading_desk
     model_ref: qwen-max
-    system_prompt_file: scenarios/mirage_csi/prompts/trading_desk.md
+    system_prompt_file: scenarios/stochopia_csi/prompts/trading_desk.md
     temperature: 0.0
     max_tokens: 600
     timeout_s: 30
     seed_policy: derived
     seed_offset: 4000
     retry: {transport_retries: 2, format_retries: 1}
-    output_schema: desk_response_v1
+    output_schema: stochopia.role.trading-desk-response.v1
     tools: []
     max_calls_per_round: 3
     history_scope: round
@@ -291,7 +291,7 @@ roles:
     failure_policy: decline
 judges:
   models: [deepseek-v4-pro, qwen-max]
-  system_prompt_file: scenarios/mirage_csi/prompts/judge.md
+  system_prompt_file: scenarios/stochopia_csi/prompts/judge.md
   repeats: 3
   temperature: 0.0
   max_tokens: 1200
@@ -339,7 +339,7 @@ loader 必须拒绝未知字段、重复 role、缺 prompt、模型不存在、s
 
 ### 3.1 可计算量与扩展点
 
-当前 `MarketSnapshot` 无真实 bid/ask（`mirage/benchmark.py:42-61`），不能把 proxy 冒充实盘买卖价差。截稿版使用“MC model spread proxy”，论文明确其含义；真实 bid/ask 校准放 Should。
+当前 `MarketSnapshot` 无真实 bid/ask（`stochopia/benchmark.py:42-61`），不能把 proxy 冒充实盘买卖价差。截稿版使用“MC model spread proxy”，论文明确其含义；真实 bid/ask 校准放 Should。
 
 ```python
 @dataclass(frozen=True)
@@ -719,18 +719,18 @@ def holm_adjust(p_values: dict[str, float]) -> dict[str, float]: ...
 
 | 文件 | 具体迁移 | 验收 |
 |---|---|---|
-| `mirage/role_config.py`（新） | `RoleSpecV2/InferenceSpec/RetryPolicy/load_role_specs`、prompt hash、严格 schema | 四角色独立 prompt/model；坏配置 fail fast |
-| `mirage/agents.py` | generic `RoleRuntime`、四类 strict parser、grounding validator、独立 history | 环境 LLM 不能越权生成数字；故障有类型 |
-| `mirage/scenario.py` | `AgentSpec` 迁至 RoleSpecV2；scenario 只引用 roles config/private state | 客户私有字段不进 public brief |
-| `mirage/pricing.py` | `PricingResult/MCDiagnostics/QuotePolicy/quote_economics`；扩 `_mc_stats` 二阶矩与事件；拆 loss 字段 | margin 非 1%FV；同 seed CRN；负 margin 可见 |
-| `mirage/benchmark.py` | `ProductDomainSpec`、共享 validate/enumerate、ClientLossMeasure、engine-signed Quote、纯 settlement | agent=oracle 域；loss 连续；settlement 无 I/O |
-| `mirage/benchmark_runner.py` | 多角色 orchestrator/event log、SeedBook/failure、submission origin；删除 auto-best | no-submit 不成交；trace 可 replay |
-| `mirage/judge.py` | blind input、multi-judge batch、span validation、missing/median/IQR | judge 离线且不污染经济结果 |
-| `mirage/experiment.py` | 每格 repeats、分角色 seed、cluster CI、paired tests | 全主格 n≥3；CI 可固定 seed 重算 |
-| `mirage/benchmark_cli.py` | `--roles-config --npc-lineup --replicate --response-store --replay-trace`；经济/judge 分文件 | resume 不重复收费；failure 分类补跑 |
+| `stochopia/role_config.py`（新） | `RoleSpecV2/InferenceSpec/RetryPolicy/load_role_specs`、prompt hash、严格 schema | 四角色独立 prompt/model；坏配置 fail fast |
+| `stochopia/agents.py` | generic `RoleRuntime`、四类 strict parser、grounding validator、独立 history | 环境 LLM 不能越权生成数字；故障有类型 |
+| `stochopia/scenario.py` | `AgentSpec` 迁至 RoleSpecV2；scenario 只引用 roles config/private state | 客户私有字段不进 public brief |
+| `stochopia/pricing.py` | `PricingResult/MCDiagnostics/QuotePolicy/quote_economics`；扩 `_mc_stats` 二阶矩与事件；拆 loss 字段 | margin 非 1%FV；同 seed CRN；负 margin 可见 |
+| `stochopia/benchmark.py` | `ProductDomainSpec`、共享 validate/enumerate、ClientLossMeasure、engine-signed Quote、纯 settlement | agent=oracle 域；loss 连续；settlement 无 I/O |
+| `stochopia/benchmark_runner.py` | 多角色 orchestrator/event log、SeedBook/failure、submission origin；删除 auto-best | no-submit 不成交；trace 可 replay |
+| `stochopia/judge.py` | blind input、multi-judge batch、span validation、missing/median/IQR | judge 离线且不污染经济结果 |
+| `stochopia/experiment.py` | 每格 repeats、分角色 seed、cluster CI、paired tests | 全主格 n≥3；CI 可固定 seed 重算 |
+| `stochopia/benchmark_cli.py` | `--roles-config --npc-lineup --replicate --response-store --replay-trace`；经济/judge 分文件 | resume 不重复收费；failure 分类补跑 |
 | `config/models.yaml` | 只保留 provider connection；记录 seed support | 不误称所有 provider 支持 seed |
 | `config/benchmark_roles.yaml`（新） | 本文角色 schema、固定主 NPC lineup | run artifact 保存完整配置/hash |
-| `scenarios/mirage_csi/prompts/*.md`（新） | 四角色+judge 独立 system prompt；移植历史角色设定和数字禁令 | 角色私有知识/工具权限不串线 |
+| `scenarios/stochopia_csi/prompts/*.md`（新） | 四角色+judge 独立 system prompt；移植历史角色设定和数字禁令 | 角色私有知识/工具权限不串线 |
 | `docs/BENCHMARK_PROTOCOL.md` | 双层结果、proxy spread/loss 限定、两 track oracle、judge/CI 实际口径 | 文档承诺均有运行产物 |
 | `tests/test_roles.py`（新） | parser/grounding/timeout/repair/history/prompt injection | 环境故障不造 fallback 答案 |
 | `tests/test_pricing_economics.py`（新） | 公式 golden cases、CRN、容量凹性、结构差异 | 不再恒等；最大 N 非必然最优 |
@@ -739,7 +739,7 @@ def holm_adjust(p_values: dict[str, float]) -> dict[str, float]: ...
 | `tests/test_judge.py` | blind/span/same-family/missing/batch join | judge 可复算且不影响 accepted |
 | `tests/test_experiment.py` | 全格 repeats、seed 派生、paired bootstrap deterministic | CI 固定 seed 可重算 |
 
-不要恢复 `HEAD:mirage/engine.py` 到正式路径；只移植多 agent map、独立 history、按轮注入思想。
+不要恢复 `HEAD:stochopia/engine.py` 到正式路径；只移植多 agent map、独立 history、按轮注入思想。
 
 ### 9.2 Must / Should / Could
 

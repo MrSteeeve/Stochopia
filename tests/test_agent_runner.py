@@ -12,23 +12,23 @@ from pathlib import Path
 
 import pytest
 
-import mirage.llm as llm_module
-from mirage.benchmark import MarketSnapshot, RiskBudget
-from mirage.benchmark_cli import main
-from mirage.environment import (
+import stochopia.llm as llm_module
+from stochopia.benchmark import MarketSnapshot, RiskBudget
+from stochopia.benchmark_cli import main
+from stochopia.environment import (
     AgentActionError,
     CommandAgentPolicy,
     EpisodeTask,
     LLMAgentPolicy,
-    MirageStructurerEnv,
+    StochopiaStructurerEnv,
     Skip,
     create_api_agent_policy,
     parse_environment_action,
     run_agent_episode,
     verify_trajectory,
 )
-from mirage.llm import LLMError, MockLLMClient
-from mirage.products import ClientProfile
+from stochopia.llm import LLMError, MockLLMClient
+from stochopia.products import ClientProfile
 
 
 class _AgentAPIResponse:
@@ -160,7 +160,7 @@ async def test_api_policy_runs_same_v3_trajectory_without_privileged_state(tmp_p
     output = tmp_path / "trajectory.json"
 
     result = await run_agent_episode(
-        MirageStructurerEnv(_task()),
+        StochopiaStructurerEnv(_task()),
         policy,
         trajectory_path=output,
     )
@@ -191,7 +191,7 @@ async def test_command_policy_uses_versioned_json_stdio_protocol(tmp_path):
                 [
                     "import json, sys",
                     "request = json.load(sys.stdin)",
-                    "assert request['schema'] == 'mirage.agent-request.v3'",
+                    "assert request['schema'] == 'stochopia.agent-request.v1'",
                     "assert 'system_prompt' in request",
                     "assert 'task_manifest' not in request",
                     "assert 'task_hash' not in request",
@@ -203,7 +203,7 @@ async def test_command_policy_uses_versioned_json_stdio_protocol(tmp_path):
                     "schema = request['action_schema']",
                     "assert schema['target_client'] == 'current_client'",
                     "assert schema['product_domain_version'] == "
-                    "'csi-domain-v3-action-contract'",
+                    "'stochopia.product-domain.csi-action-contract.v1'",
                     "assert set(schema['client_topic_enum']) == "
                     "{'capital','loss_tolerance','maturity','product_types',"
                     "'protection','preferences','purchase_status',"
@@ -219,7 +219,7 @@ async def test_command_policy_uses_versioned_json_stdio_protocol(tmp_path):
     )
     policy = CommandAgentPolicy([sys.executable, str(script)])
 
-    result = await run_agent_episode(MirageStructurerEnv(_task()), policy)
+    result = await run_agent_episode(StochopiaStructurerEnv(_task()), policy)
 
     assert result.status == "terminated"
     assert result.steps == 2
@@ -231,7 +231,7 @@ async def test_command_policy_uses_versioned_json_stdio_protocol(tmp_path):
     )
     assert result.trajectory["public_action_schema"][
         "schema_version"
-    ] == "mirage.environment.action-schema.v3"
+    ] == "stochopia.environment.action-schema.v1"
 
 
 @pytest.mark.asyncio
@@ -242,7 +242,7 @@ async def test_malformed_agent_output_is_recorded_and_bounded():
     )
 
     result = await run_agent_episode(
-        MirageStructurerEnv(_task(), max_steps_per_round=2),
+        StochopiaStructurerEnv(_task(), max_steps_per_round=2),
         policy,
     )
 
@@ -264,7 +264,7 @@ async def test_command_failure_is_infrastructure_not_agent_action(tmp_path):
     output = tmp_path / "partial-trajectory.json"
 
     result = await run_agent_episode(
-        MirageStructurerEnv(_task()),
+        StochopiaStructurerEnv(_task()),
         CommandAgentPolicy([sys.executable, str(script)]),
         trajectory_path=output,
     )
@@ -299,7 +299,7 @@ async def test_command_timeout_kills_descendant_process_group(tmp_path):
     )
 
     result = await run_agent_episode(
-        MirageStructurerEnv(_task()),
+        StochopiaStructurerEnv(_task()),
         CommandAgentPolicy(
             [sys.executable, str(script)],
             timeout=0.05,
@@ -314,23 +314,23 @@ async def test_command_timeout_kills_descendant_process_group(tmp_path):
 
 
 def test_direct_api_policy_requires_key_but_never_accepts_key_value(monkeypatch):
-    monkeypatch.delenv("MIRAGE_TEST_API_KEY", raising=False)
-    with pytest.raises(LLMError, match="MIRAGE_TEST_API_KEY"):
+    monkeypatch.delenv("STOCHOPIA_TEST_API_KEY", raising=False)
+    with pytest.raises(LLMError, match="STOCHOPIA_TEST_API_KEY"):
         create_api_agent_policy(
             provider="openai-compatible",
             base_url="https://example.test/v1",
             model="test-model",
-            api_key_env="MIRAGE_TEST_API_KEY",
+            api_key_env="STOCHOPIA_TEST_API_KEY",
         )
 
-    monkeypatch.setenv("MIRAGE_TEST_API_KEY", "top-secret")
+    monkeypatch.setenv("STOCHOPIA_TEST_API_KEY", "top-secret")
     policy = create_api_agent_policy(
         provider="openai-compatible",
         base_url="https://example.test/v1",
         model="test-model",
-        api_key_env="MIRAGE_TEST_API_KEY",
+        api_key_env="STOCHOPIA_TEST_API_KEY",
     )
-    assert policy.client.config.api_key_env == "MIRAGE_TEST_API_KEY"
+    assert policy.client.config.api_key_env == "STOCHOPIA_TEST_API_KEY"
     assert "top-secret" not in policy.name
 
 
@@ -338,7 +338,7 @@ def test_direct_api_policy_requires_key_but_never_accepts_key_value(monkeypatch)
 async def test_openai_compatible_adapter_runs_end_to_end_without_secret_leak(
     monkeypatch,
 ):
-    monkeypatch.setenv("MIRAGE_TEST_API_KEY", "adapter-secret")
+    monkeypatch.setenv("STOCHOPIA_TEST_API_KEY", "adapter-secret")
     monkeypatch.setattr(
         llm_module.httpx,
         "AsyncClient",
@@ -349,13 +349,13 @@ async def test_openai_compatible_adapter_runs_end_to_end_without_secret_leak(
         provider="openai-compatible",
         base_url="https://example.test/v1",
         model="provider-model-id",
-        api_key_env="MIRAGE_TEST_API_KEY",
+        api_key_env="STOCHOPIA_TEST_API_KEY",
         temperature=0.1,
         max_tokens=1234,
         timeout=9.0,
     )
 
-    result = await run_agent_episode(MirageStructurerEnv(_task()), policy)
+    result = await run_agent_episode(StochopiaStructurerEnv(_task()), policy)
 
     assert result.status == "terminated"
     assert len(_AgentAPIFakeHTTP.requests) == 2
@@ -365,7 +365,7 @@ async def test_openai_compatible_adapter_runs_end_to_end_without_secret_leak(
     )
     first_request = _AgentAPIFakeHTTP.requests[0]["payload"]
     policy_request = json.loads(first_request["messages"][1]["content"])
-    assert policy_request["schema"] == "mirage.agent-request.v3"
+    assert policy_request["schema"] == "stochopia.agent-request.v1"
     assert policy_request["action_schema"]["client_topic_enum"]
     assert first_request["model"] == "provider-model-id"
     assert first_request["temperature"] == pytest.approx(0.1)
@@ -398,13 +398,13 @@ def test_test_agent_cli_writes_verified_trajectory_and_summary(tmp_path):
     exit_code = main(
         [
             "test-agent",
-            str(root / "scenarios/mirage_csi/market_snapshots.example.csv"),
+            str(root / "scenarios/stochopia_csi/market_snapshots.example.csv"),
             "--episode",
             "SYNTHETIC_CSI500_DEMO",
             "--client-json",
-            str(root / "scenarios/mirage_csi/client.example.json"),
+            str(root / "scenarios/stochopia_csi/client.example.json"),
             "--risk-budget-json",
-            str(root / "scenarios/mirage_csi/risk_budget.example.json"),
+            str(root / "scenarios/stochopia_csi/risk_budget.example.json"),
             "--agent-command",
             command,
             "--output",
@@ -417,7 +417,7 @@ def test_test_agent_cli_writes_verified_trajectory_and_summary(tmp_path):
     assert exit_code == 0
     assert verify_trajectory(trajectory)
     payload = json.loads(summary.read_text(encoding="utf-8"))
-    assert payload["schema"] == "mirage.agent-run.v3"
+    assert payload["schema"] == "stochopia.agent-run.v1"
     assert payload["policy_kind"] == "command"
     assert payload["status"] == "terminated"
     assert payload["constraint_summary"]["steps"] == payload["steps"]
@@ -438,13 +438,13 @@ def test_test_agent_cli_returns_nonzero_for_infrastructure_failure(tmp_path):
     exit_code = main(
         [
             "test-agent",
-            str(root / "scenarios/mirage_csi/market_snapshots.example.csv"),
+            str(root / "scenarios/stochopia_csi/market_snapshots.example.csv"),
             "--episode",
             "SYNTHETIC_CSI500_DEMO",
             "--client-json",
-            str(root / "scenarios/mirage_csi/client.example.json"),
+            str(root / "scenarios/stochopia_csi/client.example.json"),
             "--risk-budget-json",
-            str(root / "scenarios/mirage_csi/risk_budget.example.json"),
+            str(root / "scenarios/stochopia_csi/risk_budget.example.json"),
             "--agent-command",
             command,
             "--output",
@@ -465,7 +465,7 @@ def test_test_agent_cli_returns_nonzero_for_infrastructure_failure(tmp_path):
 
 def test_v3_suite_run_replay_and_aggregate_cli(tmp_path):
     root = Path(__file__).resolve().parents[1]
-    scenario = root / "scenarios/mirage_csi"
+    scenario = root / "scenarios/stochopia_csi"
     script = tmp_path / "suite_agent.py"
     script.write_text(
         "import json, sys\n"

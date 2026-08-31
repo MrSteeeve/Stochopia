@@ -6,9 +6,9 @@ from datetime import date, timedelta
 
 import pytest
 
-from mirage.benchmark import MarketSnapshot
-from mirage.formal_option_iv import apply_full_phase, build_chain_iv, parse_mo_master, parse_sse_master
-from mirage.market_data_math import ShiborCurve, black76_price
+from stochopia.benchmark import MarketSnapshot
+from stochopia.formal_option_iv import apply_full_phase, build_chain_iv, parse_mo_master, parse_sse_master
+from stochopia.market_data_math import ShiborCurve, black76_price
 
 
 NODES = (1, 7, 14, 30, 91, 182, 274, 365)

@@ -1,16 +1,18 @@
-# MIRAGE CSI Protocol: v2 Legacy Benchmark and v3 Environment Spine
+# Stochopia CSI Protocol: v2 Legacy Benchmark and v3 Environment Spine
 
 > **Version boundary.** The factorial CLI commands and
-> `LongHorizonEnvironment` described below are the reproducible **v2 legacy
-> benchmark**. `mirage.environment` and `mirage-benchmark test-agent` are the
+> `LongHorizonEnvironment` described below are inherited **v2 engine surfaces**
+> that now emit Stochopia v1 artifacts; they do not accept pre-migration
+> trajectories, manifests, hashes or seeds. `stochopia.environment` and
+> `stochopia-benchmark test-agent` are the
 > **v3-spine / Level-0** synchronous interface, in which partial observability
 > and dynamic state are invariants rather than experimental conditions. v2
-> and v3 trajectories are versioned separately and must never be pooled in
-> one result table.
+> and v3 engine artifacts generated under Stochopia v1 are versioned separately
+> and must never be pooled in one result table.
 
 ## Research claim
 
-MIRAGE evaluates whether an LLM can repeatedly synthesize executable structured
+Stochopia evaluates whether an LLM can repeatedly synthesize executable structured
 contracts under partial observability, limited desk/client/risk interaction and
 portfolio risk carried across decisions. It does not claim open-ended financial
 invention or production-grade market pricing.
@@ -36,7 +38,7 @@ a monthly-snapshot approximation. Full/Static are not v3 task conditions.
 
 ## v3-spine / Level-0 boundary
 
-`mirage.environment.MirageStructurerEnv` exposes typed `reset`/`step`
+`stochopia.environment.StochopiaStructurerEnv` exposes typed `reset`/`step`
 transitions around the deterministic core. Its actions are `AskClient`,
 `RequestQuote`, `SubmitDesign`, `SubmitProduct`, `Skip` and `InvalidAction`;
 its output keeps an unscalarised `RewardComponents` vector and separate
@@ -72,12 +74,12 @@ trajectory metadata commits an environment-configuration hash.
 
 ### v3 external Agent interface
 
-`mirage.environment.agent_runner` is the only implemented policy-facing
+`stochopia.environment.agent_runner` is the only implemented policy-facing
 rollout layer for v3. It does not move LLM calls into the deterministic core:
 it converts an external response into a typed action and calls the same
-`MirageStructurerEnv.step()` entrypoint used by a training loop.
+`StochopiaStructurerEnv.step()` entrypoint used by a training loop.
 
-Two adapters share the versioned `mirage.agent-request.v3` request:
+Two adapters share the versioned `stochopia.agent-request.v1` request:
 
 - `CommandAgentPolicy` invokes a local executable directly, without a shell.
   Each step sends one JSON object on stdin and requires one action JSON on
@@ -88,7 +90,7 @@ Two adapters share the versioned `mirage.agent-request.v3` request:
   client directly from provider/base URL/model/API-key-environment-variable
   arguments, without requiring a `models.yaml` edit.
 
-The CLI exposes both through `mirage-benchmark test-agent`: use
+The CLI exposes both through `stochopia-benchmark test-agent`: use
 `--agent-command`, `--model` (registered), or the direct
 `--api-model/--api-base-url/--api-key-env` path. These choices are mutually
 exclusive. Literal secret values are not accepted; only the environment
@@ -160,7 +162,7 @@ policy name across different policy-configuration hashes.
 - Twelve half-year episodes, six month-end rounds each.
 - Per round: up to 3 `query_client` calls, up to 3 `consult` calls, up to 3
   `request_quote` calls, then a submission or a skip.
-- Frozen finite product action lattice `csi-domain-v3-action-contract` (below),
+- Frozen finite product action lattice `stochopia.product-domain.csi-action-contract.v1` (below),
   shared by the tested agent and the oracle.
 
 The released example snapshot (`market_snapshots.example.csv`) is synthetic and
@@ -179,10 +181,10 @@ F(K,T)=K+e^{rT}(C-P)
 \]
 
 so dividend and carrying-cost expectations are absorbed by the market-implied
-forward (`mirage.benchmark.option_implied_forward`). ETF fees are not deducted
+forward (`stochopia.benchmark.option_implied_forward`). ETF fees are not deducted
 again from ETF spot/NAV. Dividend-related contract adjustments must be
 normalized or the affected row excluded. Carry is perturbed by plus/minus 25 bp
-as a sensitivity check (`mirage.benchmark.carry_sensitivity`).
+as a sensitivity check (`stochopia.benchmark.carry_sensitivity`).
 
 ## Legacy v2 two-layer architecture
 
@@ -208,7 +210,7 @@ Offline: judge-runs batch over frozen voluntary submissions (never feeds back in
 There is no `TechnicalSettlement`/dialogue class hierarchy in code; the primary
 settlement is a plain dict returned by `LongHorizonEnvironment.submit_design`
 (and mirrored onto `RoundTrace` / `compute_metrics`), and the secondary layer is
-`mirage.benchmark.WorkflowOutcome` produced by the pure function
+`stochopia.benchmark.WorkflowOutcome` produced by the pure function
 `settle_submission`.
 
 **Fallback.** Passing no `--roles-config` to `run-episode` / `run-manifest`
@@ -221,8 +223,8 @@ config field.)
 
 ## Level-0 lattice and the legacy v2 oracle
 
-`mirage.benchmark.ProductDomainSpec`
-(`version="csi-domain-v3-action-contract"`) is a frozen
+`stochopia.benchmark.ProductDomainSpec`
+(`version="stochopia.product-domain.csi-action-contract.v1"`) is a frozen
 finite grid: 6 product families (`vanilla_call/put`, `barrier_call/put`,
 `autocallable`, `snowball`), 14 notional fractions (0.5% to 100%), maturities
 {3, 6, 12} months, strikes {0.95, 1.00, 1.05}, barriers
@@ -250,9 +252,11 @@ symmetry and a dedicated property test
 `test_voluntary_best_submission_attainment_le_one`) asserts the resulting
 attainment ratio can never exceed 1 + 1e-9.
 
-This oracle is retained only for frozen v2 reproduction. v3 task-suite
-evaluation does not treat it as a teacher or a unique correct answer; v3
-reports replay-derived outcome, constraint, efficiency and lifecycle metrics.
+This oracle is retained only for newly generated runs through the inherited v2
+engine workflow. It is not a compatibility layer for pre-migration artifacts.
+The v3 task-suite evaluation does not treat it as a teacher or a unique correct
+answer; v3 reports replay-derived outcome, constraint, efficiency and lifecycle
+metrics.
 
 `oracle_best_quote` is a **one-step** frontier: at the start of each round,
 before the agent acts, it prices every lattice candidate against the *current*
@@ -345,7 +349,7 @@ they are never collapsed into one boolean before being recorded.
 
 ## Continuous client loss proxy (`CLIENT_LOSS_BUDGET_V2` / `CONTRACT_LOSS`)
 
-`mirage.pricing.client_loss_measure` reports
+`stochopia.pricing.client_loss_measure` reports
 `observed_loss_frac = max(expected_loss_frac, premium_at_risk_frac,
 stress_loss_frac)` against `client.max_loss_pct`. All three legs use the
 client's actual cash funding denominator once a quote exists:
@@ -431,12 +435,12 @@ costs remain unavailable and are not imputed as zero.
 
 ## Risk budget calibration
 
-`mirage-benchmark calibrate-budget` runs `calibrate_risk_budget`: it scales a
+`stochopia-benchmark calibrate-budget` runs `calibrate_risk_budget`: it scales a
 base `RiskBudget` by a grid of factors (default 0.1 to 3.0 step 0.1, or an
 explicit `--factors` list), prices every lattice candidate against each
 development episode, and selects the factor whose feasible-candidate rate
 falls closest to the midpoint of the target band `[0.20, 0.40]`
-(`scenarios/mirage_csi/benchmark.yaml: risk_budget_calibration`). The full grid
+(`scenarios/stochopia_csi/benchmark.yaml: risk_budget_calibration`). The full grid
 and a `"freeze this result before evaluating held-out episodes"` warning are
 written to `--report-output`; the selected budget is written to
 `--budget-output`. Both budget and margin calibration resolve the client's
@@ -444,7 +448,7 @@ written to `--report-output`; the selected budget is written to
 that resolved client.
 
 `calibrate-budget`, `run-episode` and `run-manifest` all accept an optional
-`--quote-policy-json` (a JSON-serialised `mirage.pricing.QuotePolicy`, e.g.
+`--quote-policy-json` (a JSON-serialised `stochopia.pricing.QuotePolicy`, e.g.
 `data/derived/quote_policy.v2.candidate.json`): when given, quotes are priced
 with that policy instead of `QuotePolicy()`'s code defaults (`calibrate-budget`
 passes it through to `calibrate_risk_budget`'s new `policy` kwarg;
@@ -457,7 +461,7 @@ calibration bundle.
 
 ## `dealer_margin` economics
 
-`mirage.pricing.quote_economics` replaces the old constant 1% markup with a
+`stochopia.pricing.quote_economics` replaces the old constant 1% markup with a
 cost-plus structure. For a quote of notional `N` and fair value `F` (`f =
 F/N`):
 
@@ -502,19 +506,19 @@ approximation. Funded notes pass through the same function at their fixed par
 cash price. `MarketSnapshot.trend_alpha` is propagated into `MarketState` and
 is part of the hurdle cache key.
 
-The coefficients currently frozen in code (`mirage.pricing.QuotePolicy`
+The coefficients currently frozen in code (`stochopia.pricing.QuotePolicy`
 defaults) are: `a_f=0.030, a_v=0.25, a_p=0.002, a_b=0.75`,
 `b_f=0.020, b_v=0.75, b_p=0.004, b_b=1.00, b_l=0.003, b_q=0.015`,
 `client_cap=0.08, hedge_cap=0.10`, `suit_whitelist_miss=0.20,
 suit_protection_miss=0.10`, all `suit_w_* = 1.0`.
 
-`mirage.pricing.calibrate_quote_policy` grid-searches an overall scale on the
+`stochopia.pricing.calibrate_quote_policy` grid-searches an overall scale on the
 `a_*` markup coefficients (holding `b_*` fixed) against a pre-registered
 target: 20-60% of development candidates have positive margin, and the margin
 ranking across structures is non-degenerate (the largest-notional vanilla is
 not always optimal). It is covered by
 `tests/test_pricing_economics.py::test_calibrate_quote_policy_hits_target_band`
-and wired to `mirage-benchmark calibrate-margin`, which samples a fixed-seed
+and wired to `stochopia-benchmark calibrate-margin`, which samples a fixed-seed
 subset of the shared `ProductDomainSpec` lattice per (episode, round)
 development snapshot (`--candidates-per-snapshot`, default 30 -- the full
 lattice is tens of thousands of candidates, far more MC than a few minutes of
@@ -532,7 +536,7 @@ report before held-out evaluation begins.
 
 Four roles, each with an independent system prompt file, model and
 conversation history, configured in `config/benchmark_roles.yaml`
-(`protocol_version: mirage-csi-v2.0`, loaded by `mirage.role_config` with
+(`protocol_version: stochopia.csi.legacy.v1`, loaded by `stochopia.role_config` with
 fail-fast validation):
 
 | role id | role | model | temperature | history scope | numeric authority | failure policy |
@@ -542,7 +546,7 @@ fail-fast validation):
 | `risk_control` | env NPC | `deepseek-v4-flash` | 0.0 | round | `supplied_facts_only` | `escalate` |
 | `trading_desk` | env NPC | `qwen-max` | 0.0 | round | `supplied_facts_only` | `decline` |
 
-The three env-NPC roles are pinned as `main_npc_lineup_id: npc-fixed-v1`: only
+The three env-NPC roles are pinned as `main_npc_lineup_id: stochopia.npc-lineup.fixed.v1`: only
 the structurer's model varies across a benchmark run, so a tested model never
 also gets a different negotiation counterparty. `numeric_authority:
 supplied_facts_only` is enforced both at config-load time (`role_config`
@@ -552,8 +556,8 @@ not present in the `FormalFacts` handed to them for that call. The structurer
 has no such restriction (`numeric_authority: none`) since it is the model under
 test.
 
-`FrozenEnvAgent` (`mirage.env_agents`) wraps one role: strict JSON-schema
-parsing (`client_response_v1` / `risk_response_v1` / `desk_response_v1`, one
+`FrozenEnvAgent` (`stochopia.env_agents`) wraps one role: strict JSON-schema
+parsing (`stochopia.role.client-response.v1` / `stochopia.role.risk-response.v1` / `stochopia.role.trading-desk-response.v1`, one
 of `answer/counter/accept/reject/abstain`,
 `approve/request_revision/escalate`, `issue/decline/request_revision`
 respectively) with one format-repair retry, then grounding validation with one
@@ -563,7 +567,8 @@ deterministically from `(episode_id, round_num, role_id, turn_id)` via
 `stats.derive_seed` plus the role's `seed_offset`, so replaying a frozen
 episode reproduces the same seed sequence. An `EnvResponseCache`
 (`--env-cache-dir`, append-only JSONL) keys on
-`sha256(role_id|model|temperature|seed|canonical(messages))`, so an identical
+`sha256(inference_contract|protocol_version|role_id|model|temperature|seed|
+max_tokens|output_schema|canonical(messages))`, so an identical
 request from a different tested model hits the same frozen NPC reply, and
 every accepted role call is written to the cache for audit/replay.
 
@@ -590,7 +595,7 @@ settlement or the portfolio; it is reported as `workflow_deal_rate` and
 with the deterministic `accepted` outcome) -- a divergence-rate diagnostic, not
 a correctness label, since neither side is ground truth for the other.
 
-## Legacy v2 canonical metrics (`compute_metrics`, `mirage.benchmark_cli.CANONICAL_METRICS`)
+## Legacy v2 canonical metrics (`compute_metrics`, `stochopia.benchmark_cli.CANONICAL_METRICS`)
 
 Every round's submission has exactly one `submission_origin`:
 **voluntary** (submitted within the normal per-round action budget),
@@ -647,7 +652,7 @@ silently defaulting.
 
 ## Offline judge protocol
 
-Judging never feeds back into a run: `mirage-benchmark judge-runs` reads
+Judging never feeds back into a run: `stochopia-benchmark judge-runs` reads
 already-frozen `*.json` results and writes independent `<file>.judges.json` +
 `judge_manifest.json`, never touching the original result files.
 
@@ -684,12 +689,12 @@ already-frozen `*.json` results and writes independent `<file>.judges.json` +
   agreement, Spearman correlation of totals, and per-dimension quadratic
   weighted Cohen's kappa. `reliability_summary`'s output literally carries the
   claim string `"inter-judge reliability only; not expert-grounded validity"`
-  -- MIRAGE does not claim expert-grounded validity for the judge, only
+  -- Stochopia does not claim expert-grounded validity for the judge, only
   agreement between the two configured judge models.
 
 **Config-file defaults**: `config/benchmark_roles.yaml`'s `judges:` block
 (`models`, `repeats`, `temperature`, `max_tokens`, `blind_model_identity`) is
-loaded by `mirage.role_config.load_judges_config` into a `JudgesConfig`
+loaded by `stochopia.role_config.load_judges_config` into a `JudgesConfig`
 (unknown fields, model-count and registry-membership checks all fail fast).
 `judge-runs --roles-config config/benchmark_roles.yaml` reads it to fill in
 `--judge-models`/`--repeats` when those flags are omitted; an explicit
@@ -710,7 +715,7 @@ reject that key as unknown.
   sign-flips, sample selection) derives its seed from `stats.derive_seed`, a
   SHA-256-based deterministic derivation over an explicit namespace and parts
   -- never Python's built-in `hash()`, which is per-process randomized.
-- **Replicate design**: `mirage-benchmark make-manifest` builds every
+- **Replicate design**: `stochopia-benchmark make-manifest` builds every
   (episode, model, strategy, condition) cell with `n>=3` replicates, and
   over-samples `partial_dynamic` (full observability loss plus market drift,
   the hardest cell) to `n=5` (`DEFAULT_REPLICATES_BY_CONDITION`); replicate
@@ -740,9 +745,11 @@ reject that key as unknown.
   `protocol.primary_outcomes`).
   Every other metric/contrast is exploratory.
 
-## Reproducibility: two separate claims
+## Reproducibility: two separate Stochopia v1 claims
 
-MIRAGE does not claim bit-level reproducibility from a fresh API call to a
+These claims apply only to artifacts created with the current Stochopia v1
+schemas and seed namespaces; pre-migration artifacts are incompatible.
+Stochopia does not claim bit-level reproducibility from a fresh API call to a
 live model endpoint (provider/model updates and non-determinism persist even
 at temperature 0). It makes two narrower, implemented claims instead:
 
@@ -753,8 +760,9 @@ at temperature 0). It makes two narrower, implemented claims instead:
   `one_step_attainment` -- is a pure function of that input and recomputes
   identically every time, with no LLM call involved.
 - **`conversation_replay`**: env-role dialogue is reproducible from the
-  `EnvResponseCache` JSONL artifact (keyed by `role_id|model|temperature|
-  seed|max_tokens|output_schema|inference_contract|canonical(messages)`):
+  `EnvResponseCache` JSONL artifact (keyed by `inference_contract|
+  protocol_version|role_id|model|temperature|seed|max_tokens|output_schema|
+  canonical(messages)`):
   replaying the same request sequence against the same cache file reproduces
   the exact same NPC replies byte-for-byte, without re-calling any model.
 
@@ -762,70 +770,70 @@ at temperature 0). It makes two narrower, implemented claims instead:
 
 ```bash
 # Convert a public daily close file into leakage-safe month-end features.
-python -m mirage.benchmark_cli build-market daily.csv market_snapshots.csv
+python -m stochopia.benchmark_cli build-market daily.csv market_snapshots.csv
 
 # Validate schema, provenance and contiguous episode rounds.
-python -m mirage.benchmark_cli validate-market market_snapshots.csv
+python -m stochopia.benchmark_cli validate-market market_snapshots.csv
 
 # Freeze complete v3 inputs. The final row of every selected episode is the
 # terminal valuation snapshot rather than a policy decision.
-python -m mirage.benchmark_cli make-v3-suite market_snapshots.csv \
+python -m stochopia.benchmark_cli make-v3-suite market_snapshots.csv \
   --episodes CSI500_2024H1 CSI500_2024H2 \
   --client-json client.json --risk-budget-json risk_budget.json \
-  --name mirage-dev --version 1 --split dev \
-  --output tasks/mirage-dev.v3.json
+  --name stochopia-dev --version 1 --split dev \
+  --output tasks/stochopia-dev.v1.json
 
 # Run one external policy over every frozen task. Each trajectory is
 # immediately hash-verified and economically replayed before aggregation.
-python -m mirage.benchmark_cli run-v3-suite tasks/mirage-dev.v3.json \
+python -m stochopia.benchmark_cli run-v3-suite tasks/stochopia-dev.v1.json \
   --agent-command 'python my_agent.py' \
   --replicates 3 \
-  --output-dir outputs/mirage-dev \
+  --output-dir outputs/stochopia-dev \
   --bootstrap-resamples 10000
 
 # A separately received trajectory can be checked against the same suite.
-python -m mirage.benchmark_cli evaluate-trajectory \
-  outputs/mirage-dev/0000-example.trajectory.json \
-  --suite tasks/mirage-dev.v3.json \
+python -m stochopia.benchmark_cli evaluate-trajectory \
+  outputs/stochopia-dev/0000-example.trajectory.json \
+  --suite tasks/stochopia-dev.v1.json \
   --output outputs/example.evaluation.json
 
 # Aggregate only replay-verified evaluations from one suite.
-python -m mirage.benchmark_cli aggregate-v3 outputs/mirage-dev \
-  --output-json outputs/mirage-dev.aggregate.json \
-  --output-csv outputs/mirage-dev.aggregate.csv
+python -m stochopia.benchmark_cli aggregate-v3 outputs/stochopia-dev \
+  --output-json outputs/stochopia-dev.aggregate.json \
+  --output-csv outputs/stochopia-dev.aggregate.csv
 
-# The remaining commands reproduce the legacy v2 benchmark.
+# The remaining commands run inherited v2 engine workflows and emit Stochopia v1 artifacts.
 # Smoke-test the deterministic desk with the synthetic example.
-python -m mirage.benchmark_cli demo \
-  scenarios/mirage_csi/market_snapshots.example.csv \
+python -m stochopia.benchmark_cli demo \
+  scenarios/stochopia_csi/market_snapshots.example.csv \
   --episode SYNTHETIC_CSI500_DEMO \
-  --product-json scenarios/mirage_csi/product.example.json --full
+  --product-json scenarios/stochopia_csi/product.example.json --full
 
 # Calibrate and freeze the risk budget on development episodes only.
 # --quote-policy-json is optional (e.g. data/derived/quote_policy.v2.candidate.json);
 # omit it to price candidates with the default QuotePolicy.
-python -m mirage.benchmark_cli calibrate-budget market_snapshots.csv \
+python -m stochopia.benchmark_cli calibrate-budget market_snapshots.csv \
   --episodes CSI500_2023H1 CSI500_2023H2 \
-  --client-json scenarios/mirage_csi/client.example.json \
-  --base-budget-json scenarios/mirage_csi/risk_budget.example.json \
+  --client-json scenarios/stochopia_csi/client.example.json \
+  --base-budget-json scenarios/stochopia_csi/risk_budget.example.json \
   --report-output data/derived/budget_calibration_report.json \
   --budget-output data/derived/risk_budget.frozen.json
 
-# Calibrate and freeze the QuotePolicy markup scale (mirage.pricing.calibrate_quote_policy)
+# Calibrate and freeze the QuotePolicy markup scale (stochopia.pricing.calibrate_quote_policy)
 # on development episodes only, then report 0.8x/1.0x/1.2x sensitivity of the
 # selected policy.
-python -m mirage.benchmark_cli calibrate-margin market_snapshots.csv \
+python -m stochopia.benchmark_cli calibrate-margin market_snapshots.csv \
   --episodes CSI1000_2023H1 CSI500_2023H1 \
-  --client-json scenarios/mirage_csi/client.example.json \
+  --client-json scenarios/stochopia_csi/client.example.json \
   --report-output data/derived/quote_policy_calibration_report.json \
   --policy-output data/derived/quote_policy.v2.candidate.json
 
 # Run one registered model against one frozen episode; --roles-config and
 # --quote-policy-json are both optional (omit --roles-config to stay
 # pure-deterministic; omit --quote-policy-json to use the default QuotePolicy).
-python -m mirage.benchmark_cli run-episode market_snapshots.csv \
+python -m stochopia.benchmark_cli run-episode market_snapshots.csv \
   --episode CSI500_2023H1 \
-  --client-json scenarios/mirage_csi/client.example.json \
+  --client-json scenarios/stochopia_csi/client.example.json \
   --risk-budget-json data/derived/risk_budget.frozen.json \
   --model deepseek-v4-flash --strategy ledger_archive \
   --roles-config config/benchmark_roles.yaml \
@@ -835,7 +843,7 @@ python -m mirage.benchmark_cli run-episode market_snapshots.csv \
 
 # Freeze the complete factorial job manifest (n>=3, partial_dynamic n=5)
 # without spending API budget.
-python -m mirage.benchmark_cli make-manifest \
+python -m stochopia.benchmark_cli make-manifest \
   --episodes CSI500_2023H1 CSI500_2023H2 CSI500_2024H1 CSI500_2024H2 \
              CSI500_2025H1 CSI500_2025H2 CSI1000_2023H1 CSI1000_2023H2 \
              CSI1000_2024H1 CSI1000_2024H2 CSI1000_2025H1 CSI1000_2025H2 \
@@ -847,9 +855,9 @@ python -m mirage.benchmark_cli make-manifest \
 # quarantined and rerun; writes are atomic. A single failed job does not abort
 # the batch, and aggregate refuses mixed run fingerprints.
 # --quote-policy-json is optional (default QuotePolicy if omitted).
-python -m mirage.benchmark_cli run-manifest market_snapshots.csv \
+python -m stochopia.benchmark_cli run-manifest market_snapshots.csv \
   --manifest outputs/experiment_manifest.json \
-  --client-json scenarios/mirage_csi/client.example.json \
+  --client-json scenarios/stochopia_csi/client.example.json \
   --risk-budget-json data/derived/risk_budget.frozen.json \
   --roles-config config/benchmark_roles.yaml \
   --quote-policy-json data/derived/quote_policy.v2.candidate.json \
@@ -857,14 +865,14 @@ python -m mirage.benchmark_cli run-manifest market_snapshots.csv \
   --outputs-dir outputs/csi_benchmark
 
 # Aggregate results into CSV + markdown (cell CIs, paired contrasts, Holm).
-python -m mirage.benchmark_cli aggregate outputs/csi_benchmark \
+python -m stochopia.benchmark_cli aggregate outputs/csi_benchmark \
   --output-csv outputs/aggregate.csv --output-md outputs/aggregate.md
 
 # Offline blind judge batch over frozen voluntary submissions (never
 # touches the original result files). --judge-models/--repeats are optional
 # when --roles-config is given: they then default to config/benchmark_roles.yaml's
 # judges.models / judges.repeats; an explicit flag always overrides the file.
-python -m mirage.benchmark_cli judge-runs outputs/csi_benchmark \
+python -m stochopia.benchmark_cli judge-runs outputs/csi_benchmark \
   --roles-config config/benchmark_roles.yaml \
   --salt "$(openssl rand -hex 16)"
 ```

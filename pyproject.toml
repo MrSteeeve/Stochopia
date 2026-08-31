@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mirage-bench"
+name = "stochopia-bench"
 version = "0.2.0"
-description = "MIRAGE：面向 LLM Agent 的结构化衍生品动态训练与评测环境"
+description = "A stateful environment for training trading-desk agents under uncertainty"
 requires-python = ">=3.10"
 dependencies = [
     "httpx",
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mirage-benchmark = "mirage.benchmark_cli:main"
+stochopia-benchmark = "stochopia.benchmark_cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -29,4 +29,4 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["mirage"]
+packages = ["stochopia"]

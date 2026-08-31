@@ -1,4 +1,4 @@
-# MIRAGE 重设计方案（面向 ICAIF 2026，剩 16 天）
+# Stochopia 重设计方案（面向 ICAIF 2026，剩 16 天）
 
 版本：opus draft v1｜作者：架构设计角色｜不含生产代码，只给到函数签名与配置字段级别。
 
@@ -140,7 +140,7 @@ class AgentSpec:
     role_kind: str = "npc"            # 新增："client" | "trading_desk" | "risk_control"
 ```
 
-`scenarios/mirage_csi/benchmark.yaml` 新增 `env_agents` 节（角色 prompt 从旧 `scenarios/structurer_nasdaq/agents/*.md` 迁移复用，risk_control.md / trading_desk.md 几乎可直接用）：
+`scenarios/stochopia_csi/benchmark.yaml` 新增 `env_agents` 节（角色 prompt 统一放在 `scenarios/stochopia_csi/prompts/`，其中 risk_control.md / trading_desk.md 可直接复用其角色语义）：
 
 ```yaml
 env_agents:
@@ -402,7 +402,7 @@ temperature=0 使 seed 近乎冗余。把 **12 个 episode 当作主复制维度
 | 6 | `scenario.py` + `benchmark.yaml` + `agents/*.md` | `AgentSpec` 加字段；`load_benchmark_env_agents`；迁移旧 client/desk/risk prompt | 5 | 1d |
 | 7 | `benchmark.py`+`benchmark_runner.py` | `LongHorizonEnvironment.consult`；`run_episode` 接 `consult` 动作 + `adjudication="hard_and_client"` | 2,3,5,6 | 2d |
 | 8 | `judge.py` 接入 + CLI `judge-runs` | 捕获→离线批判→聚合 | 3 | 1d |
-| 9 | 数据管线子包 `mirage/data/` | 合并 `market_builder`+`formal_market_builder` 为一条；`tushare_*/cffex_data/formal_*/raw_data_audit/market_data_math` 归入子包；CLI 接 `build-market`/`audit`/`fetch` | 无（并行，隔离） | 2d |
+| 9 | 数据管线子包 `stochopia/data/` | 合并 `market_builder`+`formal_market_builder` 为一条；`tushare_*/cffex_data/formal_*/raw_data_audit/market_data_math` 归入子包；CLI 接 `build-market`/`audit`/`fetch` | 无（并行，隔离） | 2d |
 | 10 | 测试 + 文档 | 更新 `tests/`；`BENCHMARK_PROTOCOL.md` 对齐新指标口径 | 全部 | 1.5d |
 
 ### 9.2 三档裁剪线（16 天，硬约束 8 月 2 日）

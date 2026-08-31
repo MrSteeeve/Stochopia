@@ -1,4 +1,4 @@
-"""Offline tests for the MIRAGE Tushare initialization bridge."""
+"""Offline tests for the Stochopia Tushare initialization bridge."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mirage.tushare_data import (
+from stochopia.tushare_data import (
     DEFAULT_TUSHARE_HTTP_URL,
     TushareConfigurationError,
     create_pro_client,

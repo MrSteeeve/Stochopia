@@ -374,7 +374,7 @@ wheels = [
 ]
 
 [[package]]
-name = "mirage-bench"
+name = "stochopia-bench"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [

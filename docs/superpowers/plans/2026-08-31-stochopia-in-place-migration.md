@@ -22,7 +22,7 @@
 ## Task 3: Establish the Stochopia v1 Protocol Identity
 
 1. Replace protocol, schema, manifest, trajectory, evaluation, and experiment identifiers with `stochopia.*.v1` identifiers.
-2. Replace deterministic seed and sampling namespaces with `stochopia.*` equivalents.
+2. Replace deterministic seed, cache, and sampling namespaces with `stochopia.seed.<purpose>.v1` or another explicit `stochopia.<kind>.v1` identifier.
 3. Update scenario configuration, task-suite examples, and fixtures.
 4. Regenerate affected deterministic expected values through the repository's tests rather than preserving legacy hashes by alias.
 
@@ -31,7 +31,7 @@
 1. Update all test imports, class references, fixture paths, schema assertions, and CLI assertions.
 2. Update CI wheel smoke checks to the new distribution, package, and CLI.
 3. Update both READMEs, protocol/data-audit/redesign documents, design records, current research notes, and repository tree examples.
-4. Include the selected untracked market generator, its test, and current research notes.
+4. Include the selected untracked market generator, its test, and the reviewed research decision; retain the full private conversation transcript locally only.
 5. Keep `blobs/` and ignored local artifacts untracked.
 
 ## Task 5: Validate the Migration
@@ -54,9 +54,10 @@
 
 ## Task 7: Rename the Local Directory
 
-1. After remote verification, rename `/Users/williamqian/GitHub/eqd_simulation` to `/Users/williamqian/GitHub/Stochopia`.
-2. Verify the repository, status, remote, and `HEAD` from the new path.
-3. Report that the current Codex task may need to be reopened against the renamed directory.
+1. After remote verification, rename the local `eqd_simulation` directory to sibling directory `Stochopia`.
+2. Recreate `.venv` at the new path and reinstall the locked project so scripts, editable-package metadata, and direct URLs no longer reference the old absolute path.
+3. Verify tests or a focused post-move smoke check, repository status, remote, and `HEAD` from the new path.
+4. Report that the current Codex task may need to be reopened against the renamed directory.
 
 ## Stop Conditions
 
@@ -64,4 +65,3 @@
 - Stop before the GitHub rename if the migration diff includes secrets, third-party blobs, or unexplained deletions.
 - Stop before the local-directory rename unless the new GitHub name and pushed `main` are verified.
 - Preserve all local changes if a remote operation fails; never force-push.
-

@@ -1,4 +1,4 @@
-# MIRAGE 路线 A：形式化隐藏类型博弈设计
+# Stochopia 路线 A：形式化隐藏类型博弈设计
 
 日期：2026-08-13
 
@@ -11,7 +11,7 @@
 
 ## 1. 决策摘要
 
-MIRAGE 的下一阶段不增加自由角色扮演式 NPC，也不直接启动 PPO、GRPO
+Stochopia 的下一阶段不增加自由角色扮演式 NPC，也不直接启动 PPO、GRPO
 或双方共同学习。首个研究对象冻结为：
 
 > Desk-side Harness 已知自身 Book 和 Dealer type，但不知道 Client type；
@@ -22,7 +22,7 @@ Client 在第一阶段由版本化的形式响应核控制，不使用 LLM。外
 现有真实来源的月度回放；定价、Greeks、压力测试、硬约束、账户与生命周期
 继续由确定性金融内核控制。
 
-本设计将 MIRAGE 定位为：
+本设计将 Stochopia 定位为：
 
 > 真实市场回放上的、可审计的有限时域隐藏类型博弈 benchmark。
 
@@ -37,7 +37,7 @@ Client 在第一阶段由版本化的形式响应核控制，不使用 LLM。外
 允许查看的报价成本，但不知道 Client type。Client 使用固定形式响应核。
 
 采用理由：被测主体、效用归属、信息集和 regret 都可明确；有限类型和有限
-产品域可求精确参考策略；也能直接承接 MIRAGE 当前的 structurer/Harness
+产品域可求精确参考策略；也能直接承接 Stochopia 当前的 structurer/Harness
 接口。
 
 ### 2.2 方案 A2：中立结构师，不采用
@@ -68,7 +68,7 @@ cross-play 和非平稳训练协议；当前数据和评测无法区分机制问
 5. 所有硬约束、账户守恒、状态权限和经济重放保持正确。
 
 若类型没有决策价值，或薄 FSM 达到相同结果，则保留形式博弈作为独立
-benchmark 的可能性，但删除 MIRAGE 框架必要性与世界代理主张。
+benchmark 的可能性，但删除 Stochopia 框架必要性与世界代理主张。
 
 ## 4. 系统边界
 
@@ -538,7 +538,7 @@ quality authoritative kernel，并要求对 A0 的 canonical fixtures 逐 transi
   Desk 不能观察 response 后再行动。
 - random、greedy、memoryless。
 - 当前 v3 动态 Book、无策略 Client 的基线。
-- 脱离完整 MIRAGE runner 的极薄 FSM benchmark。
+- 脱离完整 Stochopia runner 的极薄 FSM benchmark。
 - 完整历史条件化的静态强基线。
 
 若有限状态空间无法精确求解，则先缩小类型、产品或轮次数量；首版不得用近似
@@ -597,7 +597,7 @@ J_D^{f,\theta'}(\pi^*_{\theta'})-J_D^{f,\theta'}(\pi^*_{\theta})>\epsilon_f
 \]
 
 才计一次 reversal。tie、仅产品 hash 不同但价值差不足、或单向 dominance 都
-不计。该定义证明“知道类型会改变正确策略”，但本身不证明 MIRAGE 框架必要。
+不计。该定义证明“知道类型会改变正确策略”，但本身不证明 Stochopia 框架必要。
 
 在完整冻结的 `mechanism_acceptance` family 上报告 pooled full-information gap
 恢复率：
@@ -709,7 +709,7 @@ Policy 的非法动作计入 policy failure；provider、进程、超时和 eval
 任一条件失败时：
 
 - 隐藏类型没有决策差异：退回静态 benchmark。
-- 薄 FSM 与完整框架等价：保留形式 game/protocol，删除 MIRAGE 框架必要性。
+- 薄 FSM 与完整框架等价：保留形式 game/protocol，删除 Stochopia 框架必要性。
 - 专家不认可效用排序：只称合成算法 benchmark，不称金融行为代理。
 - 存在泄漏、越权或重放错误：停止所有训练与结果发布。
 
@@ -786,4 +786,4 @@ Policy 的非法动作计入 policy failure；provider、进程、超时和 eval
 - 标记规格支持域之外的情形，要求系统拒答。
 
 若专家成本仍随 rollout 数量线性增长，或每个反事实分支都需专家给答案，
-则 MIRAGE 没有形成可复用环境价值，应停止扩张。
+则 Stochopia 没有形成可复用环境价值，应停止扩张。

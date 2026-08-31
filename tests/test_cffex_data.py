@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from mirage import cffex_data
+from stochopia import cffex_data
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "cffex" / "20230131_1.csv"

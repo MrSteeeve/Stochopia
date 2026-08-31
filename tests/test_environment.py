@@ -8,23 +8,23 @@ from datetime import date
 
 import pytest
 
-from mirage.benchmark import MarketSnapshot, ProductDomainSpec, RiskBudget
-from mirage.environment import (
+from stochopia.benchmark import MarketSnapshot, ProductDomainSpec, RiskBudget
+from stochopia.environment import (
     AskClient,
     EpisodeTask,
     InvalidAction,
-    MirageStructurerEnv,
+    StochopiaStructurerEnv,
     RequestQuote,
     ScalarizationSpec,
-    ScalarizedMirageEnv,
+    ScalarizedStochopiaEnv,
     Skip,
     SubmitDesign,
     SubmitProduct,
     TrajectoryRecorder,
     V3_PUBLIC_CLIENT_ALIAS,
 )
-from mirage.pricing import QuotePolicy
-from mirage.products import ClientProfile, ProductSpec
+from stochopia.pricing import QuotePolicy
+from stochopia.products import ClientProfile, ProductSpec
 
 
 def _task() -> EpisodeTask:
@@ -83,7 +83,7 @@ def _task() -> EpisodeTask:
         domain=ProductDomainSpec(),
         quote_policy=QuotePolicy(diagnostic_paths=256),
         task_seed=17,
-        schema="mirage.environment.test.v3",
+        schema="stochopia.environment.test.v1",
         version="test-task-v1",
     )
 
@@ -106,7 +106,7 @@ def _product() -> ProductSpec:
 
 
 def test_reset_is_deterministic_and_rebuilds_state():
-    env = MirageStructurerEnv(_task())
+    env = StochopiaStructurerEnv(_task())
     first_observation, first_info = env.reset()
     env.step(AskClient("capital"))
 
@@ -120,12 +120,12 @@ def test_reset_is_deterministic_and_rebuilds_state():
 
 
 def test_public_action_schema_is_complete_and_matches_runtime_domain():
-    env = MirageStructurerEnv(_task())
+    env = StochopiaStructurerEnv(_task())
     observation, _ = env.reset()
     schema = env.action_schema
 
-    assert schema["schema_version"] == "mirage.environment.action-schema.v3"
-    assert schema["product_domain_version"] == "csi-domain-v3-action-contract"
+    assert schema["schema_version"] == "stochopia.environment.action-schema.v1"
+    assert schema["product_domain_version"] == "stochopia.product-domain.csi-action-contract.v1"
     assert len(schema["client_topic_enum"]) == 9
     assert set(schema["client_topic_enum"]) == {
         "capital",
@@ -171,8 +171,8 @@ def test_public_action_schema_does_not_encode_hidden_client_capital():
         schema=first.schema,
         version=first.version,
     )
-    first_env = MirageStructurerEnv(first)
-    second_env = MirageStructurerEnv(second)
+    first_env = StochopiaStructurerEnv(first)
+    second_env = StochopiaStructurerEnv(second)
     first_observation, _ = first_env.reset()
     second_observation, _ = second_env.reset()
 
@@ -195,7 +195,7 @@ def test_task_manifest_detaches_reset_from_later_client_mutation():
     original_hash = task.task_hash
     task.client.capital = 1.0
 
-    env = MirageStructurerEnv(task, expose_privileged_info=True)
+    env = StochopiaStructurerEnv(task, expose_privileged_info=True)
     _, info = env.reset()
 
     assert info["privileged_state"]["client"]["capital"] == original_capital
@@ -203,7 +203,7 @@ def test_task_manifest_detaches_reset_from_later_client_mutation():
 
 
 def test_typed_quote_then_submit_auto_advances_round():
-    env = MirageStructurerEnv(_task())
+    env = StochopiaStructurerEnv(_task())
     env.reset()
 
     quoted = env.step(RequestQuote(_product()))
@@ -238,7 +238,7 @@ def test_typed_quote_then_submit_auto_advances_round():
 
 
 def test_submit_product_is_atomic_typed_quote_and_submission():
-    env = MirageStructurerEnv(_task())
+    env = StochopiaStructurerEnv(_task())
     env.reset()
 
     transition = env.step(SubmitProduct(_product(), "one-shot"))
@@ -272,7 +272,7 @@ def test_rejected_submission_cannot_earn_counterfactual_dealer_margin():
         schema=base.schema,
         version=base.version,
     )
-    env = MirageStructurerEnv(task)
+    env = StochopiaStructurerEnv(task)
     env.reset()
 
     transition = env.step(SubmitProduct(_product(), "not accepted"))
@@ -289,7 +289,7 @@ def test_rejected_submission_cannot_earn_counterfactual_dealer_margin():
 
 
 def test_horizon_liquidation_closes_accounts_and_enters_reward_summary():
-    env = MirageStructurerEnv(_task(), expose_privileged_info=True)
+    env = StochopiaStructurerEnv(_task(), expose_privileged_info=True)
     env.reset()
 
     issued = env.step(SubmitProduct(_product(), "one-shot"))
@@ -327,7 +327,7 @@ def test_horizon_liquidation_closes_accounts_and_enters_reward_summary():
 
 
 def test_query_cost_is_emitted_on_every_query_step():
-    env = MirageStructurerEnv(_task())
+    env = StochopiaStructurerEnv(_task())
     env.reset()
 
     capital = env.step(AskClient("capital"))
@@ -348,7 +348,7 @@ def test_query_cost_is_emitted_on_every_query_step():
 
 def test_direct_typed_product_pricing_error_becomes_constraint_signal():
     """Typed callers can bypass JSON parsing; numeric failures must not crash step()."""
-    env = MirageStructurerEnv(_task())
+    env = StochopiaStructurerEnv(_task())
     env.reset()
     invalid = ProductSpec(
         **{
@@ -366,7 +366,7 @@ def test_direct_typed_product_pricing_error_becomes_constraint_signal():
 
 
 def test_policy_cannot_forge_environment_maintained_product_state():
-    env = MirageStructurerEnv(_task())
+    env = StochopiaStructurerEnv(_task())
     env.reset()
     forged = ProductSpec(**{**asdict(_product()), "elapsed_months": 3})
 
@@ -379,7 +379,7 @@ def test_policy_cannot_forge_environment_maintained_product_state():
 
 
 def test_quote_binds_product_snapshot_against_post_quote_mutation():
-    env = MirageStructurerEnv(_task(), expose_privileged_info=True)
+    env = StochopiaStructurerEnv(_task(), expose_privileged_info=True)
     env.reset()
     mutable = _product()
     quoted = env.step(RequestQuote(mutable))
@@ -398,7 +398,7 @@ def test_quote_binds_product_snapshot_against_post_quote_mutation():
 
 
 def test_skip_advances_then_terminates_on_final_round():
-    env = MirageStructurerEnv(_task())
+    env = StochopiaStructurerEnv(_task())
     env.reset()
 
     first = env.step(Skip("no fit"))
@@ -415,7 +415,7 @@ def test_skip_advances_then_terminates_on_final_round():
 
 
 def test_privileged_state_is_hidden_by_default_and_evaluator_opt_in_is_explicit():
-    env = MirageStructurerEnv(_task())
+    env = StochopiaStructurerEnv(_task())
     observation, info = env.reset()
 
     public = asdict(observation)
@@ -427,14 +427,14 @@ def test_privileged_state_is_hidden_by_default_and_evaluator_opt_in_is_explicit(
     assert observation.disclosed_client == {}
     assert "privileged_state" not in info
 
-    evaluator = MirageStructurerEnv(_task(), expose_privileged_info=True)
+    evaluator = StochopiaStructurerEnv(_task(), expose_privileged_info=True)
     _, evaluator_info = evaluator.reset()
     assert evaluator_info["privileged_state"]["client"]["capital"] == 10_000_000.0
     assert evaluator_info["privileged_state"]["client"]["id"] == "client-hidden"
 
 
 def test_invalid_actions_hit_a_finite_round_time_limit():
-    env = MirageStructurerEnv(_task(), max_steps_per_round=2)
+    env = StochopiaStructurerEnv(_task(), max_steps_per_round=2)
     env.reset()
 
     first = env.step(InvalidAction("bad"))
@@ -452,7 +452,7 @@ def test_invalid_actions_hit_a_finite_round_time_limit():
 
 
 def test_available_action_mask_removes_exhausted_query_and_quote_actions():
-    env = MirageStructurerEnv(_task(), max_steps_per_round=12)
+    env = StochopiaStructurerEnv(_task(), max_steps_per_round=12)
     observation, _ = env.reset()
     assert {"ask_client", "request_quote", "submit_product"} <= set(
         observation.available_actions
@@ -470,8 +470,8 @@ def test_available_action_mask_removes_exhausted_query_and_quote_actions():
 
 
 def test_state_hash_commits_reward_config_and_reset_options():
-    base = MirageStructurerEnv(_task(), query_cost=-0.01)
-    costly = MirageStructurerEnv(_task(), query_cost=-99.0)
+    base = StochopiaStructurerEnv(_task(), query_cost=-0.01)
+    costly = StochopiaStructurerEnv(_task(), query_cost=-99.0)
     _, base_info = base.reset(options={"run_label": "a"})
     _, costly_info = costly.reset(options={"run_label": "a"})
     assert base_info["state_hash"] != costly_info["state_hash"]
@@ -485,7 +485,7 @@ def test_state_hash_commits_reward_config_and_reset_options():
 
 
 def test_unimplemented_curriculum_option_fails_closed():
-    env = MirageStructurerEnv(_task())
+    env = StochopiaStructurerEnv(_task())
 
     with pytest.raises(ValueError, match="TaskGenerator"):
         env.reset(options={"curriculum": "easy"})
@@ -500,8 +500,8 @@ def test_scalarized_wrapper_requires_explicit_non_double_counting_spec():
             }
         )
 
-    wrapped = ScalarizedMirageEnv(
-        MirageStructurerEnv(_task()),
+    wrapped = ScalarizedStochopiaEnv(
+        StochopiaStructurerEnv(_task()),
         ScalarizationSpec({"query_cost": 1.0}),
     )
     _, reset_info = wrapped.reset(seed=5)
@@ -520,7 +520,7 @@ def test_scalarized_wrapper_requires_explicit_non_double_counting_spec():
 
 
 def test_trajectory_records_full_transitions_and_verifies_chain(tmp_path):
-    env = MirageStructurerEnv(_task(), expose_privileged_info=True)
+    env = StochopiaStructurerEnv(_task(), expose_privileged_info=True)
     _, reset_info = env.reset()
     recorder = TrajectoryRecorder(env, initial_state_hash=reset_info["state_hash"])
 
@@ -534,7 +534,7 @@ def test_trajectory_records_full_transitions_and_verifies_chain(tmp_path):
     assert TrajectoryRecorder.verify(path) is True
 
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["metadata"]["schema_version"] == "mirage.environment.test.v3"
+    assert saved["metadata"]["schema_version"] == "stochopia.environment.test.v1"
     assert saved["metadata"]["environment_version"] == env.environment_version
     assert saved["metadata"]["pricing_version"]
     assert saved["metadata"]["task_version"] == "test-task-v1"
@@ -557,7 +557,7 @@ def test_trajectory_records_full_transitions_and_verifies_chain(tmp_path):
 
 
 def test_trajectory_snapshot_is_detached_and_suffix_deletion_is_detected(tmp_path):
-    env = MirageStructurerEnv(_task())
+    env = StochopiaStructurerEnv(_task())
     _, reset_info = env.reset()
     recorder = TrajectoryRecorder(env, initial_state_hash=reset_info["state_hash"])
     first = env.step(Skip("one"))

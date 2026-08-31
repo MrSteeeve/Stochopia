@@ -2,7 +2,7 @@
 
 import pytest
 
-from mirage.experiment import (
+from stochopia.experiment import (
     DEFAULT_REPLICATES_BY_CONDITION,
     build_experiment_manifest,
     manifest_payload,

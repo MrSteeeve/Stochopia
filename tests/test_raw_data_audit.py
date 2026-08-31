@@ -6,7 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from mirage import raw_data_audit as audit
+from stochopia import raw_data_audit as audit
 
 
 def _write_manifest(root: Path, paths: list[Path]) -> None:

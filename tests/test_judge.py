@@ -6,12 +6,12 @@ import json
 
 import pytest
 
-from mirage.benchmark_cli import (
+from stochopia.benchmark_cli import (
     _collect_voluntary_samples,
     _run_judge_runs,
     _stratified_sample,
 )
-from mirage.judge import (
+from stochopia.judge import (
     DIMENSIONS,
     DimensionScore,
     JudgeError,
@@ -25,7 +25,7 @@ from mirage.judge import (
     weighted_cohens_kappa,
     score_flip_rate,
 )
-from mirage.llm import MockLLMClient
+from stochopia.llm import MockLLMClient
 
 
 def payload(scores: list[int]) -> str:

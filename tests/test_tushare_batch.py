@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from mirage import tushare_batch as batch
+from stochopia import tushare_batch as batch
 
 
 class FakeFrame:

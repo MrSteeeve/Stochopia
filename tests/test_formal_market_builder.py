@@ -10,9 +10,9 @@ from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 
-from mirage.benchmark import MarketSnapshot, load_market_snapshots
-from mirage.formal_market_builder import _atomic_write, _csv_bytes, run_base_build
-from mirage.market_data_math import ShiborCurve
+from stochopia.benchmark import MarketSnapshot, load_market_snapshots
+from stochopia.formal_market_builder import _atomic_write, _csv_bytes, run_base_build
+from stochopia.market_data_math import ShiborCurve
 
 
 def _write_endpoint(root: Path, endpoint: str, rows: list[dict[str, str]], params: dict) -> None:
@@ -151,7 +151,7 @@ def test_synthetic_full_builder_preserves_72_base_rows(tmp_path, monkeypatch):
         }
         return updated, updated_provenance, [], stats
 
-    monkeypatch.setattr("mirage.formal_market_builder.apply_full_phase", fake_overlay)
+    monkeypatch.setattr("stochopia.formal_market_builder.apply_full_phase", fake_overlay)
     gate = run_base_build(tushare_root=tushare, cffex_path=cffex, output_root=derived, phase="full")
     assert gate["ready"] is True
     assert len(load_market_snapshots(derived / "market_snapshots.csv")) == 72

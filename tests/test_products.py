@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from mirage.products import (
+from stochopia.products import (
     DRAFT_TARGET,
     ClientProfile,
     Constraint,

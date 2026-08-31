@@ -8,7 +8,7 @@ from datetime import date
 
 import pytest
 
-from mirage.benchmark import (
+from stochopia.benchmark import (
     BenchmarkCondition,
     BenchmarkError,
     HardConstraintEngine,
@@ -29,8 +29,8 @@ from mirage.benchmark import (
     settle_submission,
     validate_domain,
 )
-from mirage.env_agents import RoleResponse
-from mirage.products import ClientProfile, ProductSpec
+from stochopia.env_agents import RoleResponse
+from stochopia.products import ClientProfile, ProductSpec
 
 
 # A deliberately tiny lattice so oracle enumeration and property tests stay fast.

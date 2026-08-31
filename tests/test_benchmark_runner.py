@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from mirage.benchmark import (
+from stochopia.benchmark import (
     BenchmarkCondition,
     BenchmarkError,
     LongHorizonEnvironment,
@@ -22,7 +22,7 @@ from mirage.benchmark import (
     WorkflowOutcome,
     oracle_best_quote,
 )
-from mirage.benchmark_runner import (
+from stochopia.benchmark_runner import (
     PROTOCOL_POLICIES,
     RUNNER_SYSTEM_PROMPT,
     EpisodeTrace,
@@ -30,11 +30,11 @@ from mirage.benchmark_runner import (
     compute_metrics,
     run_episode,
 )
-from mirage.env_agents import FrozenEnvAgent
-from mirage.llm import BaseLLMClient, MockLLMClient
-from mirage.pricing import PricingError, QuotePolicy
-from mirage.products import ClientProfile
-from mirage.role_config import InferenceSpec, RetryPolicy, RoleSpecV2
+from stochopia.env_agents import FrozenEnvAgent
+from stochopia.llm import BaseLLMClient, MockLLMClient
+from stochopia.pricing import PricingError, QuotePolicy
+from stochopia.products import ClientProfile
+from stochopia.role_config import InferenceSpec, RetryPolicy, RoleSpecV2
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -627,7 +627,8 @@ class _EchoQuoteDeskClient(BaseLLMClient):
 
 def _env_spec(role: str, schema: str, failure: str, seed_offset: int) -> RoleSpecV2:
     return RoleSpecV2(
-        id=role, role=role, system_prompt_file=Path("dummy.md"), system_prompt_sha256="",
+        id=role, protocol_version="stochopia.csi.legacy.v1", role=role,
+        system_prompt_file=Path("dummy.md"), system_prompt_sha256="",
         inference=InferenceSpec("mock", 0.0, 500, 30.0, "derived", seed_offset),
         retry=RetryPolicy(transport_retries=0, format_retries=1),
         output_schema=schema, tools=(), max_calls_per_round=3, history_scope="episode",
@@ -639,13 +640,13 @@ def _make_agents(*, client=None, risk=None, desk=None) -> dict[str, FrozenEnvAge
     agents: dict[str, FrozenEnvAgent] = {}
     if client is not None:
         agents["client"] = FrozenEnvAgent(
-            _env_spec("client", "client_response_v1", "abstain", 2000), client, system_prompt="SYS")
+            _env_spec("client", "stochopia.role.client-response.v1", "abstain", 2000), client, system_prompt="SYS")
     if risk is not None:
         agents["risk_control"] = FrozenEnvAgent(
-            _env_spec("risk_control", "risk_response_v1", "escalate", 3000), risk, system_prompt="SYS")
+            _env_spec("risk_control", "stochopia.role.risk-response.v1", "escalate", 3000), risk, system_prompt="SYS")
     if desk is not None:
         agents["trading_desk"] = FrozenEnvAgent(
-            _env_spec("trading_desk", "desk_response_v1", "decline", 4000), desk, system_prompt="SYS")
+            _env_spec("trading_desk", "stochopia.role.trading-desk-response.v1", "decline", 4000), desk, system_prompt="SYS")
     return agents
 
 
@@ -859,17 +860,17 @@ def test_failure_metric_does_not_double_count_submission_alias_lists():
 
 
 def test_cli_roles_config_load_failure_is_fail_fast(tmp_path):
-    from mirage.benchmark_cli import _load_env_role_specs
-    from mirage.llm import load_model_registry
+    from stochopia.benchmark_cli import _load_env_role_specs
+    from stochopia.llm import load_model_registry
 
     registry = load_model_registry(ROOT / "config" / "models.yaml")
     (tmp_path / "p.md").write_text("prompt", encoding="utf-8")
     bad = tmp_path / "roles.yaml"
     bad.write_text(yaml.safe_dump({
-        "protocol_version": "v",
+        "protocol_version": "stochopia.csi.legacy.v1",
         "roles": {"client_main": {
             "role": "client", "model_ref": "mock", "system_prompt_file": "p.md",
-            "output_schema": "client_response_v1", "numeric_authority": "supplied_facts_only",
+            "output_schema": "stochopia.role.client-response.v1", "numeric_authority": "supplied_facts_only",
             "bogus_field": 1,
         }},
     }, allow_unicode=True), encoding="utf-8")
@@ -878,13 +879,13 @@ def test_cli_roles_config_load_failure_is_fail_fast(tmp_path):
 
 
 def test_cli_builds_env_agents_from_real_config():
-    from mirage.benchmark_cli import _load_env_role_specs, _make_env_agents, _roles_config_meta
-    from mirage.llm import load_model_registry
+    from stochopia.benchmark_cli import _load_env_role_specs, _make_env_agents, _roles_config_meta
+    from stochopia.llm import load_model_registry
 
     registry = load_model_registry(ROOT / "config" / "models.yaml")
     specs = _load_env_role_specs(ROOT / "config" / "benchmark_roles.yaml", registry)
     agents = _make_env_agents(specs, registry, None)
     assert set(agents) == {"client", "risk_control", "trading_desk"}
     npc_lineup_id, roles_sha = _roles_config_meta(ROOT / "config" / "benchmark_roles.yaml")
-    assert npc_lineup_id == "npc-fixed-v1"
+    assert npc_lineup_id == "stochopia.npc-lineup.fixed.v1"
     assert len(roles_sha) == 64

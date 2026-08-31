@@ -180,7 +180,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# MIRAGE local artifacts
+# Stochopia local artifacts
+blobs/
+docs/research/2026-08-31-claude-artifact-stochopia-research-session.md
 outputs/
 output/
 data/raw/cffex/

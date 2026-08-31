@@ -8,15 +8,15 @@ import math
 import pytest
 
 import inspect
-import mirage.pricing as pricing_module
+import stochopia.pricing as pricing_module
 
-from mirage.products import (
+from stochopia.products import (
     MarketState,
     ProductSpec,
     parse_product_spec,
 )
 
-from mirage.pricing import (
+from stochopia.pricing import (
     PricingError,
     autocallable_price,
     bs_call,
@@ -135,7 +135,7 @@ def test_bs_greeks_degenerate_at_expiry():
 
 
 def test_bs_greeks_unknown_option_type_raises():
-    from mirage.pricing import PricingError
+    from stochopia.pricing import PricingError
 
     with pytest.raises(PricingError):
         bs_greeks(100, 100, 1, 0.05, 0.2, 0.0, "straddle")
@@ -940,7 +940,7 @@ def test_build_payoff_table_no_market_state_in_signature():
     """build_payoff_table 签名不含 MarketState 参数（防信息泄漏）。"""
     sig = inspect.signature(build_payoff_table)
     param_annotations = [p.annotation for p in sig.parameters.values()]
-    from mirage.products import MarketState as _MS
+    from stochopia.products import MarketState as _MS
     assert _MS not in param_annotations
 
 

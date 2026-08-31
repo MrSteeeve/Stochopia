@@ -8,7 +8,7 @@ import pytest
 
 from conftest import RecordingMockClient, query_json
 
-from mirage.agents import (
+from stochopia.agents import (
     ENV_AGENT_PREAMBLE,
     STRUCTURER_PREAMBLE,
     ActionParseError,
@@ -16,8 +16,8 @@ from mirage.agents import (
     StructurerAgent,
     parse_action,
 )
-from mirage.products import ClientProfile, Constraint, MarketState
-from mirage.scenario import AgentSpec
+from stochopia.products import ClientProfile, Constraint, MarketState
+from stochopia.scenario import AgentSpec
 
 VALID_IDS = ["client_a", "client_b", "client_c", "risk_control", "trading_desk"]
 

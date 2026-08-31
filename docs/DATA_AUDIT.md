@@ -86,4 +86,4 @@ An example exchange option adjustment after ETF distribution is available at
 Failure of an individual option-chain row triggers the pre-registered
 realized-volatility fallback. It does not change the public index spot, futures
 carry, episode layout, or held-out periods. Reproduce the complete audit with
-`python -m mirage.formal_gate_audit`.
+`python -m stochopia.formal_gate_audit`.

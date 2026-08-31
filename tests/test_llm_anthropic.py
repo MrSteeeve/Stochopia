@@ -7,8 +7,8 @@ import json
 
 import pytest
 
-import mirage.llm as llm_module
-from mirage.llm import AnthropicClient, LLMError, ModelConfig
+import stochopia.llm as llm_module
+from stochopia.llm import AnthropicClient, LLMError, ModelConfig
 
 
 def _response(text: str, stop_reason: str = "end_turn") -> "_FakeResponse":
