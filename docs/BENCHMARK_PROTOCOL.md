@@ -945,6 +945,19 @@ Only abstract workflow, schemas and synthetic rules may be derived from private
 institutional material. No private document, client, institution, limit or
 identifying metadata may enter released data or prompts.
 
+## 2026-11-10：世界模型生成器门槛改为层级命名
+
+StructurerDSL `docs/SPEC.md` 11.2 的生成器门槛不再用 G5–G7 编号，改为四个累进层级：草稿层（`draft`）、
+自洽层（`coherent`）、预测层（`predictive`）、决策层（`decision_grade`）。原 G5 与 G6 合并为预测层，原 G7 为
+决策层，各自的阈值未改；自洽层和留出数据的计次规则为新增。作为声明证据的要求因此变严：多了自洽层，且必须
+按层级顺序通过。自洽层的检验和计次台账都尚未实现，在此之前没有生成器能越过草稿层。下文更早条目里的"G5–G7"
+按此对应。
+
+`stochopia.research.world_models` 注册表的 `generator_gates` 字段改为 `tier_checks`，新增 `tier` 属性；
+`world_model_generator` 的 manifest 相应以 `tier`、`tier_checks` 取代 `generator_gates`，`development_only`
+保留，schema 标识与 seed 派生不变，生成的路径逐位不变。`r02s01` 与 `ewma_gbm_reference` 都在草稿层，仍是
+development-only。此项只涉及世界模型研究线，不修改 Benchmark v3 的定价、结算、约束或指标，已有 episode 结果不受影响。
+
 ## 2026-11-09（三）：v2 隐藏画像泄露、格点披露与结果管线修复
 
 Level-0 定价改动（MC 不把 t=0 计为已观测敲入、公允价值 ≤ 0 的 premium-paid 结构不可报价）见下一节

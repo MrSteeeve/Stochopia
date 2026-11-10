@@ -10,7 +10,7 @@ import pytest
 from stochopia.research import forecast_protocol as fp
 from stochopia.research.market_panel import MarketPanel
 from stochopia.research.world_model_generator import generate_scenario, snowball_events
-from stochopia.research.world_models import WORLD_MODELS, get_world_model
+from stochopia.research.world_models import TIERS, WORLD_MODELS, get_world_model
 
 
 def _panel(sessions: int = 900, *, with_iv: bool = True) -> MarketPanel:
@@ -35,9 +35,22 @@ def test_registered_models_produce_valid_one_step_forecasts(model):
 
 
 def test_r02s01_is_marked_development_only():
-    assert get_world_model("r02s01").development_only
+    entry = get_world_model("r02s01")
+    assert entry.tier == "draft"
+    assert entry.development_only
     with pytest.raises(KeyError, match="unknown world model"):
         get_world_model("missing")
+
+
+def test_tier_is_the_highest_consecutively_passed_check():
+    entry = get_world_model("r02s01")
+    checks = {"coherent": "passed", "predictive": "not_run", "decision_grade": "passed"}
+    skipped = replace(entry, tier_checks=checks)
+    assert skipped.tier == "coherent"
+    assert skipped.development_only
+    top = replace(entry, tier_checks={name: "passed" for name in TIERS[1:]})
+    assert top.tier == "decision_grade"
+    assert not top.development_only
 
 
 @pytest.mark.parametrize("model", ["r02s01", "ewma_gbm_reference"])
@@ -54,6 +67,8 @@ def test_chained_scenario_shapes_and_determinism(model):
     assert first.relative_spot.shape == (24, 64, 2)
     assert np.all(first.relative_spot[:, 0] == 1.0)
     assert first.manifest["measure"].startswith("P")
+    assert first.manifest["tier"] == "draft"
+    assert first.manifest["development_only"] is True
     assert first.as_of == panel.dates[t]
 
 

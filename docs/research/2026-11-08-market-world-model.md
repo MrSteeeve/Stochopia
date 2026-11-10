@@ -76,7 +76,7 @@ P 侧情景生成器。这样，Stochopia 模拟出来的世界就是循环当�
 | 文件 | 内容 |
 |---|---|
 | `stochopia/research/world_models/r02s01.py` | 原样拷贝的模型程序，文件头记录来源、分数与审阅结论 |
-| `stochopia/research/world_models/__init__.py` | 注册表：每个模型的来源、分数，以及 SPEC 11.2 门槛（G5–G7）状态。`ewma_gbm_reference` 也在其中 |
+| `stochopia/research/world_models/__init__.py` | 注册表：每个模型的来源、分数，以及 SPEC 11.2 的层级（`tier`）与各层检验状态（`tier_checks`）。`ewma_gbm_reference` 也在其中 |
 | `stochopia/research/world_model_generator.py` | `generate_scenario(panel, as_of, model, n_paths, horizon_days, seed, continuation_samples)`：从真实面板的某个交易日出发，生成联合日频路径与 Q 报价，以 21 天为一步拼接更长的期限；`dsl_paths()` 直接转成 StructurerDSL `Paths`，默认不折现 |
 
 拼接规则：
@@ -98,9 +98,14 @@ P 侧情景生成器。这样，Stochopia 模拟出来的世界就是循环当�
 - 同一 seed 结果确定，不同 seed 结果不同；面板起点平移后，同一日期得到同样的路径；
 - 报价不足时不写入历史，并在 manifest 中标出。
 
-**门槛状态**：r02s01 在 dev 和 test 上的 CRPS skill 下界都大于 0，但这与 G5 的判据（相对单一 GBM 的预测
-log score，加上风格化事实检验）不同。G6（bootstrap 与 GARCH-t 对照）和 G7（历史与合成情景上的策略排序
-一致性）都还没跑。因此注册表把它标为 `development_only`，在它的路径上得到的占优结论**不能作为声明证据**。
+**层级状态**（StructurerDSL SPEC 11.2，2026-11-10 起按层级命名）：r02s01 目前在**草稿层**。
+- 自洽层：检验尚未实现。已知两处按现状过不了：它的分布依赖请求的样本数；一次调用内各条路径可交换但
+  不独立（见上面的拼接规则）。生成器固定用 256 样本调用它，只是绕开了第一处，不算通过。
+- 预测层：没跑。它在 dev 和 test 上的 CRPS skill 下界都大于 0，但这与预测层的判据（相对单一 GBM 的预测
+  log score 加风格化事实检验，以及与 bootstrap、GARCH-t 的对照）不同。
+- 决策层：没跑（历史与合成情景上的策略排序一致性）。
+
+因此注册表把它标为 `development_only`，在它的路径上得到的占优结论**不能作为声明证据**。
 
 ### 演示：3 个月 CSI1000 雪球（KO 1.03，第 1、2 个月末观察；KI 0.85，按日观察；票息 15%）
 
