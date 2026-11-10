@@ -25,7 +25,6 @@ from stochopia.environment import (
     create_api_agent_policy,
     parse_environment_action,
     run_agent_episode,
-    verify_trajectory,
 )
 from stochopia.llm import LLMError, MockLLMClient
 from stochopia.products import ClientProfile
@@ -168,8 +167,6 @@ async def test_api_policy_runs_same_v3_trajectory_without_privileged_state(tmp_p
     assert result.status == "terminated"
     assert result.steps == 2
     assert result.invalid_actions == 0
-    assert result.trajectory_verified is True
-    assert verify_trajectory(output)
     first_observation = result.trajectory["entries"][0]["transition"][
         "previous_observation"
     ]
@@ -180,7 +177,27 @@ async def test_api_policy_runs_same_v3_trajectory_without_privileged_state(tmp_p
     assert run_metadata["model"] == "mock-api-agent"
     assert run_metadata["temperature"] == pytest.approx(0.0)
     assert run_metadata["max_tokens"] == 4000
-    assert len(run_metadata["system_prompt_sha256"]) == 64
+    assert run_metadata["system_prompt_version"]
+
+
+@pytest.mark.asyncio
+async def test_command_policy_preserves_virtualenv_python(tmp_path):
+    import venv
+
+    virtualenv = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(virtualenv)
+    python = virtualenv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    script = tmp_path / "check_prefix.py"
+    script.write_text(
+        "import json, sys\n"
+        "assert sys.prefix != sys.base_prefix\n"
+        "json.load(sys.stdin)\n"
+        "print(json.dumps({'action': 'skip'}))\n",
+    )
+    policy = CommandAgentPolicy([str(python), str(script)])
+    result = await run_agent_episode(StochopiaStructurerEnv(_task()), policy)
+    assert result.status == "terminated"
+    assert result.invalid_actions == 0
 
 
 @pytest.mark.asyncio
@@ -231,7 +248,7 @@ async def test_command_policy_uses_versioned_json_stdio_protocol(tmp_path):
     )
     assert result.trajectory["public_action_schema"][
         "schema_version"
-    ] == "stochopia.environment.action-schema.v1"
+    ] == "stochopia.environment.action-schema.v2"
 
 
 @pytest.mark.asyncio
@@ -251,7 +268,36 @@ async def test_malformed_agent_output_is_recorded_and_bounded():
     assert result.invalid_actions == 2
     assert result.parser_errors == 2
     assert result.invocation_errors == 0
-    assert result.trajectory_verified is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record_raw_output", [True, False])
+async def test_redaction_removes_malformed_output_everywhere(
+    tmp_path, record_raw_output
+):
+    from stochopia.environment.evaluation import replay_and_evaluate
+
+    secret = "SECRET-RAW-TEXT not an action"
+    path = tmp_path / "trajectory.json"
+    result = await run_agent_episode(
+        StochopiaStructurerEnv(_task(), max_steps_per_round=1),
+        LLMAgentPolicy(MockLLMClient([secret]), name="malformed-agent"),
+        trajectory_path=path,
+        record_raw_output=record_raw_output,
+    )
+
+    assert result.invalid_actions == 1
+    assert result.parser_errors == 1
+    text = path.read_text(encoding="utf-8")
+    if record_raw_output:
+        assert secret in text
+    else:
+        assert secret not in text
+        entry = json.loads(text)["entries"][0]
+        assert entry["policy_metadata"]["raw_output"] is None
+        assert entry["policy_metadata"]["parser_error"]
+        assert entry["transition"]["action"]["raw"] is None
+    assert replay_and_evaluate(path, suite_hash="s", replay=True)["replay_verified"]
 
 
 @pytest.mark.asyncio
@@ -278,7 +324,31 @@ async def test_command_failure_is_infrastructure_not_agent_action(tmp_path):
     assert result.constraint_summary["steps"] == 0
     assert result.trajectory["status"] == "partial"
     assert result.trajectory["run_outcome"]["status"] == "infrastructure_error"
-    assert verify_trajectory(output)
+
+
+@pytest.mark.asyncio
+async def test_internal_environment_error_is_recorded_as_infrastructure(tmp_path):
+    from stochopia.environment.evaluation import replay_and_evaluate
+    from stochopia.pricing import PricingError
+
+    class BrokenPricingEnv(StochopiaStructurerEnv):
+        def _apply(self, state, action):
+            raise PricingError("internal pricing bug")
+
+    output = tmp_path / "partial-trajectory.json"
+    result = await run_agent_episode(
+        BrokenPricingEnv(_task()),
+        LLMAgentPolicy(MockLLMClient(['{"action": "skip"}']), name="skipper"),
+        trajectory_path=output,
+    )
+
+    assert result.status == "infrastructure_error"
+    assert result.infrastructure_error["error_type"] == "PricingError"
+    assert result.invalid_actions == 0
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert saved["run_outcome"]["status"] == "infrastructure_error"
+    # run-v3-suite evaluates the partial trajectory and continues.
+    assert replay_and_evaluate(output, suite_hash="s")["status"] == "partial"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group semantics")
@@ -379,7 +449,7 @@ async def test_openai_compatible_adapter_runs_end_to_end_without_secret_leak(
     )
 
 
-def test_test_agent_cli_writes_verified_trajectory_and_summary(tmp_path):
+def test_test_agent_cli_writes_trajectory_and_summary(tmp_path):
     root = Path(__file__).resolve().parents[1]
     script = tmp_path / "skip_agent.py"
     script.write_text(
@@ -415,14 +485,12 @@ def test_test_agent_cli_writes_verified_trajectory_and_summary(tmp_path):
     )
 
     assert exit_code == 0
-    assert verify_trajectory(trajectory)
     payload = json.loads(summary.read_text(encoding="utf-8"))
     assert payload["schema"] == "stochopia.agent-run.v1"
     assert payload["policy_kind"] == "command"
     assert payload["status"] == "terminated"
     assert payload["constraint_summary"]["steps"] == payload["steps"]
     assert payload["reward_summary"]["total_steps"] == payload["steps"]
-    assert payload["trajectory_verified"] is True
 
 
 def test_test_agent_cli_returns_nonzero_for_infrastructure_failure(tmp_path):
@@ -455,7 +523,6 @@ def test_test_agent_cli_returns_nonzero_for_infrastructure_failure(tmp_path):
     )
 
     assert exit_code == 2
-    assert verify_trajectory(trajectory)
     payload = json.loads(summary.read_text(encoding="utf-8"))
     assert payload["status"] == "infrastructure_error"
     assert payload["steps"] == 0
@@ -583,9 +650,83 @@ def test_v3_suite_run_replay_and_aggregate_cli(tmp_path):
         ]
     ) == 0
 
-    assert verify_trajectory(trajectory)
     evaluation_payload = json.loads(evaluation.read_text(encoding="utf-8"))
-    assert evaluation_payload["replay_verified"] is True
+    assert evaluation_payload["replay_verified"] is False
     aggregate_payload = json.loads(aggregate.read_text(encoding="utf-8"))
     assert aggregate_payload["evaluation_count"] == 2
     assert aggregate_csv.exists()
+
+
+class _RecordingPolicy:
+    kind = "test"
+    name = "recording-agent"
+    total_usage: dict = {}
+
+    def __init__(self, first_action):
+        self.first_action = first_action
+        self.requests = []
+
+    async def act(self, request):
+        from stochopia.environment.agent_runner import AgentDecision
+
+        self.requests.append(request.to_dict())
+        payload = self.first_action if len(self.requests) == 1 else {"action": "skip"}
+        return AgentDecision(
+            action=parse_environment_action(payload),
+            raw_output=json.dumps(payload),
+        )
+
+
+@pytest.mark.asyncio
+async def test_policy_history_omits_normalised_rewards_that_reveal_hidden_capital():
+    product = {
+        "product_type": "vanilla_call",
+        "notional": 1_000_000.0,
+        "maturity_months": 1,
+        "strike_pct": 1.0,
+        "barrier_pct": None,
+        "barrier_type": None,
+        "coupon_rate": None,
+        "participation_rate": 1.0,
+        "principal_protected": False,
+        "funding_style": "premium_paid",
+        "target_client": "current_client",
+        "pitch": "risk disclosed",
+        "hedging_plan": "listed futures delta hedge",
+    }
+    policy = _RecordingPolicy({"action": "submit_product", "product": product})
+    result = await run_agent_episode(StochopiaStructurerEnv(_task()), policy)
+
+    history = policy.requests[-1]["history"]
+    assert history
+    for record in history:
+        for term in record["reward_components"].values():
+            if isinstance(term, dict):
+                assert "normalized_value" not in term
+    recorded = result.trajectory["entries"][0]["transition"]["reward_components"]
+    assert "normalized_value" in recorded["client_utility"]
+
+
+@pytest.mark.asyncio
+async def test_policy_context_window_enters_policy_config_hash():
+    from stochopia.environment.evaluation import replay_and_evaluate_payload
+
+    hashes = set()
+    for records, chars, raw in ((32, 96_000, True), (4, 96_000, True), (32, 96_000, False)):
+        result = await run_agent_episode(
+            StochopiaStructurerEnv(_task()),
+            _RecordingPolicy({"action": "skip"}),
+            max_history_records=records,
+            max_history_chars=chars,
+            record_raw_output=raw,
+        )
+        metadata = result.trajectory["policy_run_metadata"]
+        assert metadata["history_records"] == records
+        assert metadata["history_chars"] == chars
+        assert metadata["record_raw_output"] is raw
+        hashes.add(
+            replay_and_evaluate_payload(result.trajectory, suite_hash="s")[
+                "policy_config_hash"
+            ]
+        )
+    assert len(hashes) == 3

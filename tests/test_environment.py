@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date
 
 import pytest
@@ -23,7 +23,7 @@ from stochopia.environment import (
     TrajectoryRecorder,
     V3_PUBLIC_CLIENT_ALIAS,
 )
-from stochopia.pricing import QuotePolicy
+from stochopia.pricing import PricingError, QuotePolicy
 from stochopia.products import ClientProfile, ProductSpec
 
 
@@ -113,7 +113,6 @@ def test_reset_is_deterministic_and_rebuilds_state():
     second_observation, second_info = env.reset()
 
     assert second_observation == first_observation
-    assert second_info["state_hash"] == first_info["state_hash"]
     assert second_info["seed"] == 17
     assert second_observation.step_index == 0
     assert second_observation.disclosed_client == {}
@@ -124,7 +123,7 @@ def test_public_action_schema_is_complete_and_matches_runtime_domain():
     observation, _ = env.reset()
     schema = env.action_schema
 
-    assert schema["schema_version"] == "stochopia.environment.action-schema.v1"
+    assert schema["schema_version"] == "stochopia.environment.action-schema.v2"
     assert schema["product_domain_version"] == "stochopia.product-domain.csi-action-contract.v1"
     assert len(schema["client_topic_enum"]) == 9
     assert set(schema["client_topic_enum"]) == {
@@ -234,7 +233,6 @@ def test_typed_quote_then_submit_auto_advances_round():
     assert submitted.observation.round_num == 2
     assert submitted.observation.last_event["advanced_to_round"] == 2
     assert submitted.terminated is False
-    assert submitted.state_hash_before == quoted.state_hash_after
 
 
 def test_submit_product_is_atomic_typed_quote_and_submission():
@@ -306,6 +304,10 @@ def test_horizon_liquidation_closes_accounts_and_enters_reward_summary():
     assert "position_id" not in json.dumps(terminal.tool_result)
     assert "event_id" not in json.dumps(terminal.tool_result)
     assert "v3-test" not in json.dumps(terminal.tool_result)
+    terminal_snapshot = terminal.tool_result["terminal_snapshot"]
+    assert terminal_snapshot["date"] == "2023-03-31"
+    for private in ("trend_alpha", "source", "episode_id", "risk_free_rate"):
+        assert private not in terminal_snapshot
     assert terminal.reward_components.terminal_lifecycle_pnl.available is True
     assert terminal.reward_components.capital_efficiency.value < 0
 
@@ -339,7 +341,6 @@ def test_query_cost_is_emitted_on_every_query_step():
         t.reward_components.query_cost.value for t in (capital, maturity)
     ) == pytest.approx(-0.02)
     assert maturity.previous_observation == capital.observation
-    assert maturity.state_hash_before == capital.state_hash_after
     assert maturity.observation.disclosed_client == {
         "capital": 10_000_000.0,
         "maturity": 12,
@@ -469,20 +470,6 @@ def test_available_action_mask_removes_exhausted_query_and_quote_actions():
     assert "submit_design" in transition.observation.available_actions
 
 
-def test_state_hash_commits_reward_config_and_reset_options():
-    base = StochopiaStructurerEnv(_task(), query_cost=-0.01)
-    costly = StochopiaStructurerEnv(_task(), query_cost=-99.0)
-    _, base_info = base.reset(options={"run_label": "a"})
-    _, costly_info = costly.reset(options={"run_label": "a"})
-    assert base_info["state_hash"] != costly_info["state_hash"]
-
-    _, changed_options = base.reset(options={"run_label": "b"})
-    assert base_info["state_hash"] != changed_options["state_hash"]
-    assert (
-        TrajectoryRecorder(base).metadata.environment_config_hash
-        != TrajectoryRecorder(costly).metadata.environment_config_hash
-    )
-
 
 def test_unimplemented_curriculum_option_fails_closed():
     env = StochopiaStructurerEnv(_task())
@@ -513,64 +500,174 @@ def test_scalarized_wrapper_requires_explicit_non_double_counting_spec():
     assert terminated is False
     assert truncated is False
     assert observation.disclosed_client["capital"] == 10_000_000.0
-    assert reset_info["scalarization_hash"] == info["scalarization_hash"]
+    assert reset_info["scalarization"] == info["scalarization"]
     assert info["reward_components"]["query_cost"]["value"] == pytest.approx(
         -0.01
     )
 
 
-def test_trajectory_records_full_transitions_and_verifies_chain(tmp_path):
+def test_trajectory_records_full_transitions_and_versions(tmp_path):
     env = StochopiaStructurerEnv(_task(), expose_privileged_info=True)
-    _, reset_info = env.reset()
-    recorder = TrajectoryRecorder(env, initial_state_hash=reset_info["state_hash"])
+    env.reset()
+    recorder = TrajectoryRecorder(env)
 
     first = env.step(Skip("round one"))
     second = env.step(Skip("round two"))
     recorder.record(first, policy_metadata={"policy": "test"})
     recorder.record(second, policy_metadata={"policy": "test"})
-
-    assert recorder.verify_hash_chain() is True
     path = recorder.save(tmp_path / "trajectory.json")
-    assert TrajectoryRecorder.verify(path) is True
 
     saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["format"] == "stochopia.trajectory-json.v2"
     assert saved["metadata"]["schema_version"] == "stochopia.environment.test.v1"
     assert saved["metadata"]["environment_version"] == env.environment_version
     assert saved["metadata"]["pricing_version"]
     assert saved["metadata"]["task_version"] == "test-task-v1"
     assert saved["metadata"]["package_version"] == "0.2.0"
-    assert saved["metadata"]["installed_distribution_version"]
-    assert saved["metadata"]["environment_config_hash"]
+    assert saved["metadata"]["git_sha"]
     assert saved["environment_configuration"] == env.configuration
-    assert saved["metadata"]["implementation_hash"]
-    assert isinstance(saved["metadata"]["worktree_dirty"], (bool, type(None)))
-    assert saved["metadata"]["worktree_state_hash"]
     assert saved["dependency_versions"]["python"]
-    assert saved["metadata"]["dependency_versions_hash"]
     assert saved["run_id_seed"] == 17
+    assert saved["entry_count"] == 2
     assert saved["public_action_schema"]["product_domain_version"]
     assert saved["entries"][0]["transition"]["info"]["privileged_state"]
-
-    saved["entries"][1]["transition"]["state_hash_before"] = "tampered"
-    path.write_text(json.dumps(saved), encoding="utf-8")
-    assert TrajectoryRecorder.verify(path) is False
+    assert saved["entries"][1]["index"] == 1
 
 
-def test_trajectory_snapshot_is_detached_and_suffix_deletion_is_detected(tmp_path):
+def test_trajectory_snapshot_is_detached_from_caller_mutation(tmp_path):
     env = StochopiaStructurerEnv(_task())
-    _, reset_info = env.reset()
-    recorder = TrajectoryRecorder(env, initial_state_hash=reset_info["state_hash"])
+    env.reset()
+    recorder = TrajectoryRecorder(env)
     first = env.step(Skip("one"))
     recorder.record(first, policy_metadata={"mutable": {"value": 1}})
-    second = env.step(Skip("two"))
-    recorder.record(second)
+    recorder.record(env.step(Skip("two")))
 
     # Mutating the caller-owned transition after record() cannot rewrite history.
-    first.info["state_hash"] = "caller-mutated"
-    assert recorder.entries[0].transition["info"]["state_hash"] != "caller-mutated"
+    first.info["seed_role"] = "caller-mutated"
+    assert recorder.entries[0].transition["info"]["seed_role"] == "run_id_only"
+    assert len(recorder.entries) == 2
 
-    path = recorder.save(tmp_path / "trajectory.json")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["entries"].pop()
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    assert TrajectoryRecorder.verify(path) is False
+
+def test_episode_task_rejects_non_monthly_snapshot_dates():
+    base = _task()
+    daily = tuple(
+        replace(snapshot, as_of=date(2023, 1, 2 + index))
+        for index, snapshot in enumerate(base.snapshots)
+    )
+    with pytest.raises(ValueError, match="monthly observation grid"):
+        replace(base, snapshots=daily)
+
+
+def test_scalarized_event_scoped_costs_are_zero_without_their_event():
+    wrapped = ScalarizedStochopiaEnv(
+        StochopiaStructurerEnv(_task()),
+        ScalarizationSpec(
+            {
+                "query_cost": 1.0,
+                "quote_cost": 1.0,
+                "dealer_economics": 1.0,
+                "operational_cost": 1.0,
+            }
+        ),
+    )
+    wrapped.reset()
+    _, ask_reward, *_ = wrapped.step(AskClient("capital"))
+    _, skip_reward, *_ = wrapped.step(Skip("next"))
+
+    assert ask_reward == pytest.approx(-0.01)
+    assert skip_reward == pytest.approx(0.0)
+    with pytest.raises(ValueError, match="never measures"):
+        ScalarizedStochopiaEnv(
+            StochopiaStructurerEnv(_task()),
+            ScalarizationSpec({"relationship_delta": 1.0}),
+        )
+
+
+def test_internal_pricing_errors_propagate_instead_of_penalising_the_policy():
+    env = StochopiaStructurerEnv(_task())
+    env.reset()
+
+    def broken_quote(*args, **kwargs):
+        raise PricingError("internal pricing bug")
+
+    env._state.backend.desk.quote = broken_quote
+    with pytest.raises(PricingError, match="internal pricing bug"):
+        env.step(RequestQuote(_product()))
+
+
+def test_unsupported_and_non_json_invalid_actions_are_recordable():
+    class Foo:
+        pass
+
+    env = StochopiaStructurerEnv(_task())
+    env.reset()
+    recorder = TrajectoryRecorder(env)
+
+    unsupported = env.step(Foo())
+    nan_raw = env.step(InvalidAction(reason="bad", raw={"x": float("nan")}))
+
+    assert unsupported.constraint_signals.error == "unsupported action object: Foo"
+    assert unsupported.tool_result["type"] == "invalid_action"
+    assert nan_raw.constraint_signals.error == "bad"
+    recorder.record(unsupported)
+    recorder.record(nan_raw)
+
+
+def test_unknown_reset_options_are_rejected():
+    env = StochopiaStructurerEnv(_task())
+
+    with pytest.raises(ValueError, match="unsupported reset options"):
+        env.reset(options={"replicate": 2})
+    env.reset(options={})
+    assert env.reset_options == {}
+
+
+@pytest.mark.parametrize("submit", [False, True])
+@pytest.mark.parametrize("error_name", ["QuoteNotConvergedError", "QuoteUnavailableError"])
+def test_unquotable_request_is_quote_unavailable_not_invalid(submit, error_name):
+    import stochopia.benchmark as benchmark_module
+    import stochopia.pricing as pricing_module
+
+    error = getattr(benchmark_module, error_name, None) or getattr(pricing_module, error_name)
+    env = StochopiaStructurerEnv(_task())
+    env.reset()
+    quotes_left = env._state.backend.max_quotes_per_round
+
+    def unquotable(*args, **kwargs):
+        raise error("not quotable (test)")
+
+    env._state.backend.desk.quote = unquotable
+    action = SubmitProduct(_product()) if submit else RequestQuote(_product())
+    transition = env.step(action)
+
+    assert transition.constraint_signals.action_valid is True
+    assert transition.constraint_signals.quote_unavailable is True
+    assert transition.constraint_signals.accepted is None
+    assert transition.tool_result["type"] == "quote_unavailable"
+    assert transition.reward_components.operational_cost.available is False
+    assert transition.reward_components.quote_cost.available is False
+    assert transition.observation.action_budget["quotes_left"] == quotes_left
+    assert transition.observation.round_num == 1
+    summary = transition.info["episode_summary"]["constraints"]
+    assert summary["invalid_actions"] == 0
+    assert summary["unavailable_quotes"] == 1
+
+
+def test_scalarized_info_omits_normalised_rewards_that_reveal_hidden_capital():
+    wrapped = ScalarizedStochopiaEnv(
+        StochopiaStructurerEnv(_task()),
+        ScalarizationSpec({"quote_cost": 1.0}),
+    )
+    wrapped.reset()
+    infos = [wrapped.step(SubmitProduct(_product()))[-1]]
+    while not wrapped.done:
+        infos.append(wrapped.step(Skip("finish"))[-1])
+
+    for info in infos:
+        for term in info["reward_components"].values():
+            assert "normalized_value" not in term
+        assert "normalized_totals" not in info["episode_summary"]["reward"]
+        assert "raw_totals" in info["episode_summary"]["reward"]
+    # The inner environment's evaluator view keeps the full vector.
+    inner = wrapped.environment
+    assert "normalized_totals" in inner._episode_summary(inner._state)["reward"]

@@ -14,7 +14,6 @@ JSON action on stdout for every environment step.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import signal
@@ -29,6 +28,7 @@ from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 from ..benchmark_runner import extract_action_json
+from ..common import canonical_json, sha256_json, sha256_text
 from ..llm import BaseLLMClient, LLMError, ModelConfig, create_client
 from ..products import ProductError, parse_product_spec
 from .core import StochopiaStructurerEnv
@@ -37,7 +37,6 @@ from .types import (
     AskClient,
     EnvironmentAction,
     InvalidAction,
-    Observation,
     RequestQuote,
     Skip,
     SubmitDesign,
@@ -53,22 +52,6 @@ DEFAULT_HISTORY_CHARS = 96_000
 DEFAULT_COMMAND_OUTPUT_CHARS = 200_000
 
 
-@lru_cache(maxsize=256)
-def _file_sha256(
-    resolved_path: str,
-    size: int,
-    mtime_ns: int,
-) -> str:
-    """Hash one command artifact; stat fields make the cache change-aware."""
-
-    del size, mtime_ns
-    digest = hashlib.sha256()
-    with Path(resolved_path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _command_artifacts(argv: Sequence[str]) -> tuple[dict[str, Any], ...]:
     artifacts: list[dict[str, Any]] = []
     for index, argument in enumerate(argv):
@@ -76,17 +59,11 @@ def _command_artifacts(argv: Sequence[str]) -> tuple[dict[str, Any], ...]:
         if not candidate.is_file():
             continue
         resolved = candidate.resolve()
-        stat = resolved.stat()
         artifacts.append(
             {
                 "argument_index": index,
                 "path": str(resolved),
-                "size": stat.st_size,
-                "sha256": _file_sha256(
-                    str(resolved),
-                    stat.st_size,
-                    stat.st_mtime_ns,
-                ),
+                "size": resolved.stat().st_size,
             }
         )
     return tuple(artifacts)
@@ -295,9 +272,15 @@ def _decision_from_raw(
     raw_output: str,
     *,
     metadata: Mapping[str, Any] | None = None,
+    action_schema: Mapping[str, Any] | None = None,
 ) -> AgentDecision:
     try:
-        action = parse_environment_action(raw_output)
+        if action_schema and action_schema.get("schema_version") == "stochopia.environment.dsl-action-schema.v1":
+            from .dsl import parse_dsl_action
+
+            action = parse_dsl_action(raw_output)
+        else:
+            action = parse_environment_action(raw_output)
     except AgentActionError as exc:
         message = str(exc)
         return AgentDecision(
@@ -360,7 +343,7 @@ class LLMAgentPolicy:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "timeout_seconds": getattr(config, "timeout", None),
-            **_prompt_metadata(self.system_prompt),
+            **_prompt_metadata(),
         }
 
     async def act(self, request: AgentRequest) -> AgentDecision:
@@ -388,6 +371,7 @@ class LLMAgentPolicy:
         duration_ms = round((time.monotonic() - started) * 1000, 3)
         return _decision_from_raw(
             raw,
+            action_schema=request.action_schema,
             metadata={
                 "duration_ms": duration_ms,
                 "usage_after_call": dict(self.client.total_usage),
@@ -484,7 +468,8 @@ class CommandAgentPolicy:
             resolved = Path(executable).expanduser()
             if not resolved.is_file() or not os.access(resolved, os.X_OK):
                 raise ValueError(f"agent executable is not runnable: {executable}")
-            argv[0] = str(resolved.resolve())
+            # Resolving a venv's Python symlink discards its environment.
+            argv[0] = str(resolved.absolute())
         else:
             resolved_name = shutil.which(executable)
             if resolved_name is None:
@@ -492,30 +477,9 @@ class CommandAgentPolicy:
             argv[0] = resolved_name
 
         self.argv = tuple(argv)
-        argv_hash = hashlib.sha256(
-            json.dumps(
-                self.argv,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
         self._artifacts = _command_artifacts(self.argv)
-        policy_hash = hashlib.sha256(
-            json.dumps(
-                {
-                    "argv_sha256": argv_hash,
-                    "artifacts": self._artifacts,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        self.name = (
-            f"command:{Path(self.argv[0]).name}:{policy_hash[:12]}"
-        )
-        self._argv_hash = argv_hash
-        self._policy_hash = policy_hash
+        # Short argv digest only disambiguates policy names; it is an ID.
+        self.name = f"command:{Path(self.argv[0]).name}:{sha256_json(self.argv)[:12]}"
         self.timeout = float(timeout)
         self.max_output_chars = max_output_chars
         self.system_prompt = system_prompt or load_agent_system_prompt()
@@ -530,13 +494,11 @@ class CommandAgentPolicy:
             "policy_kind": self.kind,
             "policy_name": self.name,
             "executable": self.argv[0],
-            "argv_sha256": self._argv_hash,
-            "policy_sha256": self._policy_hash,
             "argument_files": self._artifacts,
             "argument_count": len(self.argv),
             "timeout_seconds": self.timeout,
             "max_output_chars": self.max_output_chars,
-            **_prompt_metadata(self.system_prompt),
+            **_prompt_metadata(),
         }
 
     async def act(self, request: AgentRequest) -> AgentDecision:
@@ -595,6 +557,7 @@ class CommandAgentPolicy:
             )
         return _decision_from_raw(
             stdout_text,
+            action_schema=request.action_schema,
             metadata={
                 "duration_ms": duration_ms,
                 "returncode": process.returncode,
@@ -605,7 +568,7 @@ class CommandAgentPolicy:
 
 @dataclass(frozen=True)
 class AgentEpisodeResult:
-    """A compact run summary plus the verified trajectory payload."""
+    """A compact run summary plus the recorded trajectory payload."""
 
     task_hash: str
     policy_kind: str
@@ -621,7 +584,6 @@ class AgentEpisodeResult:
     reward_summary: Mapping[str, Any]
     constraint_summary: Mapping[str, Any]
     usage: Mapping[str, Any]
-    trajectory_verified: bool
     trajectory_path: str | None
     trajectory: Mapping[str, Any] = field(repr=False)
     schema: str = AGENT_RUN_SCHEMA
@@ -643,7 +605,6 @@ class AgentEpisodeResult:
             "reward_summary": to_jsonable(self.reward_summary),
             "constraint_summary": to_jsonable(self.constraint_summary),
             "usage": to_jsonable(self.usage),
-            "trajectory_verified": self.trajectory_verified,
             "trajectory_path": self.trajectory_path,
         }
 
@@ -656,13 +617,7 @@ def _trim_history(
 ) -> tuple[tuple[Mapping[str, Any], ...], int]:
     kept = list(history[-max_records:])
     while kept:
-        encoded = json.dumps(
-            to_jsonable(kept),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
+        encoded = canonical_json(to_jsonable(kept))
         if len(encoded) <= max_chars:
             break
         kept.pop(0)
@@ -672,8 +627,7 @@ def _trim_history(
 def _request_id(public_task_id: str, run_seed: int, step_index: int) -> str:
     """Derive a reproducible request id from public policy inputs only."""
 
-    preimage = f"{public_task_id}:{run_seed}:{step_index}".encode("utf-8")
-    return hashlib.sha256(preimage).hexdigest()[:24]
+    return sha256_text(f"{public_task_id}:{run_seed}:{step_index}")[:24]
 
 
 def _sanitized_base_url(value: str) -> str:
@@ -687,21 +641,14 @@ def _sanitized_base_url(value: str) -> str:
         if parsed.port is not None:
             hostname = f"{hostname}:{parsed.port}"
     except ValueError:
-        return "invalid-url-sha256:" + hashlib.sha256(
-            value.encode("utf-8")
-        ).hexdigest()
+        return "invalid-url-sha256:" + sha256_text(value)
     return urlunsplit(
         (parsed.scheme, hostname, parsed.path.rstrip("/"), "", "")
     )
 
 
-def _prompt_metadata(prompt: str) -> dict[str, str]:
-    return {
-        "system_prompt_version": AGENT_PROMPT_VERSION,
-        "system_prompt_sha256": hashlib.sha256(
-            prompt.encode("utf-8")
-        ).hexdigest(),
-    }
+def _prompt_metadata() -> dict[str, str]:
+    return {"system_prompt_version": AGENT_PROMPT_VERSION}
 
 
 def _policy_reproducibility_metadata(policy: AgentPolicy) -> dict[str, Any]:
@@ -713,12 +660,47 @@ def _policy_reproducibility_metadata(policy: AgentPolicy) -> dict[str, Any]:
                 "policy.reproducibility_metadata() must return a mapping"
             )
         return dict(metadata)
-    prompt = str(getattr(policy, "system_prompt", load_agent_system_prompt()))
     return {
         "policy_kind": str(policy.kind),
         "policy_name": str(policy.name),
-        **_prompt_metadata(prompt),
+        **_prompt_metadata(),
     }
+
+
+def policy_run_metadata(
+    policy: AgentPolicy,
+    *,
+    max_history_records: int = DEFAULT_HISTORY_RECORDS,
+    max_history_chars: int = DEFAULT_HISTORY_CHARS,
+    record_raw_output: bool = True,
+) -> dict[str, Any]:
+    """Policy identity plus the policy-visible context window.
+
+    The history window and raw-output redaction change what the policy sees,
+    so they belong to ``policy_config_hash`` and to resume matching.
+    """
+
+    return {
+        **_policy_reproducibility_metadata(policy),
+        "history_records": max_history_records,
+        "history_chars": max_history_chars,
+        "record_raw_output": record_raw_output,
+    }
+
+
+def _policy_visible_rewards(rewards: Any) -> dict[str, Any]:
+    """Reward vector without normalised values for the policy history.
+
+    Normalisers are hidden quantities (initial client cash, dealer risk
+    capital), so ``value / normalized_value`` would reveal them. Raw values
+    stay; the trajectory and evaluator keep the full vector.
+    """
+
+    visible = to_jsonable(rewards)
+    for term in visible.values():
+        if isinstance(term, dict):
+            term.pop("normalized_value", None)
+    return visible
 
 
 async def _terminate_process_tree(
@@ -786,8 +768,12 @@ async def run_agent_episode(
     observation, info = environment.reset(seed=effective_seed)
     recorder = TrajectoryRecorder(
         environment,
-        initial_state_hash=str(info["state_hash"]),
-        run_metadata=_policy_reproducibility_metadata(policy),
+        run_metadata=policy_run_metadata(
+            policy,
+            max_history_records=max_history_records,
+            max_history_chars=max_history_chars,
+            record_raw_output=record_raw_output,
+        ),
     )
     history: list[Mapping[str, Any]] = []
     invalid_actions = 0
@@ -860,21 +846,38 @@ async def run_agent_episode(
             )
         if isinstance(action, InvalidAction):
             invalid_actions += 1
+            if not record_raw_output and decision.parser_error is not None:
+                # Redaction drops the malformed text before step(), so it never
+                # reaches action.raw, the core's last_event or agent history.
+                action = InvalidAction(reason=action.reason)
 
-        transition = environment.step(action)
+        try:
+            transition = environment.step(action)
+        except Exception as exc:
+            # Internal (non-policy) errors such as PricingError end the run as
+            # infrastructure_error; the trajectory so far is still written.
+            message = f"{type(exc).__name__}: {exc}"
+            infrastructure_error = {
+                "error_type": type(exc).__name__,
+                "message": message[:4000],
+                "request_id": request.request_id,
+                "round_num": observation.round_num,
+                "step_index": observation.step_index,
+            }
+            recorder.mark_run_outcome(
+                "infrastructure_error",
+                infrastructure_error,
+            )
+            break
         if transition.constraint_signals.accepted is True:
             accepted_submissions += 1
 
-        raw_hash = hashlib.sha256(
-            decision.raw_output.encode("utf-8")
-        ).hexdigest()
         policy_metadata = {
             **to_jsonable(dict(decision.metadata)),
             "agent_request_schema": AGENT_REQUEST_SCHEMA,
             "request_id": request.request_id,
             "policy_kind": policy.kind,
             "policy_name": policy.name,
-            "raw_output_sha256": raw_hash,
             "raw_output": decision.raw_output if record_raw_output else None,
             "parser_error": decision.parser_error,
             "history_omitted": history_omitted,
@@ -885,7 +888,7 @@ async def run_agent_episode(
                 "request_id": request.request_id,
                 "action": to_jsonable(transition.action),
                 "tool_result": to_jsonable(transition.tool_result),
-                "reward_components": to_jsonable(
+                "reward_components": _policy_visible_rewards(
                     transition.reward_components
                 ),
                 "constraint_signals": to_jsonable(
@@ -900,7 +903,6 @@ async def run_agent_episode(
     saved_path: str | None = None
     if trajectory_path is not None:
         saved_path = str(recorder.save(trajectory_path))
-    verified = recorder.verify_hash_chain()
     trajectory = recorder.to_dict()
     if infrastructure_error is not None:
         status = "infrastructure_error"
@@ -934,7 +936,6 @@ async def run_agent_episode(
         reward_summary=reward_summary,
         constraint_summary=constraint_summary,
         usage=dict(policy.total_usage),
-        trajectory_verified=verified,
         trajectory_path=saved_path,
         trajectory=trajectory,
     )
@@ -954,5 +955,6 @@ __all__ = [
     "create_api_agent_policy",
     "load_agent_system_prompt",
     "parse_environment_action",
+    "policy_run_metadata",
     "run_agent_episode",
 ]

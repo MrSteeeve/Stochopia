@@ -1,8 +1,4 @@
-# 模型注册表：defaults 定义各用途的默认模型名，models 定义各模型的接入配置。
-defaults:
-  test_model: deepseek-v4-flash
-  env_model: deepseek-v4-flash      # 环境智能体：角色扮演用便宜快的
-
+# 模型注册表：models 定义各模型的接入配置；具体用哪个模型由 CLI 参数 / benchmark_roles.yaml 决定。
 models:
   deepseek-v4-flash:
     provider: openai-compatible

@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import io
 import json
 import os
-import tempfile
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+import importlib
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -20,14 +19,83 @@ from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
-from .tushare_data import DEFAULT_TUSHARE_HTTP_URL, create_pro_client
+from .common import (
+    atomic_write_bytes,
+    atomic_write_json,
+    canonical_json,
+    read_csv_rows,
+    read_csv_table,
+    sha256_text,
+)
+
+
+DEFAULT_TUSHARE_HTTP_URL = "https://ts.gyzcloud.top/api"
+
+
+class TushareConfigurationError(RuntimeError):
+    """Raised when required Tushare configuration is missing."""
+
+
+def create_pro_client(
+    environ: Mapping[str, str] | None = None,
+    *,
+    import_module: Callable[[str], Any] = importlib.import_module,
+) -> Any:
+    """Build a Tushare Pro client using environment-only credentials.
+
+    The import is intentionally delayed until after the token check so a
+    missing credential fails before SDK initialization or network activity.
+    """
+
+    env = os.environ if environ is None else environ
+    token = env.get("TUSHARE_TOKEN", "").strip()
+    if not token:
+        raise TushareConfigurationError("TUSHARE_TOKEN is required")
+    http_url = env.get("TUSHARE_HTTP_URL", DEFAULT_TUSHARE_HTTP_URL).strip()
+    if not http_url:
+        http_url = DEFAULT_TUSHARE_HTTP_URL
+
+    ts = import_module("tushare")
+    ts.set_token(token)
+    pro = ts.pro_api()
+    pro._DataApi__http_url = http_url
+    return pro
 
 
 START_DATE = "20210901"
 END_DATE = "20251231"
 OPTION_START_DATE = "20220901"
+HISTORICAL_START_DATE = "20150101"
+HISTORICAL_GAP_END_DATE = "20210831"
+HISTORICAL_CALIBRATION_END_DATE = "20221231"
+Q_HISTORY_START_DATE = "20150101"
+Q_HISTORY_GAP_END_DATE = "20210831"
 DEFAULT_RAW_DIR = Path("data/raw/tushare")
 DEFAULT_MIN_INTERVAL = 2.1
+
+INDEX_DAILY_FIELDS = (
+    "ts_code,trade_date,close,open,high,low,pre_close,change,pct_chg,vol,amount"
+)
+HISTORICAL_SOURCE_RECORD = {
+    "provider": "Tushare Pro",
+    "acquisition_route": "user-authorized Tushare bridge",
+    "index_daily_documentation": "https://tushare.pro/document/1?doc_id=95",
+    "data_service_agreement": "https://tushare.pro/document/1?doc_id=405",
+    "license_decision_path": "data/reference/license_decision.json",
+    "permitted_use": "local_research_only",
+    "raw_redistribution": False,
+    "history_type": "post_launch_provider_snapshot",
+}
+Q_HISTORY_SOURCE_RECORD = {
+    "provider": "Tushare Pro",
+    "acquisition_route": "user-authorized Tushare bridge",
+    "shibor_documentation": "https://tushare.pro/document/1?doc_id=149",
+    "data_service_agreement": "https://tushare.pro/document/1?doc_id=405",
+    "license_decision_path": "data/reference/license_decision.json",
+    "permitted_use": "local_research_only",
+    "raw_redistribution": False,
+    "history_type": "post_observation_date_provider_snapshot",
+}
 
 RATE_LIMIT_MARKERS = (
     "rate limit",
@@ -156,7 +224,7 @@ def core_plan() -> list[RequestSpec]:
                 RequestSpec(
                     "index_daily",
                     {"ts_code": code, "start_date": start, "end_date": end},
-                    "ts_code,trade_date,close,open,high,low,pre_close,change,pct_chg,vol,amount",
+                    INDEX_DAILY_FIELDS,
                 )
             )
         specs.append(
@@ -232,6 +300,51 @@ def core_plan() -> list[RequestSpec]:
     return specs
 
 
+def historical_plan() -> list[RequestSpec]:
+    """Return the frozen append-only plan for the pre-2021-09 history gap.
+
+    The existing core cache already contains 2021-09 through 2025-12.  This
+    plan deliberately stops on 2021-08-31 so collection cannot overlap or
+    replace those raw files.  The 2015 start keeps both indices after their
+    official launch dates and excludes pre-launch backcasts.
+    """
+
+    specs = [
+        RequestSpec(
+            "trade_cal",
+            {
+                "exchange": "SSE",
+                "start_date": HISTORICAL_START_DATE,
+                "end_date": HISTORICAL_GAP_END_DATE,
+            },
+            "exchange,cal_date,is_open,pretrade_date",
+        )
+    ]
+    for start, end in annual_chunks(HISTORICAL_START_DATE, HISTORICAL_GAP_END_DATE):
+        for code in ("000905.SH", "000852.SH"):
+            specs.append(
+                RequestSpec(
+                    "index_daily",
+                    {"ts_code": code, "start_date": start, "end_date": end},
+                    INDEX_DAILY_FIELDS,
+                )
+            )
+    return specs
+
+
+def q_history_plan() -> list[RequestSpec]:
+    """Backfill the non-overlapping 2015 through 2021-08 SHIBOR gap."""
+
+    return [
+        RequestSpec(
+            "shibor",
+            {"start_date": start, "end_date": end},
+            "date,on,1w,2w,1m,3m,6m,9m,1y",
+        )
+        for start, end in annual_chunks(Q_HISTORY_START_DATE, Q_HISTORY_GAP_END_DATE)
+    ]
+
+
 def options_plan(trade_dates: Iterable[str]) -> list[RequestSpec]:
     """Build one whole-market SSE option request per selected trade date."""
 
@@ -246,48 +359,100 @@ def options_plan(trade_dates: Iterable[str]) -> list[RequestSpec]:
     ]
 
 
-def _canonical_json(payload: Any) -> str:
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def pick_date_column(columns: Iterable[str], candidates: Sequence[str] = DATE_COLUMNS) -> str | None:
+    """First known date column present in ``columns`` (precedence = ``candidates``)."""
+
+    present = set(columns)
+    return next((column for column in candidates if column in present), None)
 
 
-def _sha256_bytes(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()
+def date_bounds(
+    rows: Iterable[Mapping[str, Any]],
+    column: str | None,
+    *,
+    compact: bool = False,
+) -> tuple[str | None, str | None]:
+    """``(min, max)`` of a date column as strings; ``compact`` strips ``-``."""
 
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _atomic_write(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-    except BaseException:
-        Path(temp_name).unlink(missing_ok=True)
-        raise
+    if column is None:
+        return None, None
+    values = [str(row.get(column, "")) for row in rows if row.get(column)]
+    if compact:
+        values = [value.replace("-", "") for value in values]
+    return (min(values), max(values)) if values else (None, None)
 
 
 def _date_bounds(csv_text: str, columns: Sequence[str]) -> tuple[str | None, str | None]:
-    date_column = next((column for column in DATE_COLUMNS if column in columns), None)
-    if date_column is None:
-        return None, None
-    values = [
-        row[date_column]
-        for row in csv.DictReader(io.StringIO(csv_text))
-        if row.get(date_column)
-    ]
-    return (min(values), max(values)) if values else (None, None)
+    return date_bounds(list(csv.DictReader(io.StringIO(csv_text))), pick_date_column(columns))
+
+
+def tushare_cache_key(
+    endpoint: str | None,
+    params: Mapping[str, Any],
+    fields: str,
+    sdk_version: str,
+    bridge_host: str,
+) -> str:
+    """Content-addressed cache key shared by the fetcher and every verifier."""
+
+    payload = {
+        "endpoint": endpoint,
+        "params": dict(params),
+        "fields": fields,
+        "sdk_version": sdk_version,
+        "bridge_host": bridge_host,
+    }
+    return sha256_text(canonical_json(payload))
+
+
+def iter_endpoint_sidecars(root: Path, endpoint: str) -> Iterator[tuple[Path, Path]]:
+    """``(metadata_path, csv_path)`` for every sidecar under ``root/endpoint``, sorted."""
+
+    for metadata_path in sorted((root / endpoint).glob("*.json")):
+        yield metadata_path, metadata_path.with_suffix(".csv")
+
+
+def sidecar_checks(
+    metadata: Mapping[str, Any],
+    columns: Sequence[str],
+    rows: Sequence[Mapping[str, Any]],
+    min_date: str | None,
+    max_date: str | None,
+) -> dict[str, bool]:
+    """Consistency checks of one cache sidecar against its parsed CSV, in protocol order."""
+
+    return {
+        "status": metadata.get("status") == "complete",
+        "row_count": metadata.get("row_count") == len(rows),
+        "columns": metadata.get("columns") == list(columns),
+        "min_date": metadata.get("min_date") == min_date,
+        "max_date": metadata.get("max_date") == max_date,
+    }
+
+
+def load_endpoint_rows(
+    root: Path,
+    endpoint: str,
+    *,
+    error: type[Exception] = ValueError,
+    require_rows: bool = True,
+) -> list[dict[str, str]]:
+    """Concatenate every complete cached CSV of ``endpoint``."""
+
+    rows: list[dict[str, str]] = []
+    for metadata_path, csv_path in iter_endpoint_sidecars(root, endpoint):
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("endpoint") != endpoint or metadata.get("status") != "complete":
+            raise error(f"invalid {endpoint} cache metadata: {metadata_path.name}")
+        if not csv_path.is_file():
+            raise error(f"missing {endpoint} cache CSV: {metadata_path.name}")
+        columns, cached = read_csv_table(csv_path)
+        if len(cached) != metadata.get("row_count") or columns != metadata.get("columns"):
+            raise error(f"invalid {endpoint} cache shape: {metadata_path.name}")
+        rows.extend(cached)
+    if require_rows and not rows:
+        raise error(f"no cached rows for {endpoint}")
+    return rows
 
 
 def is_rate_limit_error(message: str) -> bool:
@@ -321,6 +486,7 @@ class BatchFetcher:
         min_interval: float = DEFAULT_MIN_INTERVAL,
         retries: int = 0,
         token: str = "",
+        source_record: Mapping[str, Any] | None = None,
         limiter: SerialRateLimiter | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -333,20 +499,16 @@ class BatchFetcher:
         self.bridge_host = bridge_host
         self.retries = retries
         self.token = token
+        self.source_record = dict(source_record or {})
         self.limiter = limiter or SerialRateLimiter(min_interval, sleeper=sleeper)
         self.sleeper = sleeper
         self.now = now
         self.stopped = False
 
     def cache_key(self, spec: RequestSpec) -> str:
-        payload = {
-            "endpoint": spec.endpoint,
-            "params": dict(spec.params),
-            "fields": spec.fields,
-            "sdk_version": self.sdk_version,
-            "bridge_host": self.bridge_host,
-        }
-        return _sha256_bytes(_canonical_json(payload).encode("utf-8"))
+        return tushare_cache_key(
+            spec.endpoint, spec.params, spec.fields, self.sdk_version, self.bridge_host
+        )
 
     def paths(self, spec: RequestSpec) -> tuple[Path, Path]:
         key = self.cache_key(spec)
@@ -363,7 +525,6 @@ class BatchFetcher:
             if (
                 metadata.get("status") != "complete"
                 or metadata.get("cache_key") != key
-                or metadata.get("sha256") != _sha256_file(csv_path)
             ):
                 return None
             return CacheResult(
@@ -382,6 +543,7 @@ class BatchFetcher:
         cached = self._cached_result(spec)
         if cached is not None:
             return cached
+        csv_path, metadata_path = self.paths(spec)
         if self.stopped:
             raise RateLimitError("collector is stopped after a rate-limit response")
 
@@ -412,15 +574,13 @@ class BatchFetcher:
                     "timestamp": self.now().isoformat(),
                     "row_count": len(frame),
                     "columns": list(columns),
-                    "sha256": _sha256_bytes(csv_bytes),
                     "min_date": min_date,
                     "max_date": max_date,
                 }
-                _atomic_write(csv_path, csv_bytes)
-                _atomic_write(
-                    metadata_path,
-                    (json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
-                )
+                if self.source_record:
+                    metadata["source"] = self.source_record
+                atomic_write_bytes(csv_path, csv_bytes)
+                atomic_write_json(metadata_path, metadata)
                 return CacheResult(
                     endpoint=spec.endpoint,
                     cache_key=self.cache_key(spec),
@@ -450,18 +610,7 @@ class BatchFetcher:
         cached = self._cached_result(spec)
         if cached is None:
             raise BatchError(f"required cache missing for {spec.endpoint}")
-        with cached.csv_path.open(encoding="utf-8", newline="") as handle:
-            return list(csv.DictReader(handle))
-
-    def write_manifest(self) -> Path:
-        entries = []
-        for path in sorted(self.raw_dir.rglob("*")):
-            if path.is_file() and path.name != "manifest.sha256" and path.suffix in {".csv", ".json"}:
-                entries.append(f"{_sha256_file(path)}  {path.relative_to(self.raw_dir)}\n")
-        manifest = self.raw_dir / "manifest.sha256"
-        _atomic_write(manifest, "".join(entries).encode("utf-8"))
-        return manifest
-
+        return read_csv_rows(cached.csv_path)
 
 def _trade_cal_spec() -> RequestSpec:
     return core_plan()[0]
@@ -474,22 +623,19 @@ def cached_option_dates(fetcher: BatchFetcher) -> list[str]:
 
 def run_specs(fetcher: BatchFetcher, specs: Iterable[RequestSpec]) -> dict[str, Any]:
     summary: dict[str, Any] = {"planned": 0, "fetched": 0, "cached": 0, "rows": 0, "optional_failures": []}
-    try:
-        for spec in specs:
-            summary["planned"] += 1
-            try:
-                result = fetcher.fetch(spec)
-            except RequestFailed as exc:
-                if not spec.optional:
-                    raise
-                summary["optional_failures"].append(
-                    {"endpoint": spec.endpoint, "error": str(exc), "non_core_optional": True}
-                )
-                continue
-            summary["cached" if result.cached else "fetched"] += 1
-            summary["rows"] += result.row_count
-    finally:
-        summary["manifest"] = str(fetcher.write_manifest())
+    for spec in specs:
+        summary["planned"] += 1
+        try:
+            result = fetcher.fetch(spec)
+        except RequestFailed as exc:
+            if not spec.optional:
+                raise
+            summary["optional_failures"].append(
+                {"endpoint": spec.endpoint, "error": str(exc), "non_core_optional": True}
+            )
+            continue
+        summary["cached" if result.cached else "fetched"] += 1
+        summary["rows"] += result.row_count
     return summary
 
 
@@ -504,7 +650,11 @@ def audit_sse_master_candidates(rows: Iterable[Mapping[str, str]]) -> dict[str, 
     return {"rule": "name_contains_500ETF_or_中证500", "candidate_count": len(candidates)}
 
 
-def _build_fetcher(args: argparse.Namespace) -> BatchFetcher:
+def _build_fetcher(
+    args: argparse.Namespace,
+    *,
+    source_record: Mapping[str, Any] | None = None,
+) -> BatchFetcher:
     client = create_pro_client()
     return BatchFetcher(
         client,
@@ -514,12 +664,16 @@ def _build_fetcher(args: argparse.Namespace) -> BatchFetcher:
         min_interval=args.min_interval,
         retries=args.retries,
         token=os.environ.get("TUSHARE_TOKEN", ""),
+        source_record=source_record,
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stochopia resumable Tushare collector")
-    parser.add_argument("command", choices=("plan", "core", "options", "all"))
+    parser.add_argument(
+        "command",
+        choices=("plan", "core", "options", "all", "historical-index", "q-history"),
+    )
     parser.add_argument("--raw-dir", type=Path, default=DEFAULT_RAW_DIR)
     parser.add_argument("--min-interval", type=float, default=DEFAULT_MIN_INTERVAL)
     parser.add_argument("--retries", type=int, default=0)
@@ -531,6 +685,40 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     load_dotenv()
     core_specs = core_plan()
+    if args.command == "q-history" and args.dry_run:
+        specs = q_history_plan()
+        print(
+            json.dumps(
+                {
+                    "q_history_requests": len(specs),
+                    "shibor_requests": len(specs),
+                    "start_date": Q_HISTORY_START_DATE,
+                    "end_date": Q_HISTORY_GAP_END_DATE,
+                    "network_requests": 0,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.command == "historical-index" and args.dry_run:
+        specs = historical_plan()
+        print(
+            json.dumps(
+                {
+                    "historical_requests": len(specs),
+                    "index_daily_requests": sum(spec.endpoint == "index_daily" for spec in specs),
+                    "trade_calendar_requests": sum(spec.endpoint == "trade_cal" for spec in specs),
+                    "start_date": HISTORICAL_START_DATE,
+                    "end_date": HISTORICAL_GAP_END_DATE,
+                    "calibration_end_date": HISTORICAL_CALIBRATION_END_DATE,
+                    "network_requests": 0,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 0
     if args.command == "plan" or args.dry_run:
         payload: dict[str, Any] = {"core_requests": len(core_specs), "network_requests": 0}
         if args.raw_dir.exists():
@@ -551,8 +739,21 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 0
 
-    fetcher = _build_fetcher(args)
+    historical = args.command == "historical-index"
+    q_history = args.command == "q-history"
+    fetcher = _build_fetcher(
+        args,
+        source_record=(
+            HISTORICAL_SOURCE_RECORD
+            if historical
+            else Q_HISTORY_SOURCE_RECORD if q_history else None
+        ),
+    )
     result: dict[str, Any] = {}
+    if historical:
+        result["historical_index"] = run_specs(fetcher, historical_plan())
+    if q_history:
+        result["q_history"] = run_specs(fetcher, q_history_plan())
     if args.command in {"core", "all"}:
         result["core"] = run_specs(fetcher, core_specs)
     if args.command in {"options", "all"}:

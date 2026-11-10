@@ -7,11 +7,27 @@ from datetime import date, timedelta
 import pytest
 
 from stochopia.benchmark import MarketSnapshot
-from stochopia.formal_option_iv import apply_full_phase, build_chain_iv, parse_mo_master, parse_sse_master
+from stochopia.formal_option_iv import (
+    _atm_total_variance_is_monotone,
+    apply_full_phase,
+    build_chain_iv,
+    parse_mo_master,
+    parse_sse_master,
+)
 from stochopia.market_data_math import ShiborCurve, black76_price
 
 
 NODES = (1, 7, 14, 30, 91, 182, 274, 365)
+
+
+def test_atm_total_variance_gate_rejects_decreasing_tenor_curve():
+    assert _atm_total_variance_is_monotone(
+        {"atm_iv_1m": 0.18, "atm_iv_3m": 0.19, "atm_iv_6m": 0.20}
+    )
+    assert not _atm_total_variance_is_monotone(
+        {"atm_iv_1m": 0.60, "atm_iv_3m": 0.20, "atm_iv_6m": 0.10}
+    )
+    assert _atm_total_variance_is_monotone({})
 
 
 def _sse_master_and_chain(chain_date=date(2025, 1, 31)):

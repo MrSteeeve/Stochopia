@@ -7,13 +7,13 @@ loops and the synchronous environment in :mod:`stochopia.environment.core`.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date
 from typing import Any, Literal, Mapping, TypeAlias
 
+from ..common import canonical_json, sha256_json, sha256_text
 from ..benchmark import (
     MarketSnapshot,
     ProductDomainSpec,
@@ -30,6 +30,15 @@ REWARD_SCHEMA_VERSION = "stochopia.reward-vector.v1"
 SCALARIZATION_VERSION = "stochopia.scalarization.explicit.v1"
 V3_PUBLIC_NOTIONAL_BASE = 10_000_000.0
 V3_PUBLIC_CLIENT_ALIAS = "current_client"
+# Measured only on steps where their event happens (query, quote, submission,
+# invalid action/skip); absent otherwise.
+EVENT_SCOPED_COMPONENTS = frozenset(
+    {"query_cost", "quote_cost", "dealer_economics", "operational_cost"}
+)
+# Never measured by Level 0; weighting them could only fail after a step.
+LEVEL0_UNMEASURED_COMPONENTS = frozenset(
+    {"relationship_delta", "communication_faithfulness"}
+)
 
 
 def _manifest_default(value: Any) -> Any:
@@ -87,10 +96,13 @@ class EpisodeTask:
         rounds = [snapshot.round_num for snapshot in self.snapshots]
         if rounds != list(range(1, len(rounds) + 1)):
             raise ValueError("EpisodeTask snapshot rounds must be contiguous from one")
-        dates = [snapshot.as_of for snapshot in self.snapshots]
-        if any(right <= left for left, right in zip(dates, dates[1:])):
+        # Positions age one month per round, so rounds must be consecutive
+        # calendar months.
+        months = [snapshot.as_of.year * 12 + snapshot.as_of.month for snapshot in self.snapshots]
+        if any(right - left != 1 for left, right in zip(months, months[1:])):
             raise ValueError(
-                "EpisodeTask snapshot dates must be strictly increasing"
+                "EpisodeTask snapshots must follow the monthly observation grid "
+                "(one snapshot per consecutive calendar month)"
             )
         for snapshot in self.snapshots:
             required = (
@@ -132,21 +144,8 @@ class EpisodeTask:
         object.__setattr__(
             self,
             "_manifest_json",
-            json.dumps(
-                payload,
-                default=_manifest_default,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ),
+            canonical_json(payload, default=_manifest_default),
         )
-
-    @property
-    def schema_version(self) -> str:
-        """Explicit alias used by trajectory metadata."""
-
-        return self.schema
 
     @property
     def manifest(self) -> dict[str, Any]:
@@ -156,7 +155,7 @@ class EpisodeTask:
 
     @property
     def task_hash(self) -> str:
-        return hashlib.sha256(self._manifest_json.encode("utf-8")).hexdigest()
+        return sha256_text(self._manifest_json)
 
     @property
     def public_task_id(self) -> str:
@@ -170,13 +169,7 @@ class EpisodeTask:
             "domain_version": self.domain.version,
             "public_notional_base": self.domain.public_notional_base,
         }
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return f"public-{hashlib.sha256(encoded).hexdigest()[:16]}"
+        return f"public-{sha256_json(payload)[:16]}"
 
     def materialize(self) -> tuple[
         tuple[MarketSnapshot, ...],
@@ -187,46 +180,14 @@ class EpisodeTask:
     ]:
         """Reconstruct fresh runtime inputs from the captured manifest."""
 
-        payload = self.manifest
-        snapshots = tuple(
-            MarketSnapshot(
-                **{
-                    **row,
-                    "as_of": date.fromisoformat(row["as_of"]),
-                }
-            )
-            for row in payload["snapshots"]
-        )
-        client = ClientProfile(**payload["client"])
-        risk_budget = RiskBudget(**payload["risk_budget"])
-        domain_payload = payload["domain"]
-        for name in (
-            "product_types",
-            "notional_fractions",
-            "maturities",
-            "strikes",
-            "barriers",
-            "coupons",
-            "participations",
-            "principal_protected",
-        ):
-            domain_payload[name] = tuple(domain_payload[name])
-        domain = ProductDomainSpec(**domain_payload)
-        quote_policy = QuotePolicy(**payload["quote_policy"])
-        return snapshots, client, risk_budget, domain, quote_policy
+        task = type(self).from_manifest(self.manifest)
+        return task.snapshots, task.client, task.risk_budget, task.domain, task.quote_policy
 
     @classmethod
     def from_manifest(cls, manifest: Mapping[str, Any]) -> "EpisodeTask":
         """Reconstruct and revalidate a task from a stored canonical manifest."""
 
-        payload = json.loads(
-            json.dumps(
-                dict(manifest),
-                ensure_ascii=False,
-                sort_keys=True,
-                allow_nan=False,
-            )
-        )
+        payload = json.loads(canonical_json(dict(manifest)))
         try:
             snapshots = tuple(
                 MarketSnapshot(
@@ -307,10 +268,6 @@ class AskClient:
     def type(self) -> str:
         return self.action
 
-    @property
-    def kind(self) -> str:
-        return self.action
-
 
 @dataclass(frozen=True)
 class RequestQuote:
@@ -321,10 +278,6 @@ class RequestQuote:
 
     @property
     def type(self) -> str:
-        return self.action
-
-    @property
-    def kind(self) -> str:
         return self.action
 
 
@@ -340,10 +293,6 @@ class SubmitDesign:
     def type(self) -> str:
         return self.action
 
-    @property
-    def kind(self) -> str:
-        return self.action
-
 
 @dataclass(frozen=True)
 class SubmitProduct:
@@ -355,10 +304,6 @@ class SubmitProduct:
 
     @property
     def type(self) -> str:
-        return self.action
-
-    @property
-    def kind(self) -> str:
         return self.action
 
 
@@ -373,10 +318,6 @@ class Skip:
     def type(self) -> str:
         return self.action
 
-    @property
-    def kind(self) -> str:
-        return self.action
-
 
 @dataclass(frozen=True)
 class InvalidAction:
@@ -388,10 +329,6 @@ class InvalidAction:
 
     @property
     def type(self) -> str:
-        return self.action
-
-    @property
-    def kind(self) -> str:
         return self.action
 
 
@@ -489,30 +426,6 @@ class RewardComponents:
     )
     schema_version: str = REWARD_SCHEMA_VERSION
 
-    @property
-    def dealer_margin(self) -> float | None:
-        return self.dealer_economics.value
-
-    @property
-    def raw_reward_components(self) -> dict[str, float | None]:
-        return {
-            name: getattr(self, name).value
-            for name in self.component_names()
-        }
-
-    @property
-    def normalised_reward_components(self) -> dict[str, float | None]:
-        return {
-            name: getattr(self, name).normalized_value
-            for name in self.component_names()
-        }
-
-    @property
-    def available_components(self) -> tuple[str, ...]:
-        return tuple(
-            name for name in self.component_names() if getattr(self, name).available
-        )
-
     @staticmethod
     def component_names() -> tuple[str, ...]:
         return (
@@ -573,7 +486,11 @@ def scalarize_reward(
     for name, weight in spec.weights.items():
         term = getattr(reward, name)
         if not term.available:
-            if term.provenance == "no-lifecycle-event-this-step":
+            # Event-scoped terms are zero on steps without their event.
+            if (
+                name in EVENT_SCOPED_COMPONENTS
+                or term.provenance == "no-lifecycle-event-this-step"
+            ):
                 continue
             raise ValueError(f"cannot scalarize unavailable component {name!r}")
         value = (
@@ -599,14 +516,8 @@ class ConstraintSignals:
     contract_failures: tuple[str, ...] = ()
     exhausted_budgets: tuple[str, ...] = ()
     error: str | None = None
-
-    @property
-    def hard_violations(self) -> tuple[str, ...]:
-        return self.hard_failures
-
-    @property
-    def contract_violations(self) -> tuple[str, ...]:
-        return self.contract_failures
+    # The desk could not price a legal request (QuoteNotConvergedError).
+    quote_unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -616,7 +527,7 @@ class StepTransition:
     Iteration yields the familiar five values ``(observation, reward,
     terminated, truncated, info)`` without taking a dependency on Gymnasium.
     The explicit fields retain the previous observation, action, constraint
-    vector, and both state hashes for lossless trajectory recording.
+    vector for lossless trajectory recording.
     """
 
     previous_observation: Observation
@@ -628,8 +539,6 @@ class StepTransition:
     terminated: bool
     truncated: bool
     info: Mapping[str, Any]
-    state_hash_before: str
-    state_hash_after: str
 
     @property
     def reward(self) -> RewardComponents:

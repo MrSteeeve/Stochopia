@@ -21,6 +21,7 @@ from .agent_runner import (
     create_api_agent_policy,
     load_agent_system_prompt,
     parse_environment_action,
+    policy_run_metadata,
     run_agent_episode,
 )
 from .trajectory import (
@@ -28,7 +29,6 @@ from .trajectory import (
     TrajectoryEntry,
     TrajectoryMetadata,
     TrajectoryRecorder,
-    verify_trajectory,
 )
 from .wrappers import ScalarizedStochopiaEnv
 from .evaluation import (
@@ -111,10 +111,10 @@ __all__ = [
     "TrajectoryMetadata",
     "TrajectoryRecorder",
     "TaskSuite",
-    "verify_trajectory",
     "create_api_agent_policy",
     "load_agent_system_prompt",
     "parse_environment_action",
+    "policy_run_metadata",
     "run_agent_episode",
     "aggregate_evaluations",
     "load_evaluations",

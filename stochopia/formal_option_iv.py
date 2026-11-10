@@ -6,11 +6,13 @@ import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date
 from typing import Any, Iterable, Mapping, Sequence
 
 from .benchmark import MarketSnapshot
+from .common import parse_yyyymmdd
 from .market_data_math import (
+    SHIBOR_COLUMNS,
     ExpiryPair,
     ExpiryPoint,
     ShiborCurve,
@@ -22,10 +24,6 @@ from .market_data_math import (
 SSE_SYMBOL = re.compile(r"^510500([CP])(\d{4})([MA])(\d{5})$")
 MO_SYMBOL = re.compile(r"^MO\d{4}-([CP])-(\d+(?:\.\d+)?)$")
 TENORS = {"atm_iv_1m": 30, "atm_iv_3m": 91, "atm_iv_6m": 182}
-
-
-def _day(value: str) -> date:
-    return datetime.strptime(value, "%Y%m%d").date()
 
 
 @dataclass(frozen=True)
@@ -81,8 +79,8 @@ def parse_sse_master(rows: Iterable[Mapping[str, str]]) -> MasterBook:
             strike = float(row.get("exercise_price", ""))
             encoded_strike = int(match.group(4)) / 1000 if match else -1
             per_unit = float(row.get("per_unit", ""))
-            expiry, listed = _day(row["maturity_date"]), _day(row["list_date"])
-            ends = [_day(row[column]) for column in ("delist_date", "last_edate") if row.get(column)]
+            expiry, listed = parse_yyyymmdd(row["maturity_date"]), parse_yyyymmdd(row["list_date"])
+            ends = [parse_yyyymmdd(row[column]) for column in ("delist_date", "last_edate") if row.get(column)]
             end = min(ends)
         except (KeyError, TypeError, ValueError):
             rejects["invalid_master"] += 1
@@ -112,8 +110,8 @@ def parse_mo_master(rows: Iterable[Mapping[str, str]]) -> MasterBook:
             strike = float(row.get("exercise_price", ""))
             encoded_strike = float(match.group(2)) if match else -1
             per_unit = float(row.get("per_unit", ""))
-            expiry, listed = _day(row["maturity_date"]), _day(row["list_date"])
-            ends = [_day(row[column]) for column in ("delist_date", "last_edate") if row.get(column)]
+            expiry, listed = parse_yyyymmdd(row["maturity_date"]), parse_yyyymmdd(row["list_date"])
+            ends = [parse_yyyymmdd(row[column]) for column in ("delist_date", "last_edate") if row.get(column)]
             end = min(ends)
         except (KeyError, TypeError, ValueError):
             rejects["invalid_master"] += 1
@@ -140,6 +138,22 @@ def _tenor_method(points: Sequence[ExpiryPoint], target: int) -> str:
     if lower and upper and upper[0] - lower[-1] <= 120:
         return "total_variance_bracket"
     return "nearest"
+
+
+def _atm_total_variance_is_monotone(tenors: Mapping[str, float]) -> bool:
+    """Necessary calendar-arbitrage check on every available ATM tenor node."""
+
+    ordered = [
+        (TENORS[name], float(tenors[name]))
+        for name in ("atm_iv_1m", "atm_iv_3m", "atm_iv_6m")
+        if name in tenors
+    ]
+    total_variances = [volatility * volatility * days / 365.0 for days, volatility in ordered]
+    tolerance = 1e-12 * max((1.0, *total_variances))
+    return not any(
+        right + tolerance < left
+        for left, right in zip(total_variances, total_variances[1:])
+    )
 
 
 def build_chain_iv(
@@ -214,6 +228,10 @@ def build_chain_iv(
             methods[name] = _tenor_method(points, target)
         except ValueError:
             continue
+    if not _atm_total_variance_is_monotone(tenors):
+        rejects["nonmonotone_atm_total_variance"] += 1
+        tenors = {}
+        methods = {}
     return ChainResult(chain_date, tenors, methods, tuple(points), point_contracts, dict(rejects))
 
 
@@ -223,23 +241,24 @@ def apply_full_phase(
     option_master_rows: Iterable[Mapping[str, str]],
     fund_rows: Iterable[Mapping[str, str]], index_rows: Iterable[Mapping[str, str]],
     shibor_rows: Iterable[Mapping[str, str]],
+    exchange_open_dates: Sequence[date] | None = None,
 ) -> tuple[list[MarketSnapshot], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     masters = list(option_master_rows)
     books = {"CSI500": parse_sse_master(masters), "CSI1000": parse_mo_master(masters)}
     sse_by_date: dict[date, list[Mapping[str, str]]] = defaultdict(list)
     for row in sse_rows:
-        sse_by_date[_day(row["trade_date"])].append(row)
+        sse_by_date[parse_yyyymmdd(row["trade_date"])].append(row)
     mo_by_date: dict[date, list[Mapping[str, str]]] = defaultdict(list)
     for row in mo_rows:
         if row.get("product") == "MO":
-            mo_by_date[_day(row["trade_date"])].append(row)
-    fund_spot = {_day(row["trade_date"]): float(row["close"]) for row in fund_rows if row.get("ts_code") == "510500.SH"}
+            mo_by_date[parse_yyyymmdd(row["trade_date"])].append(row)
+    fund_spot = {parse_yyyymmdd(row["trade_date"]): float(row["close"]) for row in fund_rows if row.get("ts_code") == "510500.SH"}
     index_spot = {
-        (row.get("ts_code", ""), _day(row["trade_date"])): float(row["close"])
+        (row.get("ts_code", ""), parse_yyyymmdd(row["trade_date"])): float(row["close"])
         for row in index_rows if row.get("ts_code") == "000852.SH"
     }
     shibor = {
-        _day(row["date"]): {days: float(row[column]) for days, column in {1:"on",7:"1w",14:"2w",30:"1m",91:"3m",182:"6m",274:"9m",365:"1y"}.items()}
+        parse_yyyymmdd(row["date"]): {days: float(row[column]) for days, column in SHIBOR_COLUMNS.items()}
         for row in shibor_rows
     }
     provenance_by_key = {(row["episode_id"], row["round"]): dict(row) for row in provenance}
@@ -248,9 +267,12 @@ def apply_full_phase(
     reject_total.update(books["CSI1000"].reject_counts)
     lag_counts: Counter[int] = Counter()
     coverage_by_underlying: Counter[str] = Counter()
+    total_by_underlying: Counter[str] = Counter()
     tenor_counts: Counter[str] = Counter()
+    open_dates = tuple(sorted(set(exchange_open_dates or ())))
     for snapshot in snapshots:
         underlying = snapshot.underlying
+        total_by_underlying[underlying] += 1
         label = "sse_510500_etf_iv_proxy" if underlying == "CSI500" else "cffex_mo_index_iv"
         chains = sse_by_date if underlying == "CSI500" else mo_by_date
         market = "SSE" if underlying == "CSI500" else "MO"
@@ -258,7 +280,7 @@ def apply_full_phase(
         selected: ChainResult | None = None
         selected_spot = None
         same_date_rejects = 0
-        for lag, chain_day in enumerate(available):
+        for chain_day in available:
             spot = fund_spot.get(chain_day) if underlying == "CSI500" else index_spot.get(("000852.SH", chain_day))
             rates = shibor.get(chain_day)
             if spot is None or rates is None:
@@ -269,7 +291,6 @@ def apply_full_phase(
             reject_total.update(result.reject_counts)
             if result.tenors:
                 selected, selected_spot = result, spot
-                lag_counts[lag] += 1
                 break
         values = selected.tenors if selected else {}
         updated = replace(
@@ -286,13 +307,24 @@ def apply_full_phase(
             tenor_counts.update(values.keys())
         base = provenance_by_key[(snapshot.episode_id, snapshot.round_num)]
         selected_date = selected.chain_date if selected else None
+        if selected_date is not None and open_dates:
+            if selected_date not in open_dates or snapshot.as_of not in open_dates:
+                raise ValueError("option chain/snapshot date is absent from exchange calendar")
+            staleness_trading_days = sum(
+                selected_date < trading_day <= snapshot.as_of
+                for trading_day in open_dates
+            )
+        else:
+            staleness_trading_days = available.index(selected_date) if selected_date else None
+        if staleness_trading_days is not None:
+            lag_counts[staleness_trading_days] += 1
         max_input = max(date.fromisoformat(base["max_input_date"]), selected_date) if selected_date else date.fromisoformat(base["max_input_date"])
         if max_input > snapshot.as_of:
             raise AssertionError("future-dated option input detected")
         base["option_iv"] = {
             "source_label": label,
             "selected_date": selected_date.isoformat() if selected_date else None,
-            "staleness_trading_days": available.index(selected_date) if selected_date else None,
+            "staleness_trading_days": staleness_trading_days,
             "proxy_spot": {"code": "510500.SH" if underlying == "CSI500" else "000852.SH", "observation_date": selected_date.isoformat() if selected_date else None},
             "tenors": {name: {"method": selected.tenor_methods[name]} for name in values} if selected else {},
             "expiry_contracts": dict(selected.point_contracts) if selected else {},
@@ -324,7 +356,15 @@ def apply_full_phase(
         "any_iv": any_count, "all3_iv": all_count, "total": len(output),
         "any_rate": any_count / len(output), "all3_rate": all_count / len(output),
         "by_underlying": {
-            name: {"count": coverage_by_underlying[name], "rate": coverage_by_underlying[name] / 36}
+            name: {
+                "count": coverage_by_underlying[name],
+                "total": total_by_underlying[name],
+                "rate": (
+                    coverage_by_underlying[name] / total_by_underlying[name]
+                    if total_by_underlying[name]
+                    else 0.0
+                ),
+            }
             for name in ("CSI500", "CSI1000")
         },
         "by_tenor": {

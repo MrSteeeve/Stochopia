@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import io
 import zipfile
 from pathlib import Path
@@ -95,7 +94,7 @@ def test_download_retries_then_atomically_writes_verified_archive(tmp_path):
     target = raw_dir / "202301.zip"
     assert target.read_bytes() == source
     assert record.cached is False
-    assert record.sha256 == hashlib.sha256(source).hexdigest()
+    assert record.size_bytes == len(source)
     assert record.csv_members == 1
     assert calls == [
         ("https://example.test/202301.zip", 4.5),
@@ -103,9 +102,14 @@ def test_download_retries_then_atomically_writes_verified_archive(tmp_path):
     ]
     assert sleeps == [1]
     assert list(raw_dir.glob("*.tmp")) == []
+    assert record.sidecar_path is not None
+    assert Path(record.sidecar_path).name == "202301.json"
 
     cached = cffex_data.download_month(
-        "202301", raw_dir=raw_dir, opener=lambda *_: pytest.fail("network used")
+        "202301",
+        raw_dir=raw_dir,
+        base_url="https://example.test/{yyyymm}.zip",
+        opener=lambda *_: pytest.fail("network used"),
     )
     assert cached.cached is True
 
@@ -153,23 +157,23 @@ def test_download_cli_defaults_to_single_attempt_and_2_1_second_interval():
     args = cffex_data.build_parser().parse_args(["download"])
     assert args.retries == 1
     assert args.min_interval == pytest.approx(2.1)
+    assert args.start == "201504"
 
 
-def test_manifest_and_normalized_csv_are_deterministic(tmp_path):
-    archive = _fixture_zip(tmp_path / "202301.zip")
-    digest = cffex_data.sha256_file(archive)
+def test_sidecar_and_normalized_csv_are_deterministic(tmp_path):
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    archive = _fixture_zip(raw_dir / "202301.zip")
     record = cffex_data.ArchiveRecord(
         month="202301",
         path=str(archive),
         url="http://example.test/202301.zip",
-        sha256=digest,
         size_bytes=archive.stat().st_size,
         csv_members=1,
         cached=False,
     )
-    manifest = tmp_path / "raw" / "manifest.sha256"
-    cffex_data.write_sha256_manifest([record], manifest)
-    assert manifest.read_text(encoding="utf-8") == f"{digest}  202301.zip\n"
+    record = cffex_data.write_archive_sidecar(record, raw_dir)
+    assert Path(record.sidecar_path).is_file()
 
     output = tmp_path / "processed" / "cffex_daily.csv"
     count = cffex_data.write_normalized_csv([archive], output)
@@ -178,6 +182,7 @@ def test_manifest_and_normalized_csv_are_deterministic(tmp_path):
     assert lines[0].split(",") == list(cffex_data.NORMALIZED_COLUMNS)
     assert lines[1].startswith("20230131,IC,IC2302,")
     assert lines[3].startswith("20230131,MO,MO2302-C-7000,")
+
 
 
 def test_cli_parse_uses_only_local_archives(tmp_path, capsys):

@@ -3,29 +3,17 @@
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 from dataclasses import asdict
 from typing import Any, Mapping
 
 from .core import StochopiaStructurerEnv
 from .types import (
+    LEVEL0_UNMEASURED_COMPONENTS,
     EnvironmentAction,
     Observation,
     ScalarizationSpec,
     scalarize_reward,
 )
-
-
-def _spec_hash(spec: ScalarizationSpec) -> str:
-    encoded = json.dumps(
-        asdict(spec),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 class ScalarizedStochopiaEnv:
@@ -45,9 +33,17 @@ class ScalarizedStochopiaEnv:
             raise TypeError("environment must be a StochopiaStructurerEnv")
         if not isinstance(scalarization, ScalarizationSpec):
             raise TypeError("scalarization must be a ScalarizationSpec")
+        # Reject up front: scalarize_reward would raise only after the inner
+        # environment had already stepped.
+        unmeasured = sorted(
+            name
+            for name, weight in scalarization.weights.items()
+            if weight != 0.0 and name in LEVEL0_UNMEASURED_COMPONENTS
+        )
+        if unmeasured:
+            raise ValueError(f"Level 0 never measures components: {unmeasured}")
         self.environment = environment
         self.scalarization = scalarization
-        self.scalarization_hash = _spec_hash(scalarization)
 
     @property
     def task(self):
@@ -65,7 +61,6 @@ class ScalarizedStochopiaEnv:
         observation, info = self.environment.reset(seed=seed, options=options)
         wrapped = dict(info)
         wrapped["scalarization"] = asdict(self.scalarization)
-        wrapped["scalarization_hash"] = self.scalarization_hash
         return observation, wrapped
 
     def step(
@@ -79,12 +74,17 @@ class ScalarizedStochopiaEnv:
         )
         info = copy.deepcopy(dict(transition.info))
         info["reward_components"] = asdict(transition.reward_components)
+        # Normalisers are hidden (initial client cash, dealer risk capital);
+        # value / normalized_value would reveal them to an agent reading info.
+        for term in info["reward_components"].values():
+            if isinstance(term, dict):
+                term.pop("normalized_value", None)
+        reward_summary = info.get("episode_summary", {}).get("reward")
+        if isinstance(reward_summary, dict):
+            reward_summary.pop("normalized_totals", None)
         info["constraint_signals"] = asdict(transition.constraint_signals)
         info["tool_result"] = copy.deepcopy(transition.tool_result)
-        info["state_hash_before"] = transition.state_hash_before
-        info["state_hash_after"] = transition.state_hash_after
         info["scalarization"] = asdict(self.scalarization)
-        info["scalarization_hash"] = self.scalarization_hash
         return (
             transition.observation,
             reward,

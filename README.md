@@ -149,8 +149,8 @@ print(observation.available_actions, transition.observation.round_num, info["see
 |---|---|---|
 | Input | a versioned `TaskSuite`, public market observation, public action schema and fixed public notional grid | client mandate, risk limits, quote policy and complete task manifest |
 | Interaction | `ask_client`, `request_quote`, `submit_design`, `submit_product`, `skip` | deterministic pricing, accounts, constraints and lifecycle state |
-| Output | one hash-chained trajectory with actions, observations, reward vector, constraint signals and run provenance | the same artifact also carries the sealed task manifest for replay, but it is never sent to the policy |
-| Evaluation | replay-verified per-task metrics and task-clustered policy aggregates | exact economic state is reconstructed independently from the sealed inputs |
+| Output | one JSON trajectory with actions, observations, reward vector, constraint signals and run provenance | the same artifact also carries the sealed task manifest for replay, but it is never sent to the policy |
+| Evaluation | per-task metrics (optional exact economic replay) and task-clustered policy aggregates | exact economic state is reconstructed independently from the sealed inputs |
 
 The last snapshot in every v3 task is terminal valuation truth, not another
 decision round. Thus a contract issued on the last decision snapshot must
@@ -216,9 +216,9 @@ stochopia-benchmark aggregate-v3 outputs/stochopia-dev \
 ```
 
 `run-v3-suite` resumes only trajectories whose task, public run seed,
-environment configuration and policy configuration still match and whose
-economic replay succeeds. Partial or stale runs are rerun; use `--force` to
-rerun matching complete artifacts deliberately.
+environment configuration and policy configuration still match. Partial or
+stale runs are rerun; use `--force` to rerun matching complete artifacts
+deliberately.
 
 The same boundary is available from Python through `CommandAgentPolicy`,
 `LLMAgentPolicy`/`create_api_agent_policy`, and `run_agent_episode`. Malformed
@@ -230,10 +230,10 @@ policy.
 
 Stochopia v1 trajectories include the public action schema, environment configuration,
 reset options and public run seed, prompt/model parameters, dependency
-versions, implementation hash and Git worktree provenance. Hash verification
-alone is not treated as economic verification: `evaluate-trajectory` rebuilds
-the task and requires every transition to match a fresh replay exactly. Agent
-summaries expose cumulative reward and constraint totals. These additions do
+versions and the Git commit. `evaluate-trajectory` scores the recorded
+transitions; with `--replay` it rebuilds the task and requires every transition
+to match a fresh replay exactly. Agent summaries expose cumulative reward and
+constraint totals. These additions do
 not implement the still-planned TaskGenerator, repair teacher,
 counterfactual-pair exporter, payoff DSL/solve-for, or fast/reference pricer.
 
@@ -317,14 +317,13 @@ Stochopia/
 |   |-- stats.py                    # seeding, bootstrap CI, Wilcoxon, permutation, Holm
 |   |-- experiment.py               # factorial manifest + paired condition contrasts
 |   |-- llm.py                      # OpenAI-compatible and Anthropic clients, mock client
-|   `-- market_builder.py, cffex_data.py, tushare_*.py, formal_*.py, raw_data_audit.py
-|                                   # market-data acquisition, provenance audit pipeline
+|   `-- market_builder.py, cffex_data.py, tushare_*.py, formal_*.py
+|                                   # market-data acquisition pipeline
 |-- scenarios/
 |   `-- stochopia_csi/              # inherited v2 engine inputs under Stochopia v1
 |-- docs/
 |   |-- BENCHMARK_PROTOCOL.md       # protocol of record
-|   |-- DATA_AUDIT.md               # source audit and go/no-go gates
-|   `-- redesign/                   # v2 design record (REDESIGN_PLAN.md and drafts)
+|   `-- redesign/                   # v2 design formula reference (DESIGN_REFERENCE.md)
 |-- data/                           # derived/frozen calibration artifacts (gitignored raw data)
 |-- outputs/                        # run artifacts (results JSON, manifests, aggregates)
 |-- tests/
@@ -334,8 +333,9 @@ Stochopia/
 
 ## Data provenance and license
 
-Production market data must carry explicit source provenance and pass the
-gates frozen in [docs/DATA_AUDIT.md](docs/DATA_AUDIT.md); the checked-in
+Production market data must carry explicit source provenance (raw Tushare and
+CFFEX files are collected with a JSON sidecar per request and are never
+redistributed); the checked-in
 `scenarios/stochopia_csi/market_snapshots.example.csv` is synthetic and cannot be
 used for reported results. Only abstract workflow, schemas and synthetic
 rules may be derived from private institutional material -- no private

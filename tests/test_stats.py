@@ -79,9 +79,17 @@ def test_bootstrap_ci_covers_mean_and_is_ordered():
     assert lo < hi
 
 
-def test_bootstrap_ci_single_value_degenerate():
+def test_bootstrap_ci_single_value_not_estimable():
     mean, lo, hi = bootstrap_ci([5.0], seed=1)
-    assert mean == lo == hi == 5.0
+    assert mean == 5.0
+    assert lo is None and hi is None
+
+
+def test_cluster_bootstrap_ci_single_cluster_not_estimable():
+    rows = [{"episode_id": "E1", "m": 1.0}, {"episode_id": "E1", "m": 3.0}]
+    mean, lo, hi = cluster_bootstrap_ci(rows, "m", seed=1, n_resamples=100)
+    assert mean == 2.0
+    assert lo is None and hi is None
 
 
 def test_bootstrap_ci_rejects_empty():

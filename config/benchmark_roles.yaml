@@ -1,40 +1,26 @@
 # Stochopia protocol v1 的 legacy-v2 角色行为配置（连接信息见 config/models.yaml）。
-# 冻结的主 NPC lineup：正式主榜只改变 structurer 的测试模型（model_ref=${job.model}），
+# 冻结的主 NPC lineup：正式主榜只改变被测 structurer 模型（由 run-episode --model /
+# manifest job.model 指定，prompt 为打包的 stochopia/resources/structurer.md，不在本文件配置），
 # client/risk/desk 三个环境角色的模型与参数固定，保证跨测试模型可归因。
+# 注意：deepseek-v4-flash 同时是 client_main 与 risk_control NPC，也在文档被测模型名单
+# （gpt-4o、claude-sonnet、deepseek-v4-flash、minimax）中。它作为被测模型时，对手方是
+# 同一模型，结果不是独立对照；报告应单独标注该模型，不据此做跨模型因果结论。
+# risk_control / trading_desk 的 history_scope 必须是 round（role_config 强制）：提交后的
+# workflow_review 会把未脱敏报价交给它们，round 作用域保证这些内容不进入之后的 consult 历史。
 protocol_version: stochopia.csi.legacy.v1
 main_npc_lineup_id: stochopia.npc-lineup.fixed.v1
 
 roles:
-  structurer:
-    role: structurer
-    model_ref: ${job.model}          # 被测模型，建 job 时解析
-    system_prompt_file: scenarios/stochopia_csi/prompts/structurer.md
-    temperature: 0.0
-    max_tokens: 1800
-    timeout_s: 60
-    seed_policy: derived
-    seed_offset: 1000
-    retry: {transport_retries: 2, format_retries: 1}
-    output_schema: stochopia.role.structurer-action.v1
-    tools: [query_client, consult, request_quote, submit_design, skip_round]
-    max_calls_per_round: 9
-    history_scope: episode
-    numeric_authority: none
-    failure_policy: no_action
-
   client_main:
     role: client
     model_ref: deepseek-v4-flash
     system_prompt_file: scenarios/stochopia_csi/prompts/client_main.md
     temperature: 0.2
     max_tokens: 500
-    timeout_s: 30
     seed_policy: derived
     seed_offset: 2000
-    retry: {transport_retries: 2, format_retries: 1}
+    retry: {transport_retries: 2}
     output_schema: stochopia.role.client-response.v1
-    tools: []
-    max_calls_per_round: 4
     history_scope: episode
     numeric_authority: supplied_facts_only
     failure_policy: abstain
@@ -45,13 +31,10 @@ roles:
     system_prompt_file: scenarios/stochopia_csi/prompts/risk_control.md
     temperature: 0.0
     max_tokens: 600
-    timeout_s: 30
     seed_policy: derived
     seed_offset: 3000
-    retry: {transport_retries: 2, format_retries: 1}
+    retry: {transport_retries: 2}
     output_schema: stochopia.role.risk-response.v1
-    tools: []
-    max_calls_per_round: 3
     history_scope: round
     numeric_authority: supplied_facts_only
     failure_policy: escalate
@@ -62,18 +45,16 @@ roles:
     system_prompt_file: scenarios/stochopia_csi/prompts/trading_desk.md
     temperature: 0.0
     max_tokens: 600
-    timeout_s: 30
     seed_policy: derived
     seed_offset: 4000
-    retry: {transport_retries: 2, format_retries: 1}
+    retry: {transport_retries: 2}
     output_schema: stochopia.role.trading-desk-response.v1
-    tools: []
-    max_calls_per_round: 3
     history_scope: round
     numeric_authority: supplied_facts_only
     failure_policy: decline
 
-# 两个异构 judge 模型（不与主 NPC lineup 同一实例），离线批跑、禁自评。
+# 两个异构 judge 模型，离线批跑、禁自评。注意：qwen-max 同时是 trading_desk NPC，
+# judge 与 NPC lineup 并不独立；registry 中没有既不在 NPC lineup、也不在文档被测模型名单里的第二个模型。
 # 自评跳过按精确模型名比较实现（judge_model == item["model"]），不做模型
 # 家族推断，故不设 exclude_same_model_family 字段。
 judges:
@@ -81,4 +62,3 @@ judges:
   repeats: 3
   temperature: 0.0
   max_tokens: 1200
-  blind_model_identity: true

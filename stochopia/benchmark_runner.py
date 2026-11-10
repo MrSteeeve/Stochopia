@@ -6,35 +6,26 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from importlib.resources import files
-from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
-from .agents import _find_balanced_end
+from .benchmark import (
+    BenchmarkError,
+    CandidateArchive,
+    LongHorizonEnvironment,
+    Quote,
+    WorkflowOutcome,
+    constraint_ledger,
+    oracle_best_quote,
+)
+from .env_agents import PROVIDER_ERRORS
+from .llm import BaseLLMClient
+from .llm_json import iter_json_candidates
+from .pricing import PricingError
+from .products import ProductError, parse_product_spec
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _UNCLOSED_THINK_RE = re.compile(r"<think>.*\Z", re.DOTALL | re.IGNORECASE)
-
-
-def _iter_json_candidates(text: str):
-    """按出现顺序产出文本中所有可解析的 JSON 对象（围栏块优先）。"""
-    for block in re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE):
-        try:
-            yield json.loads(block.strip())
-        except json.JSONDecodeError:
-            continue
-    index = 0
-    while index < len(text):
-        if text[index] == "{":
-            end = _find_balanced_end(text, index)
-            if end is not None:
-                try:
-                    yield json.loads(text[index : end + 1])
-                    index = end + 1
-                    continue
-                except json.JSONDecodeError:
-                    pass
-        index += 1
 
 
 def extract_action_json(raw: str):
@@ -46,7 +37,7 @@ def extract_action_json(raw: str):
     """
     cleaned = _UNCLOSED_THINK_RE.sub("", _THINK_BLOCK_RE.sub("", raw))
     first = None
-    for obj in _iter_json_candidates(cleaned):
+    for obj in iter_json_candidates(cleaned):
         if first is None:
             first = obj
         if isinstance(obj, dict) and "action" in obj:
@@ -55,22 +46,10 @@ def extract_action_json(raw: str):
         return first
     if cleaned.strip() != raw.strip():
         # 思考文本里只信带 action 键的对象，绝不把推理碎片当动作。
-        for obj in _iter_json_candidates(raw):
+        for obj in iter_json_candidates(raw):
             if isinstance(obj, dict) and "action" in obj:
                 return obj
     raise ValueError("未找到可解析的 JSON 对象")
-from .benchmark import (
-    BenchmarkError,
-    CandidateArchive,
-    LongHorizonEnvironment,
-    Quote,
-    WorkflowOutcome,
-    constraint_ledger,
-    oracle_best_quote,
-)
-from .llm import BaseLLMClient
-from .pricing import PricingError
-from .products import ProductError, parse_product_spec
 
 
 @dataclass(frozen=True)
@@ -150,8 +129,6 @@ def _load_structurer_prompt() -> str:
 
 
 STRUCTURER_SYSTEM_PROMPT = _load_structurer_prompt()
-# Compatibility name for integrations that imported the pre-resource constant.
-RUNNER_SYSTEM_PROMPT = STRUCTURER_SYSTEM_PROMPT
 
 
 @dataclass
@@ -209,6 +186,9 @@ class RoundTrace:
     # Canonical diagnostic events.  Compatibility lists above are retained for
     # old artifacts, but metrics deduplicate on this event identity.
     failure_events: list[dict] = field(default_factory=list)
+    # Lattice points skipped by the one-step frontier because their quote
+    # equilibrium did not converge (not quotable by the agent either).
+    frontier_nonconverged_skipped: int = 0
 
 
 @dataclass
@@ -219,6 +199,11 @@ class EpisodeTrace:
     rounds: list[RoundTrace]
     usage: dict
     seed: int | None = None
+    # "failed": a tested-model call raised a provider/transport error (after
+    # the client's own retries/escalation); rounds holds the partial trace up
+    # to and including the interrupted round.
+    status: str = "complete"
+    error: str | None = None
 
 
 def _protocol_prompt(policy: ProtocolPolicy) -> str:
@@ -369,18 +354,62 @@ async def run_episode(
     max_actions_per_round: int = 9,
     seed: int | None = None,
 ) -> EpisodeTrace:
-    """Run one frozen episode against the strict tool protocol."""
+    """Run one frozen episode against the strict tool protocol.
+
+    A provider/transport error from the tested model (``PROVIDER_ERRORS``)
+    ends the episode with ``status="failed"`` and the partial trace instead of
+    discarding everything; any other exception still propagates.
+    """
     policy = PROTOCOL_POLICIES.get(strategy)
     if policy is None:
         raise BenchmarkError(f"unknown strategy {strategy!r}; expected one of {STRATEGIES}")
     action_budget = policy.action_budget if policy.action_budget is not None else max_actions_per_round
     messages = [{"role": "system", "content": STRUCTURER_SYSTEM_PROMPT + "\n" + _protocol_prompt(policy)}]
     round_traces: list[RoundTrace] = []
+    current: list[RoundTrace] = []
+    try:
+        await _run_rounds(
+            environment, client, policy, action_budget, messages, round_traces, current, seed,
+        )
+    except PROVIDER_ERRORS as exc:
+        if current and (not round_traces or round_traces[-1] is not current[0]):
+            round_traces.append(current[0])
+        return EpisodeTrace(
+            episode_id=environment.snapshots[0].episode_id,
+            condition=environment.condition.id,
+            strategy=strategy,
+            rounds=round_traces,
+            usage=dict(client.total_usage),
+            seed=seed,
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}"[:2000],
+        )
+    return EpisodeTrace(
+        episode_id=environment.snapshots[0].episode_id,
+        condition=environment.condition.id,
+        strategy=strategy,
+        rounds=round_traces,
+        usage=dict(client.total_usage),
+        seed=seed,
+    )
 
+
+async def _run_rounds(
+    environment: LongHorizonEnvironment,
+    client: BaseLLMClient,
+    policy: ProtocolPolicy,
+    action_budget: int,
+    messages: list[dict],
+    round_traces: list[RoundTrace],
+    current: list[RoundTrace],
+    seed: int | None,
+) -> None:
     for round_offset in range(len(environment.snapshots)):
         trace = RoundTrace(round_num=environment.snapshot.round_num)
+        current[:] = [trace]
         # One-step frontier: compute before the model acts, over exactly the same
         # frozen domain and quote economics used by this environment.
+        nonconverged: list = []
         frontier = oracle_best_quote(
             environment.domain,
             environment.snapshot,
@@ -388,15 +417,20 @@ async def run_episode(
             environment.portfolio,
             environment.desk.hard_checks.risk_budget,
             policy=environment.quote_policy,
+            nonconverged=nonconverged,
         )
+        trace.frontier_nonconverged_skipped = len(nonconverged)
         frontier_margin = frontier[1].dealer_margin if frontier is not None else None
         trace.one_step_frontier_margin = frontier_margin
         trace.oracle_margin = frontier_margin  # deprecated compatibility alias
         archive = CandidateArchive()
         brief = environment.get_round_brief()
+        # The frozen lattice is protocol metadata the model must be told; it is
+        # kept out of the brief snapshot handed to the offline judge.
+        round_message = {**brief, "product_domain": environment.policy_action_schema()}
         messages.append({
             "role": "user",
-            "content": "【新一轮】\n" + json.dumps(brief, ensure_ascii=False, sort_keys=True),
+            "content": "【新一轮】\n" + json.dumps(round_message, ensure_ascii=False, sort_keys=True),
         })
         last_quote: Quote | None = None
 
@@ -576,15 +610,6 @@ async def run_episode(
         if round_offset < len(environment.snapshots) - 1:
             environment.advance_round()
 
-    return EpisodeTrace(
-        episode_id=environment.snapshots[0].episode_id,
-        condition=environment.condition.id,
-        strategy=strategy,
-        rounds=round_traces,
-        usage=dict(client.total_usage),
-        seed=seed,
-    )
-
 
 def compute_metrics(trace: EpisodeTrace, oracle_margins: list[float | None] | None = None) -> dict:
     """Compute separate pre-registered outcomes; never collapse to one score."""
@@ -600,9 +625,10 @@ def compute_metrics(trace: EpisodeTrace, oracle_margins: list[float | None] | No
     hard_passed_submissions = [item for item in submitted_rounds if item.hard_executable]
     settlement_acceptance_rate = len(accepted) / n if n else 0.0
     hard_execution_rate = len(hard_passed_submissions) / n if n else 0.0
+    # Conditional metric: undefined (None) without a voluntary accepted trade.
     mean_voluntary_accepted_margin = (
         sum(item.dealer_margin for item in voluntary_accepted) / len(voluntary_accepted)
-        if voluntary_accepted else 0.0
+        if voluntary_accepted else None
     )
     def round_failure_ids(item: RoundTrace) -> list[str]:
         if item.failure_events:

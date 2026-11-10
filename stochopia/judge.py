@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from typing import Sequence
 
 from .llm import BaseLLMClient
+from .llm_json import iter_json_candidates
 
 
 class JudgeError(Exception):
@@ -26,7 +27,7 @@ DIMENSIONS = (
 
 
 # Whitelist for the anti-leakage "public fact sheet" handed to the judge model
-# (REDESIGN_PLAN.md §4, draft_codex.md §6.1/§6.2). Only fields the tested model
+# (BENCHMARK_PROTOCOL.md "Offline judge protocol", DESIGN_REFERENCE.md C§6.1/§6.2). Only fields the tested model
 # itself could see (client_brief_snapshot) or produced (submitted_product) are
 # ever eligible; everything else on a RoundTrace record (dealer_margin,
 # oracle_margin, hard_failures, submission_origin, model/vendor identity, ...)
@@ -135,14 +136,21 @@ def build_judge_input(round_trace_dict: dict, salt: str) -> JudgeInput:
     )
 
 
-def validate_evidence_spans(result: JudgeResult, explanation: str) -> JudgeResult:
+def validate_evidence_spans(result: JudgeResult, explanation: str, *texts: str) -> JudgeResult:
     """Downgrade any dimension whose evidence is not a literal (whitespace-
-    normalized) substring of the explanation to missing (score=None). Guards
-    against a judge fabricating evidence that was never actually said."""
-    normalized_explanation = _normalize_whitespace(explanation)
+    normalized) substring of one submitted text shown to the judge -- the
+    explanation plus any extra ``texts`` (product pitch / hedging_plan) -- to
+    missing (score=None). Guards against a judge fabricating evidence that was
+    never actually said."""
+    sources = [
+        _normalize_whitespace(text)
+        for text in (explanation, *texts)
+        if isinstance(text, str) and text.strip()
+    ]
     validated: dict[str, DimensionScore] = {}
     for name, dim in result.dimensions.items():
-        if _normalize_whitespace(dim.evidence) in normalized_explanation:
+        evidence = _normalize_whitespace(dim.evidence)
+        if any(evidence in source for source in sources):
             validated[name] = dim
         else:
             validated[name] = DimensionScore(score=None, evidence=dim.evidence, reason=dim.reason)
@@ -157,18 +165,20 @@ non_misleading、hedging_rationale、commercial_communication。不要输出总�
 
 
 def parse_judge_result(raw: str, *, model: str = "", repeat: int = 0) -> JudgeResult:
-    """Parse a strict judge payload; markdown fences are tolerated."""
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if len(lines) >= 3:
-            text = "\n".join(lines[1:-1])
-            if text.lstrip().startswith("json"):
-                text = text.lstrip()[4:].lstrip()
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise JudgeError(f"judge did not return valid JSON: {exc}") from exc
+    """Parse a strict judge payload with the shared LLM JSON extractor.
+
+    Fenced blocks and surrounding prose are tolerated; the first JSON object
+    carrying ``dimensions`` wins, else the first parseable value.
+    """
+    payload = None
+    for candidate in iter_json_candidates(raw):
+        if payload is None:
+            payload = candidate
+        if isinstance(candidate, dict) and "dimensions" in candidate:
+            payload = candidate
+            break
+    if payload is None:
+        raise JudgeError("judge did not return valid JSON")
     dimensions = payload.get("dimensions") if isinstance(payload, dict) else None
     if not isinstance(dimensions, dict) or set(dimensions) != set(DIMENSIONS):
         raise JudgeError(f"judge dimensions must be exactly {DIMENSIONS}")
@@ -230,8 +240,9 @@ async def judge_soft_quality(
 
     The submission is rendered inside an explicit untrusted-data block
     (``judge_user_payload``) and any dimension whose evidence cannot be found
-    verbatim (whitespace-normalized) in ``explanation`` is downgraded to
-    missing (``validate_evidence_spans``).
+    verbatim (whitespace-normalized) in the shown submission text
+    (``explanation``, ``product.pitch``, ``product.hedging_plan``) is
+    downgraded to missing (``validate_evidence_spans``).
     """
     user = judge_user_payload(client_brief, product, explanation)
     raw = await client.chat(
@@ -240,7 +251,9 @@ async def judge_soft_quality(
         seed=seed,
     )
     result = parse_judge_result(raw, model=model_name, repeat=repeat)
-    return validate_evidence_spans(result, explanation)
+    return validate_evidence_spans(
+        result, explanation, product.get("pitch", ""), product.get("hedging_plan", ""),
+    )
 
 
 def _rank(values: Sequence[float]) -> list[float]:
@@ -318,13 +331,6 @@ def reliability_summary(left: Sequence[JudgeResult], right: Sequence[JudgeResult
     }
 
 
-def score_flip_rate(original: Sequence[JudgeResult], perturbed: Sequence[JudgeResult]) -> float:
-    """Fraction whose total score changes after order/name/counterfactual perturbation."""
-    if len(original) != len(perturbed) or not original:
-        raise JudgeError("flip-rate inputs must be non-empty and aligned")
-    return sum(a.total != b.total for a, b in zip(original, perturbed)) / len(original)
-
-
 def _percentile(sorted_values: Sequence[int], q: float) -> float:
     """Linear-interpolated percentile of an already-sorted sequence, q in [0,1]."""
     n = len(sorted_values)
@@ -343,7 +349,7 @@ def aggregate_judge_bundle(results: Sequence[JudgeResult]) -> dict:
     """Per-dimension median/IQR/missing-rate across a batch of judge calls.
 
     Deliberately produces no total ranking or cross-dimension composite
-    (REDESIGN_PLAN.md §4: "judge 六维分开报告，不与经济指标合成总分"). A
+    (BENCHMARK_PROTOCOL.md "Offline judge protocol": judge 六维分开报告，不与经济指标合成总分). A
     dimension counts as missing for a given JudgeResult when its score is
     None (evidence-span validation rejected it) or the dimension is absent.
     """

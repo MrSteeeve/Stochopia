@@ -20,10 +20,6 @@ class LLMTruncationError(LLMError):
     """输出因 max_tokens 上限被截断；chat 内部会自动升额重试，重试耗尽才抛出。"""
 
 
-# 长输出调用按用途覆盖 max_tokens，避免默认 2000 不够用导致输出被截断
-LONG_OUTPUT_MAX_TOKENS = 4000
-
-
 @dataclass
 class ModelConfig:
     """模型注册表中的一条配置。"""
@@ -38,28 +34,12 @@ class ModelConfig:
     timeout: float = 60.0
 
 
-# defaults 节缺失时的内置默认模型名（兼容 v0.1 无 defaults 的旧配置）
-BUILTIN_DEFAULTS: dict[str, str] = {
-    "test_model": "deepseek-v4-flash",
-    "env_model": "deepseek-v4-flash",
-    "judge_model": "deepseek-v4-pro",
-    "polish_model": "deepseek-v4-flash",
-}
-
-
 class ModelRegistry(dict):
-    """模型注册表：本体是 dict[str, ModelConfig]，defaults 存各用途的默认模型名。"""
-
-    def __init__(self, models: dict[str, ModelConfig], defaults: dict[str, str]) -> None:
-        super().__init__(models)
-        self.defaults = defaults
+    """模型注册表：dict[模型名 -> ModelConfig]。"""
 
 
 def load_model_registry(path: str | Path) -> ModelRegistry:
-    """解析 config/models.yaml；文件缺失或格式错误抛 LLMError。
-
-    兼容无 defaults 节的旧配置：缺失的默认模型名回退到内置值。
-    """
+    """解析 config/models.yaml；文件缺失或格式错误抛 LLMError。"""
     p = Path(path)
     if not p.is_file():
         raise LLMError(f"模型注册表文件不存在：{p}")
@@ -69,13 +49,6 @@ def load_model_registry(path: str | Path) -> ModelRegistry:
         raise LLMError(f"模型注册表 YAML 解析失败（{p}）：{exc}") from exc
     if not isinstance(data, dict) or not isinstance(data.get("models"), dict):
         raise LLMError(f"模型注册表格式错误（{p}）：顶层需要 models 映射")
-    defaults_node = data.get("defaults") or {}
-    if not isinstance(defaults_node, dict):
-        raise LLMError(f"模型注册表格式错误（{p}）：defaults 需为映射")
-    unknown_defaults = set(defaults_node) - set(BUILTIN_DEFAULTS)
-    if unknown_defaults:
-        raise LLMError(f"defaults 节含未知字段（{p}）：{sorted(unknown_defaults)}")
-    defaults = {**BUILTIN_DEFAULTS, **{k: str(v) for k, v in defaults_node.items()}}
     registry: dict[str, ModelConfig] = {}
     for name, cfg in data["models"].items():
         if not isinstance(cfg, dict) or "provider" not in cfg:
@@ -85,7 +58,7 @@ def load_model_registry(path: str | Path) -> ModelRegistry:
         if unknown:
             raise LLMError(f"模型 {name} 配置含未知字段（{p}）：{sorted(unknown)}")
         registry[name] = ModelConfig(name=name, **cfg)
-    return ModelRegistry(registry, defaults)
+    return ModelRegistry(registry)
 
 
 class BaseLLMClient:
@@ -103,13 +76,20 @@ class BaseLLMClient:
     ) -> str:
         raise NotImplementedError
 
+    def _record_max_tokens_escalation(self, requested: int, effective: int) -> None:
+        """截断升额重试后成功：把实际生效的 max_tokens 记入 usage（随 trace 序列化）。"""
+        self.total_usage.setdefault("max_tokens_escalations", []).append(
+            {"requested_max_tokens": requested, "effective_max_tokens": effective}
+        )
+
 
 class OpenAICompatClient(BaseLLMClient):
     """OpenAI 兼容 chat/completions 客户端，429/5xx/超时指数退避重试。
 
     输出被 max_tokens 截断（finish_reason=length）时不直接报错，而是把
     max_tokens 翻倍后立即重试（独立计数，最多 TRUNCATION_RETRIES 次，
-    封顶 TRUNCATION_MAX_TOKENS_CEILING），仍截断才抛 LLMTruncationError。
+    封顶 TRUNCATION_MAX_TOKENS_CEILING），仍截断才抛 LLMTruncationError；升额后成功时
+    实际生效的 max_tokens 记入 total_usage["max_tokens_escalations"]。
     """
 
     RETRY_DELAYS = (1.0, 2.0, 4.0)
@@ -146,6 +126,7 @@ class OpenAICompatClient(BaseLLMClient):
             payload["seed"] = seed
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
+        requested_max_tokens = payload["max_tokens"]
         last_error = ""
         net_attempt = 0
         trunc_attempt = 0
@@ -174,7 +155,7 @@ class OpenAICompatClient(BaseLLMClient):
                     )
                 else:
                     try:
-                        return self._parse_response(resp)
+                        text = self._parse_response(resp)
                     except LLMTruncationError:
                         # 截断：升额重试（独立计数，不占用网络重试次数、不退避等待）
                         if (
@@ -187,6 +168,9 @@ class OpenAICompatClient(BaseLLMClient):
                             payload["max_tokens"] * 2, self.TRUNCATION_MAX_TOKENS_CEILING
                         )
                         continue
+                    if trunc_attempt:
+                        self._record_max_tokens_escalation(requested_max_tokens, payload["max_tokens"])
+                    return text
             if net_attempt < len(self.RETRY_DELAYS):
                 await asyncio.sleep(self.RETRY_DELAYS[net_attempt])
                 net_attempt += 1
@@ -276,6 +260,7 @@ class AnthropicClient(BaseLLMClient):
             "Content-Type": "application/json",
         }
 
+        requested_max_tokens = payload["max_tokens"]
         last_error = ""
         net_attempt = 0
         trunc_attempt = 0
@@ -304,7 +289,7 @@ class AnthropicClient(BaseLLMClient):
                     )
                 else:
                     try:
-                        return self._parse_response(resp)
+                        text = self._parse_response(resp)
                     except LLMTruncationError:
                         # 截断：升额重试（独立计数，不占用网络重试次数、不退避等待）
                         if (
@@ -317,6 +302,9 @@ class AnthropicClient(BaseLLMClient):
                             payload["max_tokens"] * 2, self.TRUNCATION_MAX_TOKENS_CEILING
                         )
                         continue
+                    if trunc_attempt:
+                        self._record_max_tokens_escalation(requested_max_tokens, payload["max_tokens"])
+                    return text
             if net_attempt < len(self.RETRY_DELAYS):
                 await asyncio.sleep(self.RETRY_DELAYS[net_attempt])
                 net_attempt += 1
@@ -375,12 +363,8 @@ class MockLLMClient(BaseLLMClient):
         return self._responses[0]
 
 
-def create_client(
-    model_name: str, registry: dict[str, ModelConfig], dry_run: bool = False
-) -> BaseLLMClient:
-    """按模型名创建客户端；dry_run 或 mock provider 返回 MockLLMClient。"""
-    if dry_run:
-        return MockLLMClient()
+def create_client(model_name: str, registry: dict[str, ModelConfig]) -> BaseLLMClient:
+    """按模型名创建客户端；mock provider 返回 MockLLMClient。"""
     if model_name not in registry:
         available = "、".join(sorted(registry)) or "（无）"
         raise LLMError(f"模型 {model_name} 不在注册表中，可用模型：{available}")
@@ -392,115 +376,3 @@ def create_client(
     if cfg.provider == "anthropic":
         return AnthropicClient(cfg)
     raise LLMError(f"模型 {model_name} 的 provider 不受支持：{cfg.provider}")
-
-
-# --dry-run 的脚本化参考产品：一份自动赎回结构（autocallable），目标客户 client_b。
-# 经过手工验证：
-#   R8-R11（波动偏高段）hurdle_hit_prob 超过 0.50 门槛，可成交并产生佣金；
-#   R12+ 触发监管期限上限（6 个月）约束而终止，属预期行为；R1-7 胜率偏低未成交。
-# notional=15_000_000：不超过 client_b 在 R10-11（capital 缩至 1500 万）的可投额度；
-# 同时满足 basic_notional_limit 上限（≤ 5000 万）。
-# 每轮固定 4 步：① 查询 client_b（满足接触门）② 查询 trading_desk ③ 查询 risk_control ④ 提交产品。
-DRY_RUN_PRODUCT: dict = {
-    "product_type": "autocallable",
-    "notional": 15000000,
-    "maturity_months": 12,
-    "strike_pct": 1.0,
-    "barrier_pct": 0.75,
-    "barrier_type": "knock_in",
-    "coupon_rate": 0.15,
-    "participation_rate": 1.0,
-    "principal_protected": False,
-    "target_client": "client_b",
-    "pitch": "自动赎回票据：高波动期获取票息，若提前触发赎回则锁定年化收益",
-    "hedging_plan": "delta 对冲，通过期权组合管理敲入敲出风险敞口",
-}
-
-
-def make_dry_run_clients(scenario) -> tuple[BaseLLMClient, dict[str, BaseLLMClient]]:
-    """构造脚本化 Mock 客户端，保证 --dry-run 能以零成本跑通整个 Playground。
-
-    被测（结构化产品设计师）客户端：每轮固定 4 步动作——
-    ① 查询 client_b（满足接触门，获取本轮客户简报）
-    ② 向 trading_desk 提问并附产品草案 JSON（触发确定性报价，跳过 LLM）
-    ③ 向 risk_control 提问并附产品草案 JSON（触发合规预检，跳过 LLM）
-    ④ 提交同一份 autocallable 产品（见 DRY_RUN_PRODUCT）
-    脚本按 scenario.total_rounds × 4 条准备好，逐轮弹出，不依赖 MockLLMClient
-    的"弹完重复最后一条"兜底行为。
-
-    R8-R11：胜率达标，成交并产生佣金。R12 起监管收紧期限上限，脚本产品
-    同步切换为 6 个月期（避免触发违规修改流程、打乱固定步数的脚本节奏），
-    此时客户胜率不足，成交失败属预期行为。
-
-    环境智能体：各自返回一两句简短的固定回复。
-    """
-    agent_ids = scenario.agent_ids()
-    desk_target = "trading_desk" if "trading_desk" in agent_ids else agent_ids[0]
-    risk_target = "risk_control" if "risk_control" in agent_ids else agent_ids[-1]
-    client_target = "client_b" if "client_b" in agent_ids else agent_ids[0]
-
-    responses: list[str] = []
-    for round_num in range(1, scenario.total_rounds + 1):
-        # R12 起 maturity_cap 约束生效：切换 6 个月期，避免违规修改打乱脚本步数
-        product = {**DRY_RUN_PRODUCT}
-        if round_num >= 12:
-            product["maturity_months"] = 6
-        _draft = {k: v for k, v in product.items() if k != "target_client"}
-        _draft_str = json.dumps(_draft, ensure_ascii=False)
-        # 步骤 1：查询目标客户（client_b），满足接触门
-        responses.append(
-            "```json\n"
-            + json.dumps(
-                {
-                    "action": "query",
-                    "target": client_target,
-                    "message": "李总您好，请问您本轮的配置需求和风险偏好？",
-                },
-                ensure_ascii=False,
-            )
-            + "\n```"
-        )
-        # 步骤 2：查询 trading_desk（附草案 → 触发确定性报价，跳过 LLM）
-        responses.append(
-            "```json\n"
-            + json.dumps(
-                {
-                    "action": "query",
-                    "target": desk_target,
-                    "message": f"请对以下产品草案出具确定性报价：{_draft_str}",
-                },
-                ensure_ascii=False,
-            )
-            + "\n```"
-        )
-        # 步骤 3：查询 risk_control（附草案 → 触发合规预检，跳过 LLM）
-        responses.append(
-            "```json\n"
-            + json.dumps(
-                {
-                    "action": "query",
-                    "target": risk_target,
-                    "message": f"请对以下产品草案进行合规预检：{_draft_str}",
-                },
-                ensure_ascii=False,
-            )
-            + "\n```"
-        )
-        # 步骤 4：提交产品
-        responses.append(
-            "```json\n"
-            + json.dumps({"action": "submit_product", "product": product}, ensure_ascii=False)
-            + "\n```"
-        )
-    test_client: BaseLLMClient = MockLLMClient(responses)
-
-    env_clients: dict[str, BaseLLMClient] = {
-        spec.id: MockLLMClient(
-            [
-                f"（模拟）我是{spec.display_name}，目前情况大致稳定，暂时没有特别要补充的。",
-                f"（模拟）作为{spec.display_name}，这一点我们内部会持续关注。",
-            ]
-        )
-        for spec in scenario.agents
-    }
-    return test_client, env_clients

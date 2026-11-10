@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import math
-import hashlib
-import json
 from dataclasses import asdict, dataclass
 from itertools import product
 from typing import Mapping
@@ -23,7 +21,7 @@ CONDITIONS = (
 
 # All primary cells get n>=3 replicates; partial_dynamic (full observability
 # loss + market drift, the hardest cell) is over-sampled to n=5 to better
-# resolve its residual variance. See REDESIGN_PLAN.md §4 / draft_codex.md §8.2.
+# resolve its residual variance. See BENCHMARK_PROTOCOL.md "Statistics" / DESIGN_REFERENCE.md C§8.2.
 DEFAULT_REPLICATES_BY_CONDITION: dict[str, int] = {
     "full_static": 3,
     "full_dynamic": 3,
@@ -120,19 +118,8 @@ def manifest_payload(jobs: list[ExperimentJob]) -> dict:
             "total_dealer_margin",
         ],
     }
-    fingerprint_payload = {"jobs": job_rows, "protocol": protocol}
-    manifest_fingerprint = hashlib.sha256(
-        json.dumps(
-            fingerprint_payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
-        "manifest_fingerprint": manifest_fingerprint,
         "jobs": job_rows,
         "count": len(job_rows),
         "protocol": protocol,
@@ -146,11 +133,14 @@ def paired_condition_contrasts(
     seed: int = 20260802,
     n_resamples: int = 10_000,
     n_permutations: int = 100_000,
+    alpha: float = 0.05,
 ) -> dict:
     """Compute matched degradation with CI + paired significance tests.
 
+    ``alpha`` sets the bootstrap CI level (``1 - alpha``).
+
     Episode is the primary replication/clustering unit (temperature=0 makes
-    within-cell replicate seeds near-redundant; see REDESIGN_PLAN.md §4).
+    within-cell replicate seeds near-redundant; see BENCHMARK_PROTOCOL.md "Statistics").
     Rows are first collapsed to one mean per (episode, model, strategy,
     condition) cell (averaging across replicates), then matched within each
     (episode, model, strategy).  All model/strategy/information-level contrasts
@@ -226,13 +216,13 @@ def paired_condition_contrasts(
             }
         ci_seed = derive_seed(SEED_NAMESPACE, "contrast_ci", metric, name, seed)
         perm_seed = derive_seed(SEED_NAMESPACE, "contrast_perm", metric, name, seed)
-        _, lo, hi = bootstrap_ci(diffs, n_resamples=n_resamples, seed=ci_seed)
+        _, lo, hi = bootstrap_ci(diffs, n_resamples=n_resamples, alpha=alpha, seed=ci_seed)
         stat, wilcoxon_p = wilcoxon_signed_rank(diffs)
         permutation_p = paired_permutation_test(diffs, n_permutations=n_permutations, seed=perm_seed)
         return {
             "mean": mean(diffs),
             "n_pairs": len(diffs),
-            "ci": (lo, hi),
+            "ci": (lo, hi) if lo is not None else None,  # None: not estimable (n<2)
             "wilcoxon_statistic": stat,
             "wilcoxon_p": wilcoxon_p,
             "permutation_p": permutation_p,

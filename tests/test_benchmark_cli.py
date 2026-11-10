@@ -1,7 +1,6 @@
 """CLI-level wiring: calibrate-margin end-to-end, --quote-policy-json plumbing,
 and judge-runs reading its judge-model/repeats defaults from
-config/benchmark_roles.yaml's judges: block (REDESIGN_PLAN.md items 1 and 2
-of the pre-freeze cleanup)."""
+config/benchmark_roles.yaml's judges: block (pre-freeze cleanup items 1 and 2)."""
 
 from __future__ import annotations
 
@@ -22,13 +21,11 @@ from stochopia.benchmark import (
     RiskBudget,
     calibrate_risk_budget,
     enumerate_domain,
-    oracle_candidate_grid,
 )
 from stochopia.benchmark_cli import (
     RUN_OUTPUT_SCHEMA_VERSION,
     _atomic_write_json,
     _cmd_calibrate_margin,
-    _cmd_aggregate,
     _cmd_judge_runs,
     _completed_result_matches,
     _load_quote_policy,
@@ -88,10 +85,16 @@ def _snapshots(episode: str, n_rounds: int = 2) -> list[MarketSnapshot]:
 def _margin_args(tmp_path: Path, **overrides) -> argparse.Namespace:
     client_json = tmp_path / "client.json"
     client_json.write_text(json.dumps(asdict(_client())), encoding="utf-8")
+    budget_json = tmp_path / "risk_budget.json"
+    budget_json.write_text(
+        json.dumps(asdict(RiskBudget(50_000_000, 50_000_000, 100_000_000, 10_000_000, 50_000_000))),
+        encoding="utf-8",
+    )
     base = dict(
         csv=tmp_path / "unused.csv",
         episodes=["E1"],
         client_json=client_json,
+        risk_budget_json=budget_json,
         sensitivity_factors=[0.8, 1.0, 1.2],
         report_output=tmp_path / "report.json",
         policy_output=tmp_path / "policy.json",
@@ -284,70 +287,23 @@ def test_calibrate_budget_quote_policy_kwarg_accepted():
 # ---------------------------------------------------------------------------
 
 
-def test_completed_result_is_skippable_only_for_exact_fingerprints(tmp_path):
+def test_completed_result_is_skippable_only_when_complete(tmp_path):
     path = tmp_path / "job.json"
     payload = {
         "schema_version": RUN_OUTPUT_SCHEMA_VERSION,
         "complete": True,
-        "run_fingerprint": "run-a",
-        "job_fingerprint": "job-a",
         "job": {"job_id": "J"},
         "trace": {},
         "metrics": {},
     }
     _atomic_write_json(path, payload)
 
-    assert _completed_result_matches(
-        path,
-        run_fingerprint="run-a",
-        job_fingerprint="job-a",
-        job_id="J",
-    )
-    assert not _completed_result_matches(
-        path,
-        run_fingerprint="run-b",
-        job_fingerprint="job-a",
-        job_id="J",
-    )
+    assert _completed_result_matches(path, job_id="J")
+    assert not _completed_result_matches(path, job_id="K")
 
     payload["complete"] = False
     _atomic_write_json(path, payload)
-    assert not _completed_result_matches(
-        path,
-        run_fingerprint="run-a",
-        job_fingerprint="job-a",
-        job_id="J",
-    )
-
-
-def test_aggregate_rejects_mixed_run_fingerprints(tmp_path):
-    results = tmp_path / "results"
-    results.mkdir()
-    for index, fingerprint in enumerate(("run-a", "run-b")):
-        _atomic_write_json(
-            results / f"{index}.json",
-            {
-                "schema_version": RUN_OUTPUT_SCHEMA_VERSION,
-                "complete": True,
-                "run_fingerprint": fingerprint,
-                "job_fingerprint": f"job-{index}",
-                "job": {"job_id": str(index), "model": "m", "strategy": "s"},
-                "trace": {},
-                "metrics": {"episode_id": "E", "condition": "full_static"},
-            },
-        )
-    args = argparse.Namespace(
-        results_dir=results,
-        output_csv=tmp_path / "aggregate.csv",
-        output_md=None,
-        bootstrap_resamples=10,
-        n_permutations=10,
-        alpha=0.05,
-        seed=1,
-    )
-
-    with pytest.raises(SystemExit, match="mixed run fingerprints"):
-        _cmd_aggregate(args)
+    assert not _completed_result_matches(path, job_id="J")
 
 
 # ---------------------------------------------------------------------------
@@ -401,3 +357,206 @@ def test_judge_runs_cli_requires_judge_models_without_roles_config(tmp_path):
     args = _judge_runs_args(tmp_path)
     with pytest.raises(SystemExit, match="judge-models"):
         _cmd_judge_runs(args)
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: v2 result inputs, resume, per-job metrics, n<2 CI rendering
+# ---------------------------------------------------------------------------
+
+
+def _run_manifest_args(tmp_path, manifest_path, *, client_json=None):
+    return argparse.Namespace(
+        csv=ROOT / "scenarios" / "stochopia_csi" / "market_snapshots.example.csv",
+        manifest=manifest_path,
+        only_models=None,
+        client_json=client_json or ROOT / "scenarios" / "stochopia_csi" / "client.example.json",
+        risk_budget_json=ROOT / "scenarios" / "stochopia_csi" / "risk_budget.example.json",
+        quote_policy_json=None,
+        models_config=ROOT / "config" / "models.yaml",
+        roles_config=None,
+        env_cache_dir=None,
+        outputs_dir=tmp_path / "out",
+    )
+
+
+def test_run_manifest_records_inputs_resumes_on_match_and_isolates_metric_errors(
+    tmp_path, monkeypatch,
+):
+    import stochopia.benchmark_cli as cli
+    from stochopia.benchmark import load_market_snapshots
+    from stochopia.benchmark_runner import EpisodeTrace
+
+    jobs = [
+        {"job_id": job_id, "episode_id": "SYNTHETIC_CSI500_DEMO", "model": "mock",
+         "strategy": "quote_and_revise", "condition": "partial_dynamic", "seed": 1}
+        for job_id in ("J1", "J2")
+    ]
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+
+    async def fake_run_episode(env, llm, *, strategy, seed):
+        return EpisodeTrace(env.snapshot.episode_id, "partial_dynamic", strategy, [], {}, seed)
+
+    calls = {"n": 0}
+
+    def flaky_metrics(trace):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ZeroDivisionError("metric bug on first job")
+        return {"episode_id": trace.episode_id}
+
+    monkeypatch.setattr(cli, "run_episode", fake_run_episode)
+    monkeypatch.setattr(cli, "compute_metrics", flaky_metrics)
+    snapshots = load_market_snapshots(ROOT / "scenarios" / "stochopia_csi" / "market_snapshots.example.csv")
+    args = _run_manifest_args(tmp_path, manifest_path)
+
+    assert cli._cmd_run_manifest(args, snapshots) == 1  # J1 failed, J2 written
+    # A failed job leaves a visible, non-resumable record.
+    failed_payload = json.loads((args.outputs_dir / "J1.json").read_text(encoding="utf-8"))
+    assert failed_payload["complete"] is False
+    assert failed_payload["status"] == "failed"
+    assert "metric bug" in failed_payload["error"]
+    assert not _completed_result_matches(
+        args.outputs_dir / "J1.json", job_id="J1", inputs=failed_payload["inputs"],
+    )
+    payload = json.loads((args.outputs_dir / "J2.json").read_text(encoding="utf-8"))
+    inputs = payload["inputs"]
+    assert inputs["market_csv"] == str(args.csv.resolve())
+    assert inputs["tested_model"]["provider"] == "mock"
+    assert inputs["client_profile"]["id"] == "institutional_demo"
+    assert inputs["quote_policy"] == json.loads(json.dumps(asdict(QuotePolicy())))
+    assert set(inputs["risk_budget"]) >= {"notional", "net_delta"}
+    assert inputs["role_models"] == {}
+
+    # Same inputs -> J2 resumes; changed client profile -> J2 is rerun.
+    assert _completed_result_matches(args.outputs_dir / "J2.json", job_id="J2", inputs=inputs)
+    changed = json.loads(args.client_json.read_text(encoding="utf-8"))
+    changed["max_loss_pct"] = 0.5
+    changed_path = tmp_path / "client.json"
+    changed_path.write_text(json.dumps(changed), encoding="utf-8")
+    changed_inputs = cli._economic_inputs(
+        args.csv, changed, json.loads(args.risk_budget_json.read_text(encoding="utf-8")), None, None,
+    )
+    assert not _completed_result_matches(
+        args.outputs_dir / "J2.json", job_id="J2", inputs=changed_inputs,
+    )
+
+
+def test_aggregate_markdown_marks_single_episode_ci_not_estimable():
+    from stochopia.benchmark_cli import CANONICAL_METRICS, _aggregate_markdown
+
+    rows = [{"file": "a.json", "model": "M", "condition": "partial_dynamic",
+             "episode_id": "E1", "strategy": "S", "hard_execution_rate": 0.5}]
+    args = argparse.Namespace(seed=1, bootstrap_resamples=50, alpha=0.05, n_permutations=50)
+    fully_missing = [name for name in CANONICAL_METRICS if name != "hard_execution_rate"]
+    text = "\n".join(_aggregate_markdown(rows, args, fully_missing, []))
+    assert "0.5 [CI n/a: 1 episode]" in text
+    assert "[0.5, 0.5]" not in text
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-09 (三): aggregate poolability/coverage, alpha, calibrate-margin budget
+# ---------------------------------------------------------------------------
+
+
+def _agg_result(job_id: str, model: str, condition: str, episode: str, *, inputs: dict) -> dict:
+    return {
+        "schema_version": RUN_OUTPUT_SCHEMA_VERSION,
+        "complete": True,
+        "job": {"job_id": job_id, "model": model, "condition": condition,
+                "episode_id": episode, "strategy": "quote_and_revise"},
+        "inputs": {**inputs, "tested_model": {"name": model}},
+        "trace": {"condition": condition, "rounds": []},
+        "metrics": {"episode_id": episode, "condition": condition,
+                    "hard_execution_rate": 0.5,
+                    "mean_dealer_margin_per_voluntary_accepted_trade": None},
+    }
+
+
+def _agg_args(results_dir: Path, **overrides) -> argparse.Namespace:
+    base = dict(results_dir=results_dir, output_csv=results_dir / "agg.csv",
+                output_md=results_dir / "agg.md", bootstrap_resamples=50,
+                n_permutations=50, alpha=0.10, seed=1, manifest=None)
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_aggregate_reports_coverage_and_refuses_mixed_inputs(tmp_path):
+    from stochopia.benchmark_cli import _cmd_aggregate
+
+    results = tmp_path / "res"
+    results.mkdir()
+    same = {"market_csv": "/m.csv"}
+    _atomic_write_json(results / "J1.json", _agg_result("J1", "M", "full_static", "E1", inputs=same))
+    _atomic_write_json(results / "J2.json", _agg_result("J2", "N", "full_static", "E1", inputs=same))
+    _atomic_write_json(results / "J3.json", {
+        "schema_version": RUN_OUTPUT_SCHEMA_VERSION, "complete": False, "status": "failed",
+        "error": "LLMError: 400", "job": {"job_id": "J3", "model": "M", "condition": "partial_static"},
+        "inputs": same, "trace": None,
+    })
+    _atomic_write_json(results / "old.json", {"metrics": {"hard_execution_rate": 1.0}})
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"jobs": [
+        {"job_id": job, "model": "M", "condition": cond}
+        for job, cond in (("J1", "full_static"), ("J3", "partial_static"), ("J4", "partial_static"))
+    ]}), encoding="utf-8")
+
+    assert _cmd_aggregate(_agg_args(results, manifest=manifest)) == 0
+    md = (results / "agg.md").read_text(encoding="utf-8")
+    assert "mean +/- 90% CI" in md and "ci_90%" in md
+    assert "old.json" in md and "LLMError: 400" in md
+    assert "| M | partial_static | 2 | 0 | 1 | 1 |" in md
+    assert "likely an old-schema" not in md
+
+    _atomic_write_json(results / "J5.json", _agg_result(
+        "J5", "M", "full_dynamic", "E1", inputs={"market_csv": "/other.csv"}))
+    with pytest.raises(SystemExit, match="different inputs"):
+        _cmd_aggregate(_agg_args(results))
+
+
+def test_calibrate_margin_requires_frozen_risk_budget():
+    from stochopia.benchmark_cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([
+            "calibrate-margin", "m.csv", "--episodes", "E1", "--client-json", "c.json",
+            "--report-output", "r.json", "--policy-output", "p.json",
+        ])
+
+
+def test_aggregate_writes_coverage_report_when_no_complete_rows(tmp_path):
+    from stochopia.benchmark_cli import _cmd_aggregate
+
+    results = tmp_path / "res"
+    results.mkdir()
+    _atomic_write_json(results / "J1.json", {
+        "schema_version": RUN_OUTPUT_SCHEMA_VERSION, "complete": False, "status": "failed",
+        "error": "LLMError: 400", "job": {"job_id": "J1", "model": "M", "condition": "full_static"},
+        "inputs": {}, "trace": None,
+    })
+    with pytest.raises(SystemExit, match="no result json"):
+        _cmd_aggregate(_agg_args(results))
+    assert "LLMError: 400" in (results / "agg.md").read_text(encoding="utf-8")
+
+
+def test_run_episode_writes_failed_record_for_any_exception(tmp_path, monkeypatch):
+    import stochopia.benchmark_cli as cli
+
+    from stochopia.pricing import PricingError
+
+    async def broken_run_episode(env, llm, *, strategy, seed):
+        raise PricingError("pricing bug")
+
+    monkeypatch.setattr(cli, "run_episode", broken_run_episode)
+    output = tmp_path / "episode.json"
+    with pytest.raises(PricingError):
+        cli.main([
+            "run-episode", str(ROOT / "scenarios" / "stochopia_csi" / "market_snapshots.example.csv"),
+            "--episode", "SYNTHETIC_CSI500_DEMO",
+            "--client-json", str(ROOT / "scenarios" / "stochopia_csi" / "client.example.json"),
+            "--risk-budget-json", str(ROOT / "scenarios" / "stochopia_csi" / "risk_budget.example.json"),
+            "--model", "mock", "--output", str(output),
+        ])
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["complete"] is False and payload["status"] == "failed"
+    assert "pricing bug" in payload["error"] and payload["model"] == "mock"

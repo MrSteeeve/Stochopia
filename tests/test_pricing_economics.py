@@ -1,6 +1,6 @@
 """v2 定价经济学核心测试：MC 诊断、报价经济学、连续损失度量、系数标定。
 
-覆盖 REDESIGN_PLAN 的可信度底线：margin 不再恒等于 1%×fair_value、最大名义
+覆盖 v2 重设计的可信度底线：margin 不再恒等于 1%×fair_value、最大名义
 vanilla 非必然最优、同 seed 逐位复现、负 margin 不被截断、suitability 边界、
 损失分位与保本产品损失为 0。
 """
@@ -13,11 +13,9 @@ import pytest
 
 from stochopia.pricing import (
     ClientLossMeasure,
-    MCDiagnostics,
     QuoteEconomics,
     QuotePolicy,
     _DIAG_CACHE,
-    _fair_value_stress_loss,
     calibrate_quote_policy,
     client_loss_measure,
     evaluate_product,
@@ -103,7 +101,7 @@ def econ(prod: ProductSpec, cli: ClientProfile, *, policy: QuotePolicy | None = 
     policy = policy or QuotePolicy()
     pricing = evaluate_product(prod, mkt)
     diag = mc_diagnostics(prod, mkt, n_paths=2048, seed=seed)
-    stress_loss, _ = _fair_value_stress_loss(prod, mkt)
+    stress_loss = fair_value_stress_profile(prod, mkt).client_value_loss
     return quote_economics(
         pricing,
         diag,
@@ -167,7 +165,7 @@ def test_same_seed_is_bit_identical():
     assert d1.event_probs == d2.event_probs
 
     pricing = evaluate_product(prod, mkt)
-    stress_loss, _ = _fair_value_stress_loss(prod, mkt)
+    stress_loss = fair_value_stress_profile(prod, mkt).client_value_loss
     kwargs = dict(stress_loss=stress_loss, post_notional=prod.notional,
                   capacity_notional=cli.capital, policy=QuotePolicy(), product=prod, client=cli)
     qe1 = quote_economics(pricing, d1, **kwargs)

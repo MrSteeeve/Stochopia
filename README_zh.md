@@ -104,8 +104,8 @@ print(observation.available_actions, transition.observation.round_num, info["see
 |---|---|---|
 | Input | 带版本的`TaskSuite`、公开市场 observation、公开 action schema、固定公开名义本金网格 | 客户 mandate、风险限额、报价 policy 和完整 task manifest |
 | Interaction | `ask_client`、`request_quote`、`submit_design`、`submit_product`、`skip` | 确定性定价、账户、约束和生命周期状态 |
-| Output | 一条带哈希链的 trajectory，含动作、观察、reward vector、constraint signals 与运行来源 | 同一产物密封保存完整 task manifest 供重放，但绝不发送给策略 |
-| Evaluation | 经重放验证的逐 task 指标，以及按 task 聚类的 policy 汇总 | evaluator 从密封输入独立重建精确经济状态 |
+| Output | 一条 JSON trajectory，含动作、观察、reward vector、constraint signals 与运行来源 | 同一产物密封保存完整 task manifest 供重放，但绝不发送给策略 |
+| Evaluation | 逐 task 指标（可选精确经济重放），以及按 task 聚类的 policy 汇总 | evaluator 从密封输入独立重建精确经济状态 |
 
 每个 v3 task 的最后一张快照是终端估值真值，不是新的决策轮。因此在最后
 决策快照发行的合约，至少会经历一个市场区间，之后才到期或在 horizon
@@ -167,9 +167,8 @@ stochopia-benchmark aggregate-v3 outputs/stochopia-dev \
   --output-csv outputs/stochopia-dev.aggregate.csv
 ```
 
-`run-v3-suite`只会复用 task、公开 run seed、环境配置和策略配置仍一致，并且
-能够通过经济重放的完整轨迹；partial 或陈旧运行会重新执行。需要主动重跑
-匹配产物时使用`--force`。
+`run-v3-suite`只会复用 task、公开 run seed、环境配置和策略配置仍一致的完整
+轨迹；partial 或陈旧运行会重新执行。需要主动重跑匹配产物时使用`--force`。
 
 Python 侧使用`CommandAgentPolicy`、`LLMAgentPolicy`/
 `create_api_agent_policy`和`run_agent_episode`走同一边界。模型输出的动作
@@ -179,9 +178,9 @@ invalid-action 计数。超时命令的整个进程组都会被清理。隐藏�
 发给策略。
 
 Stochopia v1 轨迹包含公开动作 schema、环境配置、reset options、公开 run seed、
-prompt/model 参数、依赖版本、实现哈希和 Git 工作树状态。哈希通过不等于经济
-验证通过：`evaluate-trajectory`会重建 task，并要求每一个 transition 与
-全新重放逐项一致。Agent summary 直接给出累计 reward/constraint 统计。
+prompt/model 参数、依赖版本和 Git 提交。`evaluate-trajectory`默认按记录的
+transition 计分；加`--replay`时会重建 task，并要求每一个 transition 与全新
+重放逐项一致。Agent summary 直接给出累计 reward/constraint 统计。
 这不代表尚未实现的 TaskGenerator、repair teacher、counterfactual pair
 exporter、payoff DSL/solve-for 或 fast/reference pricer 已经完成。
 
@@ -264,14 +263,13 @@ Stochopia/
 |   |-- stats.py                    # 种子派生、bootstrap CI、Wilcoxon、置换检验、Holm
 |   |-- experiment.py               # 析因实验清单 + 配对条件对比
 |   |-- llm.py                      # OpenAI 兼容与 Anthropic 客户端、Mock 客户端
-|   `-- market_builder.py、cffex_data.py、tushare_*.py、formal_*.py、raw_data_audit.py
-|                                   # 市场数据获取与来源审计管线
+|   `-- market_builder.py、cffex_data.py、tushare_*.py、formal_*.py
+|                                   # 市场数据获取管线
 |-- scenarios/
 |   `-- stochopia_csi/              # Stochopia v1 下的 v2 遗留引擎输入
 |-- docs/
 |   |-- BENCHMARK_PROTOCOL.md       # 协议正本
-|   |-- DATA_AUDIT.md               # 数据来源审计与 go/no-go 门禁
-|   `-- redesign/                   # v2 设计记录（REDESIGN_PLAN.md 与两份草案）
+|   `-- redesign/                   # v2 设计公式参考（DESIGN_REFERENCE.md）
 |-- data/                           # 冻结/派生标定产物（原始数据已 gitignore）
 |-- outputs/                        # 运行产物（结果 JSON、清单、聚合结果）
 |-- tests/
@@ -281,6 +279,6 @@ Stochopia/
 
 ## 数据来源与许可
 
-正式实验用的市场数据必须携带明确的来源信息，并通过[docs/DATA_AUDIT.md](docs/DATA_AUDIT.md)中冻结的审计门禁；仓库内自带的`scenarios/stochopia_csi/market_snapshots.example.csv`是合成数据，不能用于报告结果。只有抽象的工作流程、schema与合成规则可以取材自机构实践经验——任何私有文档、客户、机构、限额或可识别的元数据都不得进入公开数据或prompt。
+正式实验用的市场数据必须携带明确的来源信息（Tushare 与 CFFEX 原始文件按请求附带 JSON sidecar 采集，且不再分发）；仓库内自带的`scenarios/stochopia_csi/market_snapshots.example.csv`是合成数据，不能用于报告结果。只有抽象的工作流程、schema与合成规则可以取材自机构实践经验——任何私有文档、客户、机构、限额或可识别的元数据都不得进入公开数据或prompt。
 
 代码以[MIT许可证](LICENSE)发布。

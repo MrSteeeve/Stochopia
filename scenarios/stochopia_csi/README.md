@@ -6,9 +6,8 @@ not be used as an experimental result.
 
 The production CSV must contain one row per month-end decision and carry a
 non-empty `source` field. Preferred sources are CFFEX MO contract-level history
-for CSI1000 and SSE 510500 ETF option history for CSI500. When paired calls and
-puts exist, infer the forward with put-call parity. The loader then follows the
-frozen ATM-IV to realized-vol fallback in `benchmark.yaml`.
+for CSI1000 and SSE 510500 ETF option history for CSI500. The loader follows the
+ATM-IV to realized-vol fallback frozen in `docs/BENCHMARK_PROTOCOL.md`.
 
 Validate a prepared file:
 
@@ -32,11 +31,10 @@ python -m stochopia.benchmark_cli build-market daily.csv market_snapshots.csv
 
 ## `prompts/` and `config/benchmark_roles.yaml`
 
-`prompts/` holds the frozen system prompt for each v2 role:
+`prompts/` holds the frozen system prompt for each v2 environment NPC role:
 
 | file | role id (in `config/benchmark_roles.yaml`) |
 |------|------|
-| `structurer.md` | `structurer` (the tested model) |
 | `client_main.md` | `client_main` |
 | `risk_control.md` | `risk_control` |
 | `trading_desk.md` | `trading_desk` |
@@ -46,9 +44,9 @@ model, temperature and this prompt file (`system_prompt_file`); the repo root
 is `stochopia.role_config.load_role_specs`'s default `base_dir`, so the
 `system_prompt_file` paths in `benchmark_roles.yaml` are written relative to
 the repository root (e.g. `scenarios/stochopia_csi/prompts/client_main.md`), not
-relative to this directory. The loader hashes each prompt file's contents
-(`system_prompt_sha256`) at load time so a prompt edit is auditable in any
-run's recorded `roles_config_sha256`.
+relative to this directory. Prompt files are not hashed and v2 results do not
+record a prompt version or `git_sha`; after editing a prompt, write results to a
+new output directory.
 
 Editing a prompt file here changes that role's behaviour the next time
 `--roles-config config/benchmark_roles.yaml` is passed to `run-episode` /
@@ -63,8 +61,11 @@ benchmark run -- do not repoint their `model_ref` per tested model. See
 (numeric-authority discipline, grounding validation, response caching,
 degraded fallback).
 
-`structurer.md` also documents the `consult` action (qualitative, non-binding
-chat with an env role), which is only usable when `--roles-config` is passed;
-without it, `consult` returns a fixed degraded-fallback string and the rest of
-the protocol -- including the deterministic checks and `dealer_margin` -- is
-unaffected.
+The tested structurer is not configured here: its model comes from
+`run-episode --model` / the manifest job, and its system prompt is the packaged
+`stochopia/resources/structurer.md` (temperature 0, `max_tokens` from
+`config/models.yaml`, seed from `--seed` / the job). That prompt also documents
+the `consult` action (qualitative, non-binding chat with an env role), which is
+only usable when `--roles-config` is passed; without it, `consult` returns a
+fixed degraded-fallback string and the rest of the protocol -- including the
+deterministic checks and `dealer_margin` -- is unaffected.

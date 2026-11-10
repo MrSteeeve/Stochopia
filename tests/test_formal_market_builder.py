@@ -11,7 +11,8 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from stochopia.benchmark import MarketSnapshot, load_market_snapshots
-from stochopia.formal_market_builder import _atomic_write, _csv_bytes, run_base_build
+from stochopia.common import atomic_write_bytes
+from stochopia.formal_market_builder import _csv_bytes, run_base_build
 from stochopia.market_data_math import ShiborCurve
 
 
@@ -28,6 +29,7 @@ def _write_endpoint(root: Path, endpoint: str, rows: list[dict[str, str]], param
         "status": "complete",
         "params": params,
         "row_count": len(rows),
+        "columns": list(rows[0]),
         "sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
     }
     (directory / "fixture.json").write_text(json.dumps(metadata), encoding="utf-8")
@@ -37,10 +39,8 @@ def _fixtures(tmp_path: Path) -> tuple[Path, Path, Path]:
     data = tmp_path / "data"
     tushare = data / "raw" / "tushare"
     tushare.mkdir(parents=True)
-    (tushare / "manifest.sha256").write_text("fixture\n", encoding="utf-8")
     cffex_raw = data / "raw" / "cffex"
     cffex_raw.mkdir(parents=True)
-    (cffex_raw / "manifest.sha256").write_text("fixture\n", encoding="utf-8")
 
     start, end = date(2022, 6, 1), date(2025, 12, 31)
     dates = []
@@ -110,7 +110,6 @@ def test_phase_a_build_is_complete_index_only_and_leakage_safe(tmp_path):
     assert all(row["spot"]["ts_code"] in {"000905.SH", "000852.SH"} for row in provenance)
     assert all(row["max_input_date"] <= row["as_of"] for row in provenance)
     assert "510500" not in (derived / "market_snapshots.csv").read_text()
-    assert (derived / "manifest.sha256").is_file()
 
 
 def test_full_phase_csv_preserves_iv_overlay_values(tmp_path):
@@ -121,7 +120,7 @@ def test_full_phase_csv_preserves_iv_overlay_values(tmp_path):
         atm_iv_1m=0.22, atm_iv_3m=0.23, atm_iv_6m=0.24,
         source="base; sse_510500_etf_iv_proxy",
     )
-    _atomic_write(target, _csv_bytes([snapshot]))
+    atomic_write_bytes(target, _csv_bytes([snapshot]))
     loaded = load_market_snapshots(target)[0]
     assert (loaded.atm_iv_1m, loaded.atm_iv_3m, loaded.atm_iv_6m) == (0.22, 0.23, 0.24)
 
@@ -131,8 +130,14 @@ def test_synthetic_full_builder_preserves_72_base_rows(tmp_path, monkeypatch):
     _write_endpoint(tushare, "opt_daily", [{"trade_date": "20250131"}], {})
     _write_endpoint(tushare, "opt_basic", [{"symbol": "fixture"}], {})
     _write_endpoint(tushare, "fund_daily", [{"ts_code": "510500.SH", "trade_date": "20250131", "close": "5"}], {})
+    _write_endpoint(tushare, "trade_cal", [
+        {"exchange": "SSE", "cal_date": "20250131", "is_open": "1", "pretrade_date": "20250130"},
+        {"exchange": "SSE", "cal_date": "20250201", "is_open": "0", "pretrade_date": "20250131"},
+    ], {})
+    seen: dict = {}
 
-    def fake_overlay(snapshots, provenance, **_):
+    def fake_overlay(snapshots, provenance, **kwargs):
+        seen["exchange_open_dates"] = kwargs.get("exchange_open_dates")
         updated = []
         updated_provenance = []
         for snapshot, row in zip(snapshots, provenance):
@@ -155,3 +160,17 @@ def test_synthetic_full_builder_preserves_72_base_rows(tmp_path, monkeypatch):
     gate = run_base_build(tushare_root=tushare, cffex_path=cffex, output_root=derived, phase="full")
     assert gate["ready"] is True
     assert len(load_market_snapshots(derived / "market_snapshots.csv")) == 72
+    # IV staleness is counted on exchange open days, not chain-file days.
+    assert seen["exchange_open_dates"] == [date(2025, 1, 31)]
+
+
+def test_carry_fallback_fails_carry_complete_gate(tmp_path):
+    tushare, cffex, derived = _fixtures(tmp_path)
+    lines = cffex.read_text(encoding="utf-8").splitlines()
+    cffex.write_text("\n".join([lines[0]] + lines[2:]) + "\n", encoding="utf-8")
+
+    gate = run_base_build(tushare_root=tushare, cffex_path=cffex, output_root=derived)
+
+    assert gate["carry"] == {"observed": 71, "fallback_zero": 1}
+    assert gate["checks"]["carry_complete"] is False
+    assert gate["ready"] is False

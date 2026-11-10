@@ -106,26 +106,13 @@ class ProductSpec:
         return self.effective_face_value if self.principal_protected else 0.0
 
 
-def _prob_bucket(p: float) -> str:
-    """把概率映射为客户口吻的定性表述（客户不会说小数点概率）。"""
-    if p < 0.2:
-        return "很小"
-    if p < 0.4:
-        return "较小"
-    if p < 0.6:
-        return "中等"
-    if p < 0.8:
-        return "较大"
-    return "很大"
-
-
 @dataclass
 class ClientProfile:
     """客户画像：资金规模、风险偏好与决策阈值。
 
-    带 round_ 前缀语义的字段（max_maturity_months、principal_protection_required、
-    allowed_product_types、accepting_new_products、current_focus）描述"当轮状态"，
-    由 scenario.get_client(id, round_num) 按轮次时间表解析后返回的副本携带。
+    max_maturity_months、principal_protection_required、allowed_product_types、
+    accepting_new_products、current_focus 描述客户"当轮状态"，由 round_overrides
+    按轮次解析后的副本携带；成交判定见 benchmark.client_contract_pass。
     """
 
     id: str
@@ -142,144 +129,6 @@ class ClientProfile:
     min_hit_prob: float = 0.5
     current_focus: str = ""
     round_overrides: list[dict] = field(default_factory=list)
-
-    def would_buy(self, product: ProductSpec, pricing: dict) -> tuple[bool, str]:
-        """依据定价结果，确定性地判断客户是否会购买该产品。
-
-        客户报出的 min_return_pct 语义是"产品要有像样的机会做到这个年化"：
-        决策检查 pricing["hurdle_hit_prob"]（真实漂移下实现年化 ≥ 门槛的概率）
-        是否达到 min_hit_prob，而非概率加权的平均收益。
-        pricing 另需包含 client_price（元）与 loss_frac（预期损失比例，期望口径）。
-        本方法应在"当轮解析后"的客户状态上调用。
-        """
-        if not self.accepting_new_products:
-            return False, "本轮暂停申购新产品"
-
-        if self.allowed_product_types is not None and (
-            product.product_type not in self.allowed_product_types
-        ):
-            return False, f"产品类型 {product.product_type} 不在本轮可接受范围内"
-
-        if product.maturity_months > self.max_maturity_months:
-            return (
-                False,
-                f"期限超出本轮可接受上限（{product.maturity_months} > {self.max_maturity_months} 个月）",
-            )
-
-        if self.principal_protection_required and not product.principal_protected:
-            return False, "本轮要求保本，产品不保本"
-
-        if self.risk_appetite == "conservative" and not product.principal_protected:
-            return False, "不保本，不符合风险偏好"
-
-        cash_outlay = float(pricing.get("cash_outlay", pricing.get("client_price", 0.0)))
-        if cash_outlay > self.capital:
-            return False, "客户实际现金出资超过可投资金额"
-
-        loss_frac = pricing["loss_frac"]
-        if loss_frac > self.max_loss_pct + 1e-9:
-            return (
-                False,
-                f"潜在损失超出承受范围（{loss_frac:.2%} > {self.max_loss_pct:.2%}）",
-            )
-
-        hit_prob = pricing["hurdle_hit_prob"]
-        if hit_prob < self.min_hit_prob - 1e-9:
-            return (
-                False,
-                f"做到年化 {self.min_return_pct:.1%} 的把握{_prob_bucket(hit_prob)}，"
-                f"达不到我的要求（我要有{_prob_bucket(self.min_hit_prob)}的把握才行）",
-            )
-
-        return True, "符合投资标准"
-
-
-@dataclass
-class Constraint:
-    """一条在特定轮次生效的合规/风控约束。"""
-
-    id: str
-    activate_round: int
-    source: str
-    description: str
-    check_field: str
-    check_type: str
-    check_value: float | str
-
-    def validate(self, product: ProductSpec, greeks: dict) -> tuple[bool, str]:
-        """校验产品是否满足本约束。check_field 优先取自 greeks，其次取产品字段。"""
-        if self.check_field in greeks:
-            value = greeks[self.check_field]
-        elif hasattr(product, self.check_field):
-            value = getattr(product, self.check_field)
-        else:
-            raise ProductError(
-                f"约束 {self.id} 配置错误：字段 {self.check_field} 既不在 greeks 中，"
-                f"也不是产品字段"
-            )
-
-        tol = 1e-9
-        if self.check_type == "max":
-            if value <= self.check_value + tol:
-                return True, "通过"
-            return (
-                False,
-                f"{self.description}：{self.check_field} 实际值 {value} 超过上限 {self.check_value}",
-            )
-        if self.check_type == "min":
-            if value >= self.check_value - tol:
-                return True, "通过"
-            return (
-                False,
-                f"{self.description}：{self.check_field} 实际值 {value} 低于下限 {self.check_value}",
-            )
-        if self.check_type == "max_abs":
-            if abs(value) <= self.check_value + tol:
-                return True, "通过"
-            return (
-                False,
-                f"{self.description}：{self.check_field} 实际值 {value} 的绝对值超过上限 {self.check_value}",
-            )
-        if self.check_type == "forbidden_type":
-            if product.product_type != self.check_value:
-                return True, "通过"
-            return (
-                False,
-                f"{self.description}：产品类型 {product.product_type} 属于被禁止的类型 {self.check_value}",
-            )
-        raise ProductError(f"约束 {self.id} 配置错误：未知的 check_type {self.check_type!r}")
-
-
-@dataclass
-class RoundResult:
-    """单轮博弈结果：记录该轮的市场状态、生效约束、设计出的产品（若有）及其
-    定价（公允价值、希腊字母、对冲成本）、报给客户的价格、触发的约束违规、
-    客户的成交/拒绝决策、本轮及累计佣金、声誉值，以及结构化设计师的推理文本。
-    """
-
-    round_num: int
-    market_state: MarketState
-    active_constraints: list[str]
-    product_designed: ProductSpec | None
-    fair_value: float | None
-    greeks: dict | None
-    hedging_cost: float | None
-    client_price: float | None
-    constraint_violations: list[str]
-    client_decision: tuple[bool, str]
-    commission: float
-    cumulative_commission: float
-    reputation: float
-    structurer_reasoning: str
-
-
-@dataclass
-class PlaygroundResult:
-    """一次完整对局的结果。"""
-
-    rounds: list[RoundResult]
-    total_commission: float
-    usage: dict = field(default_factory=dict)
 
 
 DRAFT_TARGET = "__draft__"
@@ -345,10 +194,12 @@ def parse_product_spec(data: dict) -> ProductSpec:
         return _is_number(x) and math.isfinite(x)
 
     product_type = data.get("product_type")
-    if product_type not in PRODUCT_TYPES:
+    if not isinstance(product_type, str) or product_type not in PRODUCT_TYPES:
         errors.append(
             f"product_type 必须是 {PRODUCT_TYPES} 之一，实际为 {product_type!r}"
         )
+        # 非字符串（如 LLM 输出的列表）不可哈希，不能再参与下文的集合判断。
+        product_type = None
 
     notional = data.get("notional")
     if not _is_finite_number(notional) or notional <= 0 or notional > 1e12:
@@ -597,40 +448,6 @@ def parse_product_spec(data: dict) -> ProductSpec:
     )
 
 
-# 发行政策（全程生效的产品线规则，违反视同约束违规，有一次修改机会）
-ISSUANCE_MAX_MATURITY_MONTHS = 12
-ISSUANCE_MAX_PARTICIPATION_PROTECTED = 1.5
-ISSUANCE_MAX_PARTICIPATION_UNPROTECTED = 3.0
-
-
-def check_issuance_policy(product: ProductSpec) -> list[tuple[str, str]]:
-    """检查发行政策，返回 (违规 id, 原因) 列表；合规返回空列表。"""
-    violations: list[tuple[str, str]] = []
-    if product.maturity_months > ISSUANCE_MAX_MATURITY_MONTHS:
-        violations.append(
-            (
-                "issuance_maturity_cap",
-                f"发行政策：产品期限不得超过 {ISSUANCE_MAX_MATURITY_MONTHS} 个月"
-                f"（实际 {product.maturity_months} 个月）",
-            )
-        )
-    cap = (
-        ISSUANCE_MAX_PARTICIPATION_PROTECTED
-        if product.principal_protected
-        else ISSUANCE_MAX_PARTICIPATION_UNPROTECTED
-    )
-    if product.participation_rate > cap + 1e-9:
-        kind = "保本" if product.principal_protected else "非保本"
-        violations.append(
-            (
-                "issuance_participation_cap",
-                f"发行政策：{kind}产品参与率不得超过 {cap:g}"
-                f"（实际 {product.participation_rate:g}）",
-            )
-        )
-    return violations
-
-
 def parse_product_draft(data: dict) -> ProductSpec:
     """解析产品草案（用于交易台报价 / 风控预检）：与正式提交同规则，
     但 target_client 可缺省（草案阶段无需指定客户，缺省填 DRAFT_TARGET）。
@@ -640,18 +457,3 @@ def parse_product_draft(data: dict) -> ProductSpec:
     if not (isinstance(data.get("target_client"), str) and data.get("target_client", "").strip()):
         data = {**data, "target_client": DRAFT_TARGET}
     return parse_product_spec(data)
-
-
-def check_protection_claim(product: ProductSpec) -> tuple[bool, str]:
-    """校验 principal_protected 声明与产品结构是否一致（诚实性检查）。"""
-    if product.product_type == "custom":
-        return True, "无法校验"
-    if product.product_type == "snowball" and product.principal_protected:
-        return False, "雪球客户承担敲入下行，不可能保本"
-    if (
-        product.product_type == "autocallable"
-        and product.barrier_pct is not None
-        and product.principal_protected
-    ):
-        return False, "带敲入障碍即不保本"
-    return True, "一致"

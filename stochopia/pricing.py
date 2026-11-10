@@ -10,12 +10,17 @@ import random
 from dataclasses import dataclass, replace
 
 from .cache import BoundedLRUCache
+from .common import normal_cdf
 from .products import ClientProfile, MarketState, ProductSpec
 
 MARKUP = 1.03
 HEDGE_COST_RATIO = 1.02
 MC_PATHS = 10000
 MC_SEED = 42
+# 雪球敲出 / autocall 赎回触发水平（期初价比例）。定价、P 测度 hurdle MC 与
+# 生命周期观察（benchmark._observe_position_path）共用这两个常数。
+SNOWBALL_KNOCK_OUT_PCT = 1.03
+AUTOCALL_TRIGGER_PCT = 1.05
 
 _VANILLA_TYPES = ("vanilla_call", "vanilla_put")
 _BARRIER_TYPES = ("barrier_call", "barrier_put")
@@ -23,6 +28,10 @@ _BARRIER_TYPES = ("barrier_call", "barrier_put")
 
 class PricingError(Exception):
     """定价参数非法或计算失败。"""
+
+
+class QuoteUnavailableError(PricingError):
+    """结构可以估值但不可报价（如 premium-paid 公允价值 ≤ 0，权利金无从定义）。"""
 
 
 def _reference_spot(product: ProductSpec, current_spot: float) -> float:
@@ -60,6 +69,12 @@ def _barrier_direction(product: ProductSpec) -> str:
     return direction
 
 
+# 生命周期按月度快照监控/结算障碍（与 mc_diagnostics 的 dt 一致）。
+BARRIER_MONITORING_DT = 1.0 / 12.0
+# Broadie–Glasserman–Kou (1997) 离散监控修正常数 -zeta(1/2)/sqrt(2*pi)。
+BGK_BETA = 0.5826
+
+
 def _barrier_is_touched(spot: float, barrier: float, direction: str) -> bool:
     if direction == "down":
         return spot <= barrier
@@ -71,11 +86,6 @@ def _barrier_is_touched(spot: float, barrier: float, direction: str) -> bool:
 # ---------------------------------------------------------------------------
 # 正态分布辅助函数
 # ---------------------------------------------------------------------------
-
-
-def _norm_cdf(x: float) -> float:
-    """标准正态分布累积分布函数，基于 math.erf 计算。"""
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
 def _norm_pdf(x: float) -> float:
@@ -101,7 +111,7 @@ def bs_call(S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0
             return max(S - K, 0.0)
         return max(S * math.exp(-q * T) - K * math.exp(-r * T), 0.0)
     d1, d2 = _d1_d2(S, K, T, r, sigma, q)
-    return S * math.exp(-q * T) * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+    return S * math.exp(-q * T) * normal_cdf(d1) - K * math.exp(-r * T) * normal_cdf(d2)
 
 
 def bs_put(S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0) -> float:
@@ -111,7 +121,7 @@ def bs_put(S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0)
             return max(K - S, 0.0)
         return max(K * math.exp(-r * T) - S * math.exp(-q * T), 0.0)
     d1, d2 = _d1_d2(S, K, T, r, sigma, q)
-    return K * math.exp(-r * T) * _norm_cdf(-d2) - S * math.exp(-q * T) * _norm_cdf(-d1)
+    return K * math.exp(-r * T) * normal_cdf(-d2) - S * math.exp(-q * T) * normal_cdf(-d1)
 
 
 def bs_greeks(
@@ -134,18 +144,18 @@ def bs_greeks(
     vega = vega_annual / 100.0
 
     if option_type == "call":
-        delta = disc_q * _norm_cdf(d1)
+        delta = disc_q * normal_cdf(d1)
         theta_annual = (
             -S * disc_q * _norm_pdf(d1) * sigma / (2.0 * math.sqrt(T))
-            - r * K * disc_r * _norm_cdf(d2)
-            + q * S * disc_q * _norm_cdf(d1)
+            - r * K * disc_r * normal_cdf(d2)
+            + q * S * disc_q * normal_cdf(d1)
         )
     elif option_type == "put":
-        delta = disc_q * (_norm_cdf(d1) - 1.0)
+        delta = disc_q * (normal_cdf(d1) - 1.0)
         theta_annual = (
             -S * disc_q * _norm_pdf(d1) * sigma / (2.0 * math.sqrt(T))
-            + r * K * disc_r * _norm_cdf(-d2)
-            - q * S * disc_q * _norm_cdf(-d1)
+            + r * K * disc_r * normal_cdf(-d2)
+            - q * S * disc_q * normal_cdf(-d1)
         )
     else:
         raise PricingError(f"未知期权类型：{option_type}")
@@ -172,12 +182,17 @@ def barrier_option(
     barrier_direction: str,
     *,
     already_touched: bool = False,
+    monitoring_dt: float | None = None,
 ) -> float:
     """Reiner-Rubinstein (1991) 障碍期权解析解，零返还（rebate=0）。
 
     barrier_type 取值 {"knock_in", "knock_out"}；barrier_direction 是发行时
     固定的 {"down", "up"}，不会随重估时现货位置反转。already_touched
     用于继承存续期已触碰状态；当前现货在障碍边界上也视为触碰。
+    monitoring_dt 给定时按 Broadie–Glasserman–Kou 把离散监控近似为连续公式：
+    障碍位向远离现货方向平移 exp(±0.5826·σ·√Δt)；已观测触碰必须由调用方经
+    already_touched 传入（生命周期按月度快照判定），S 相对平移障碍只决定假想
+    起点是否已越界。None 为连续监控。
     """
     if barrier_type not in ("knock_in", "knock_out"):
         raise PricingError(f"未知障碍类型：{barrier_type}")
@@ -190,6 +205,11 @@ def barrier_option(
 
     # 已经触碰的边界情况（含 barrier == S）。方向绝不由当前 S 重推。
     is_down = barrier_direction == "down"
+    if monitoring_dt and sigma > 0:
+        # 离散监控：已观测到的触碰只经 already_touched 传入；S 只是未来路径的
+        # 起点（delta 扰动、压力冲击），越过原障碍但未越过平移障碍时仍按 BGK 定价。
+        shift = BGK_BETA * sigma * math.sqrt(monitoring_dt)
+        barrier *= math.exp(-shift if is_down else shift)
     already_breached = already_touched or _barrier_is_touched(
         S, barrier, barrier_direction
     )
@@ -204,7 +224,6 @@ def barrier_option(
     eta = 1.0 if is_down else -1.0
 
     mu = (r - q - 0.5 * sigma * sigma) / (sigma * sigma)
-    lam = math.sqrt(mu * mu + 2.0 * r / (sigma * sigma))
     sqT = sigma * math.sqrt(T)
 
     def _x1():
@@ -219,9 +238,6 @@ def barrier_option(
     def _y2():
         return math.log(barrier / S) / sqT + (1.0 + mu) * sqT
 
-    def _z():
-        return math.log(barrier / S) / sqT + lam * sqT
-
     disc_q = math.exp(-q * T)
     disc_r = math.exp(-r * T)
 
@@ -230,23 +246,23 @@ def barrier_option(
     y1 = _y1()
     y2 = _y2()
 
-    A = phi * S * disc_q * _norm_cdf(phi * x1) - phi * K * disc_r * _norm_cdf(phi * x1 - phi * sqT)
-    B = phi * S * disc_q * _norm_cdf(phi * x2) - phi * K * disc_r * _norm_cdf(phi * x2 - phi * sqT)
+    A = phi * S * disc_q * normal_cdf(phi * x1) - phi * K * disc_r * normal_cdf(phi * x1 - phi * sqT)
+    B = phi * S * disc_q * normal_cdf(phi * x2) - phi * K * disc_r * normal_cdf(phi * x2 - phi * sqT)
     C = (
         phi
         * S
         * disc_q
         * (barrier / S) ** (2.0 * (mu + 1.0))
-        * _norm_cdf(eta * y1)
-        - phi * K * disc_r * (barrier / S) ** (2.0 * mu) * _norm_cdf(eta * y1 - eta * sqT)
+        * normal_cdf(eta * y1)
+        - phi * K * disc_r * (barrier / S) ** (2.0 * mu) * normal_cdf(eta * y1 - eta * sqT)
     )
     D = (
         phi
         * S
         * disc_q
         * (barrier / S) ** (2.0 * (mu + 1.0))
-        * _norm_cdf(eta * y2)
-        - phi * K * disc_r * (barrier / S) ** (2.0 * mu) * _norm_cdf(eta * y2 - eta * sqT)
+        * normal_cdf(eta * y2)
+        - phi * K * disc_r * (barrier / S) ** (2.0 * mu) * normal_cdf(eta * y2 - eta * sqT)
     )
 
     # 依据 8 种 up/down × in/out × call/put 组合，用 A/B/C/D 拼出结果
@@ -364,7 +380,9 @@ def _mc_stats(
 
     for _ in range(n_paths):
         ratio = 1.0
-        min_ratio = 1.0
+        # 只看未来月度观察日（t>=1）：当前（可能被 delta/压力扰动的）现货
+        # 不是已观测敲入，历史敲入只经 already_knocked_in 传入。
+        min_ratio = math.inf
         cashflow = None
         term_t = None
         payment_delay_months = None
@@ -459,7 +477,7 @@ def autocallable_price(
     q: float,
     coupon_rate: float,
     barrier_pct: float | None,
-    autocall_pct: float = 1.05,
+    autocall_pct: float = AUTOCALL_TRIGGER_PCT,
     n_paths: int = 10000,
     seed: int = 42,
     fixing_ratio: float = 1.0,
@@ -501,7 +519,7 @@ def snowball_price(
     q: float,
     coupon_rate: float,
     knock_in_pct: float = 0.75,
-    knock_out_pct: float = 1.03,
+    knock_out_pct: float = SNOWBALL_KNOCK_OUT_PCT,
     n_paths: int = 10000,
     seed: int = 42,
     fixing_ratio: float = 1.0,
@@ -542,14 +560,14 @@ def snowball_price(
 def _snowball_kwargs(product: ProductSpec) -> dict:
     return {
         "knock_in_pct": product.barrier_pct if product.barrier_pct is not None else 0.75,
-        "knock_out_pct": 1.03,
+        "knock_out_pct": SNOWBALL_KNOCK_OUT_PCT,
     }
 
 
 def _autocallable_kwargs(product: ProductSpec) -> dict:
     return {
         "barrier_pct": product.barrier_pct,
-        "autocall_pct": 1.05,
+        "autocall_pct": AUTOCALL_TRIGGER_PCT,
     }
 
 
@@ -600,6 +618,7 @@ def expected_payoff(product: ProductSpec, market: MarketState) -> float | None:
             option_type,
             barrier_direction,
             already_touched=product.barrier_touched,
+            monitoring_dt=BARRIER_MONITORING_DT,
         )
         if product.principal_protected:
             return (
@@ -692,6 +711,7 @@ def _barrier_price_points(product: ProductSpec, market: MarketState) -> float:
         option_type,
         _barrier_direction(product),
         already_touched=product.barrier_touched,
+        monitoring_dt=BARRIER_MONITORING_DT,
     )
 
 
@@ -768,6 +788,7 @@ def price_product(product: ProductSpec, market: MarketState) -> dict | None:
                 option_type,
                 barrier_direction,
                 already_touched=product.barrier_touched,
+                monitoring_dt=BARRIER_MONITORING_DT,
             )
 
         # delta 在绝对价格上做中心差分（对"价格/现货"差分会混入 −price/S 项）
@@ -911,10 +932,11 @@ def price_product(product: ProductSpec, market: MarketState) -> dict | None:
 
 
 def evaluate_product(product: ProductSpec, market: MarketState) -> dict | None:
-    """一站式产品评估：公允价值、希腊值、对客户报价、期望收益与损失比例。custom 返回 None。
+    """一站式产品评估：公允价值、希腊值、对客户报价与损失比例。custom 返回 None。
 
     返回字典包含：fair_value、greeks、hedging_cost、pricing_details、
-    client_price、expected_payoff 及 loss_frac（预期损失（期望口径））。
+    client_price 及 loss_frac（预期损失（期望口径））。P 测度期望收益不在此
+    计算（无调用方读取），需要时直接调用 expected_payoff。
     """
     if product.product_type == "custom":
         return None
@@ -925,7 +947,6 @@ def evaluate_product(product: ProductSpec, market: MarketState) -> dict | None:
 
     fair_value = result["fair_value"]
     result["client_price"] = MARKUP * fair_value
-    result["expected_payoff"] = expected_payoff(product, market)
 
     if product.principal_protected:
         if product.product_type in ("snowball",):
@@ -1035,7 +1056,7 @@ def hurdle_hit_prob(
             d = (math.log(S_T_star / S0) - (mu - q - 0.5 * sigma * sigma) * T) / (
                 sigma * math.sqrt(T)
             )
-            return _norm_cdf(-d)
+            return normal_cdf(-d)
 
         else:  # vanilla_put
             if protected:
@@ -1066,7 +1087,7 @@ def hurdle_hit_prob(
             d = (math.log(S_T_star / S0) - (mu - q - 0.5 * sigma * sigma) * T) / (
                 sigma * math.sqrt(T)
             )
-            return _norm_cdf(d)
+            return normal_cdf(d)
 
     # barrier / autocallable / snowball → 月度步长 MC
     return _mc_hit_prob(product, market, hurdle_annual, client_price, mu)
@@ -1150,10 +1171,10 @@ def _mc_hit_prob(
             term_t = remaining_months
 
         elif product.product_type == "snowball":
-            ko_pct = 1.03
+            ko_pct = SNOWBALL_KNOCK_OUT_PCT
             ki_pct = product.barrier_pct if product.barrier_pct is not None else 0.75
             coupon = product.coupon_rate or 0.0
-            min_ratio = 1.0
+            min_ratio = math.inf  # t=0 不算观察日，见 _mc_stats
             knocked_out = False
 
             for t_step in range(1, remaining_months + 1):
@@ -1180,10 +1201,10 @@ def _mc_hit_prob(
                 )
 
         elif product.product_type == "autocallable":
-            autocall_pct = 1.05
+            autocall_pct = AUTOCALL_TRIGGER_PCT
             ki_pct = product.barrier_pct
             coupon = product.coupon_rate or 0.0
-            min_ratio = 1.0
+            min_ratio = math.inf  # t=0 不算观察日，见 _mc_stats
             knocked_out = False
 
             for t_step in range(1, remaining_months + 1):
@@ -1238,265 +1259,10 @@ def _mc_hit_prob(
 # ---------------------------------------------------------------------------
 
 
-def build_payoff_table(product: ProductSpec, spot: float) -> str | None:
-    """到期情景表（每 1 元名义本金的到期现金流，未贴现）。
-
-    纯函数，刻意不接受 MarketState，防止路径依赖信息或市场观点泄漏。
-    custom → None。
-
-    指数涨跌情景：−20%,−10%,−5%,0%,+5%,+10%,+20%。
-    - vanilla：单列终值
-    - barrier：双列（未触发障碍 / 已触发障碍）+ 注释
-    - autocallable / snowball：情景文字描述（含敲出/敲入场景）
-    """
-    if product.product_type == "custom":
-        return None
-
-    moves = [-0.20, -0.10, -0.05, 0.00, 0.05, 0.10, 0.20]
-    move_labels = ["-20%", "-10%", "-5%", "0%", "+5%", "+10%", "+20%"]
-
-    K = product.strike_pct * spot
-    participation = product.participation_rate
-    protected = product.principal_protected
-    T_months = int(product.maturity_months)
-
-    title = "【到期情景表｜每 1 元名义本金的到期现金流，未贴现】"
-
-    def _opt_frac(S_T: float, is_call: bool) -> float:
-        if is_call:
-            return participation * max(S_T - K, 0.0) / spot
-        return participation * max(K - S_T, 0.0) / spot
-
-    if product.product_type in _VANILLA_TYPES:
-        is_call = product.product_type == "vanilla_call"
-        lines = [title, "", f"{'指数涨跌':>8}  {'到期收益':>10}", "-" * 24]
-        for label, move in zip(move_labels, moves):
-            S_T = spot * (1.0 + move)
-            pf = (1.0 + _opt_frac(S_T, is_call)) if protected else _opt_frac(S_T, is_call)
-            lines.append(f"{label:>8}  {pf:>10.4f}")
-        return "\n".join(lines)
-
-    if product.product_type in _BARRIER_TYPES:
-        is_call = product.product_type == "barrier_call"
-        barrier_type = product.barrier_type or "knock_out"
-
-        lines = [
-            title,
-            "",
-            f"{'指数涨跌':>8}  {'未触发障碍':>12}  {'已触发障碍':>12}",
-            "-" * 40,
-        ]
-        for label, move in zip(move_labels, moves):
-            S_T = spot * (1.0 + move)
-            opt = _opt_frac(S_T, is_call)
-
-            if barrier_type == "knock_out":
-                # 未触发：期权有效
-                no_touch = (1.0 + opt) if protected else opt
-                # 已触发：期权死亡
-                touch = 1.0 if protected else 0.0
-            else:  # knock_in
-                # 未触发：期权无效
-                no_touch = 1.0 if protected else 0.0
-                # 已触发：期权有效
-                touch = (1.0 + opt) if protected else opt
-
-            lines.append(f"{label:>8}  {no_touch:>12.4f}  {touch:>12.4f}")
-
-        lines.append("")
-        lines.append("注：障碍为路径观察，终值不能确定是否触发")
-        return "\n".join(lines)
-
-    if product.product_type in ("autocallable", "snowball"):
-        coupon = product.coupon_rate or 0.0
-        lines = [title, ""]
-
-        lines.append(
-            f"提前敲出（第 m 月赎回）：1+票息×m/12"
-            f"（示例 m=3）：{1.0 + coupon * 3 / 12:.4f}"
-        )
-        lines.append(
-            f"提前敲出（第 m 月赎回）：1+票息×m/12"
-            f"（示例 m=6）：{1.0 + coupon * 6 / 12:.4f}"
-        )
-        lines.append(f"到期未敲入：{1.0 + coupon * T_months / 12:.4f}（票息全收）")
-
-        if product.product_type == "snowball":
-            lines.append("到期已敲入：按标的终值结算（雪球=终值/期初）")
-            lines.append(f"  示例：指数-20% → 终值收益约 0.8000")
-        else:
-            lines.append("到期已敲入：按标的终值结算（autocall=min(终值/期初,1)）")
-            lines.append(f"  示例：指数-20% → 终值收益约 0.8000")
-
-        return "\n".join(lines)
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# 最高情景收益摘要行（报价展示）
-# ---------------------------------------------------------------------------
-
-
-def best_case_line(
-    product: ProductSpec,
-    market: MarketState,
-    client_price: float,
-) -> str | None:
-    """交易台报价中的最高情景收益摘要行（风险中性口径）。
-
-    使用风险中性漂移（drift = r，不含 trend_alpha），防止内幕信息泄漏。custom → None。
-
-    - snowball / autocallable：最高年化 = coupon_rate；概率为 RN 下实现票息情景的概率
-      （1 − 敲入概率，即敲出 + 到期未敲入路径）。
-      格式：最高情景收益：票息年化 {coupon:.1%}｜风险中性实现概率约 {p:.0%}
-    - knock_out barrier（封顶结构）：以障碍位为封顶情景，年化净收益 + RN 实现概率。
-    - 无封顶（vanilla / knock_in barrier）：以 ±20% 情景为示意，标注「上不封顶」。
-    """
-    if product.product_type == "custom":
-        return None
-
-    S0 = market.spot
-    reference = _reference_spot(product, S0)
-    r = market.risk_free_rate
-    sigma = market.volatility
-    q = market.dividend_yield
-    remaining_months = _remaining_months(product)
-    T = remaining_months / 12.0
-    T_months = int(product.maturity_months)
-    participation = product.participation_rate
-    protected = product.principal_protected
-    notional = product.notional
-    K = product.strike_pct * reference
-
-    # 风险中性市场态（trend_alpha = 0，防止漏出真实漂移）
-    rn_market = MarketState(
-        round_num=market.round_num,
-        index_name=market.index_name,
-        spot=S0,
-        volatility=sigma,
-        risk_free_rate=r,
-        dividend_yield=q,
-        recent_trend=market.recent_trend,
-        vix_level=market.vix_level,
-        trend_alpha=0.0,
-    )
-
-    # ---- coupon 产品 ------------------------------------------------
-    if product.product_type in ("snowball", "autocallable"):
-        coupon = product.coupon_rate or 0.0
-
-        if product.product_type == "snowball":
-            kwargs = _snowball_kwargs(product)
-            rn_stats = _mc_stats(
-                S0,
-                T_months,
-                r,
-                sigma,
-                q,
-                "snowball",
-                coupon_rate=coupon,
-                knock_in_pct=kwargs["knock_in_pct"],
-                knock_out_pct=kwargs["knock_out_pct"],
-                discount=False,
-                fixing_ratio=reference / S0,
-                already_knocked_in=product.knock_in_active,
-                elapsed_months=product.elapsed_months,
-            )
-        else:
-            kwargs = _autocallable_kwargs(product)
-            rn_stats = _mc_stats(
-                S0,
-                T_months,
-                r,
-                sigma,
-                q,
-                "autocallable",
-                coupon_rate=coupon,
-                knock_in_pct=kwargs["barrier_pct"],
-                autocall_pct=kwargs["autocall_pct"],
-                protected=protected,
-                discount=False,
-                fixing_ratio=reference / S0,
-                already_knocked_in=product.knock_in_active,
-                elapsed_months=product.elapsed_months,
-            )
-
-        # 票息情景 = 敲出 + 到期未敲入 = 1 − 敲入概率
-        p_coupon = 1.0 - rn_stats["knock_in_prob"]
-        return f"最高情景收益：票息年化 {coupon:.1%}｜风险中性实现概率约 {p_coupon:.0%}"
-
-    # ---- 封顶结构（knock_out barrier）--------------------------------
-    is_capped = (
-        product.product_type in _BARRIER_TYPES
-        and product.barrier_type == "knock_out"
-    )
-
-    if is_capped:
-        barrier_S = (product.barrier_pct or 1.0) * reference
-        is_call = product.product_type == "barrier_call"
-
-        if is_call:
-            opt_at_cap = participation * max(barrier_S - K, 0.0) / reference
-        else:
-            opt_at_cap = participation * max(K - barrier_S, 0.0) / reference
-
-        cap_payoff_frac = (1.0 + opt_at_cap) if protected else opt_at_cap
-        cap_annual = (
-            (cap_payoff_frac - client_price / notional)
-            * 12.0
-            / max(remaining_months, 1)
-        )
-
-        # P_RN(realized_annual ≥ cap_annual)，以风险中性市场态调用 hurdle_hit_prob
-        p = hurdle_hit_prob(product, rn_market, cap_annual, client_price)
-        if p is None:
-            p = 0.0
-        return f"最高情景收益（封顶年化）：{cap_annual:.1%}｜风险中性实现概率约 {p:.0%}"
-
-    # ---- 无封顶：vanilla 或 knock_in barrier --------------------------
-    is_call = product.product_type in ("vanilla_call", "barrier_call")
-    move = 0.20 if is_call else -0.20
-    S_T_illus = S0 * (1.0 + move)
-
-    if is_call:
-        opt_frac = participation * max(S_T_illus - K, 0.0) / reference
-    else:
-        opt_frac = participation * max(K - S_T_illus, 0.0) / reference
-
-    illus_payoff_frac = (1.0 + opt_frac) if protected else opt_frac
-    illus_annual = (
-        (illus_payoff_frac - client_price / notional)
-        * 12.0
-        / max(remaining_months, 1)
-    )
-
-    # RN 概率：P(S_T ≥ 1.2*S0) for call, P(S_T ≤ 0.8*S0) for put
-    if product.product_type in _VANILLA_TYPES:
-        p = hurdle_hit_prob(product, rn_market, illus_annual, client_price)
-        if p is None:
-            p = 0.0
-    else:
-        # barrier knock_in：用对数正态尾概率近似（忽略敲入条件）
-        if T > 0 and sigma > 0:
-            d = (
-                math.log(S_T_illus / S0) - (r - q - 0.5 * sigma * sigma) * T
-            ) / (sigma * math.sqrt(T))
-            p = _norm_cdf(-d) if is_call else _norm_cdf(d)
-        else:
-            p = 0.0
-
-    return (
-        f"最高情景收益（年化）：{illus_annual:.1%}"
-        f"｜风险中性实现概率约 {p:.0%}（上不封顶，以 ±20% 情景示意）"
-    )
-
-
 # ===========================================================================
 # v2 定价经济学核心：MC 诊断、报价经济学、连续损失度量、系数标定
 # ---------------------------------------------------------------------------
-# 与旧路径（MARKUP / HEDGE_COST_RATIO / evaluate_product 的 client_price）并存，
-# benchmark.py 仍用旧路径，下一波才切换。本节全部为纯函数 / 确定性计算。
+# 本节全部为纯函数 / 确定性计算。
 # ===========================================================================
 
 
@@ -1571,7 +1337,8 @@ def _mc_vanilla_barrier_stats(
 ) -> MCDiagnostics:
     """vanilla / barrier 的诊断 MC：月度步长 GBM，风险中性漂移，贴现终值。
 
-    barrier 触碰采用与 _mc_hit_prob 一致的月度步长近似（knock_out 触碰即提前终止）。
+    barrier 触碰在本函数内独立实现月度步长近似（knock_out 触碰即提前终止），
+    与 hurdle_hit_prob 的 P 测度 MC 同为月度观察口径，但不共享代码。
     损失口径：期权票据（非保本 vanilla/barrier）的最大损失是权利金（由 ClientLossMeasure
     的 premium 项承担），故此处逐路径损失记 0；保本票据地板为 1，损失恒 0。
     """
@@ -1684,7 +1451,7 @@ def mc_diagnostics(
     """统一 payoff sampler 产出的 MC 诊断量，按去掉 notional 的结构键缓存。
 
     snowball / autocallable 复用 _mc_stats（含二阶矩与事件计数）；
-    vanilla / barrier 走 _mc_vanilla_barrier_stats（复用 _mc_hit_prob 的月度触碰逻辑）。
+    vanilla / barrier 走 _mc_vanilla_barrier_stats（独立的风险中性月度触碰 MC）。
     风险中性漂移、贴现现值；同 seed 同结果（common random numbers）。
     """
     key = _diag_cache_key(product, market, n_paths, seed)
@@ -1762,7 +1529,7 @@ def mc_diagnostics(
 
 @dataclass(frozen=True)
 class QuotePolicy:
-    """报价系数（draft_codex §3 公式 + draft_opus §3.2 适配度）。
+    """报价系数（DESIGN_REFERENCE.md C§3 公式 + DESIGN_REFERENCE.md O§3.2 适配度）。
 
     a_* 为对客加成率系数、b_* 为对冲成本系数、client_cap / hedge_cap 为封顶。
     suit_* 为 suitability 四因子的权重（加权乘积的指数）与两个失配地板。
@@ -1842,7 +1609,7 @@ class QuoteEconomics:
 def _suitability(
     product: ProductSpec, client: ClientProfile, pricing: dict, policy: QuotePolicy
 ) -> tuple[float, dict]:
-    """客户适配度 ∈ [0,1]（draft_opus §3.2 四因子加权乘积）。
+    """客户适配度 ∈ [0,1]（DESIGN_REFERENCE.md O§3.2 四因子加权乘积）。
 
     四因子：产品类型白名单命中、保本偏好匹配、期限贴合度、hurdle_hit_prob
     相对 min_hit_prob 的余量。任一失配把加成率压向 0，使乱塞产品无利可图。
@@ -1893,7 +1660,7 @@ def _suitability(
 
 
 def _path_dependence(event_probs: dict) -> float:
-    """路径依赖度 P（draft_codex §3）：vanilla 为 0，否则 2·√mean(p(1−p))，clip 到 [0,1]。"""
+    """路径依赖度 P（DESIGN_REFERENCE.md C§3）：vanilla 为 0，否则 2·√mean(p(1−p))，clip 到 [0,1]。"""
     if not event_probs:
         return 0.0
     vals = [p * (1.0 - p) for p in event_probs.values()]
@@ -1913,7 +1680,7 @@ def quote_economics(
     product: ProductSpec,
     client: ClientProfile,
 ) -> QuoteEconomics:
-    """按 draft_codex §3 计算报价经济学，r_c 额外乘 draft_opus §3.2 的 suitability。
+    """按 DESIGN_REFERENCE.md C§3 计算报价经济学，r_c 额外乘 DESIGN_REFERENCE.md O§3.2 的 suitability。
 
     client_price = F + N·r_c·suit；hedging_cost = F + N·r_h；
     dealer_margin = N·(r_c·suit − r_h)（允许为负，不截断）。
@@ -2126,6 +1893,12 @@ def solve_quote_equilibrium(
         )
 
     fair_value = float(pricing["fair_value"])
+    if fair_value <= 0.0:
+        # 例如 BGK 平移后极远的敲入障碍：期权价值恰为 0，cash price 区间下端为 0，
+        # hurdle 收益率无定义。这类结构不可报价，而不是内部定价错误。
+        raise QuoteUnavailableError(
+            "premium-paid structure has non-positive fair value; not quotable"
+        )
     lower = fair_value
     upper = fair_value + product.notional * policy.client_cap
 
@@ -2211,7 +1984,7 @@ def solve_quote_equilibrium(
 
 
 # ---------------------------------------------------------------------------
-# 客户连续损失度量（draft_codex §7）
+# 客户连续损失度量（DESIGN_REFERENCE.md C§7）
 # ---------------------------------------------------------------------------
 
 
@@ -2304,7 +2077,7 @@ def client_loss_measure(
 # 系数标定：stochopia.benchmark_cli 的 calibrate-margin 子命令接线于此
 # ---------------------------------------------------------------------------
 
-# 与 benchmark._stress_loss 一致的冻结压力网格，但用 fair value 差避免 quote 公式循环。
+# 冻结压力网格：用 fair value 差衡量压力损失，避免 quote 公式循环。
 _STRESS_SCENARIOS = (("spot_down_20", 0.8, 0.0), ("spot_up_20", 1.2, 0.0), ("vol_up_10", 1.0, 0.10))
 
 
@@ -2338,10 +2111,18 @@ class StressLossProfile:
 def fair_value_stress_profile(
     product: ProductSpec,
     market: MarketState,
+    *,
+    base: dict | None = None,
 ) -> StressLossProfile:
-    """Return both sides of the frozen stress grid without sign conflation."""
+    """Return both sides of the frozen stress grid without sign conflation.
 
-    base = price_product(product, market)
+    ``base`` is the caller's already-computed ``price_product`` /
+    ``evaluate_product`` result for the same ``(product, market)``; passing it
+    avoids re-pricing the unstressed base.
+    """
+
+    if base is None:
+        base = price_product(product, market)
     if base is None:
         return StressLossProfile(
             0.0, "", 0.0, "", 0.0, "", "static_delta_v1", ()
@@ -2362,7 +2143,7 @@ def fair_value_stress_profile(
         # 压力仅扰动现货/波动率，不改写合约条款。对旧式
         # reference_spot=None 的发行时产品，在压力副本上显式冻结
         # 基准市场现货。这不仅锁定 strike/barrier，也锁定雪球/
-        # autocall 的隐式 1.03/1.05 敲出水平。
+        # autocall 的 SNOWBALL_KNOCK_OUT_PCT / AUTOCALL_TRIGGER_PCT 敲出水平。
         stressed_product = replace(
             product,
             reference_spot=_reference_spot(product, market.spot),
@@ -2423,13 +2204,6 @@ def fair_value_stress_profile(
     )
 
 
-def _fair_value_stress_loss(product: ProductSpec, market: MarketState) -> tuple[float, str]:
-    """Deprecated v2 alias for the client-long value-loss convention."""
-
-    profile = fair_value_stress_profile(product, market)
-    return profile.client_value_loss, profile.client_worst_stress_id
-
-
 def scale_quote_policy_markup(policy: QuotePolicy, factor: float) -> QuotePolicy:
     """按整体缩放因子缩放对客加成系数 a_*（对冲系数 b_* 保持不变）。
 
@@ -2486,20 +2260,23 @@ def evaluate_quote_policy(
         if pricing is None:
             continue
         diag = mc_diagnostics(product, market, n_paths=policy.diagnostic_paths, seed=seed)
-        stress = fair_value_stress_profile(product, market)
+        stress = fair_value_stress_profile(product, market, base=pricing)
         capacity = capacity_fn(client) if capacity_fn is not None else client.capital
-        equilibrium = solve_quote_equilibrium(
-            product,
-            market,
-            client,
-            pricing,
-            diag,
-            dealer_stress_loss=stress.dealer_hedged_stress_loss,
-            post_notional=product.notional,
-            capacity_notional=capacity,
-            policy=policy,
-        )
-        if not equilibrium.converged:
+        try:
+            equilibrium = solve_quote_equilibrium(
+                product,
+                market,
+                client,
+                pricing,
+                diag,
+                dealer_stress_loss=stress.dealer_hedged_stress_loss,
+                post_notional=product.notional,
+                capacity_notional=capacity,
+                policy=policy,
+            )
+        except QuoteUnavailableError:
+            equilibrium = None
+        if equilibrium is None or not equilibrium.converged:
             # Runtime fails this quote closed.  Calibration must mirror that
             # outcome without aborting the whole development grid.
             nonconverged += 1

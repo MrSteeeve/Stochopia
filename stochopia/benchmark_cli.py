@@ -5,11 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
-import hashlib
 import json
 import os
 import random
-import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
@@ -26,13 +24,13 @@ from .benchmark import (
     calibrate_risk_budget,
     enumerate_domain,
     load_market_snapshots,
-    oracle_candidate_grid,
     resolve_client_profile,
 )
+from .common import atomic_write_json, canonical_json
 from .products import ClientProfile, parse_product_spec
 from .market_builder import build_monthly_snapshots, load_daily_closes, write_market_snapshots
 from .benchmark_runner import STRATEGIES, compute_metrics, run_episode, trace_to_dict
-from .env_agents import EnvResponseCache, FrozenEnvAgent
+from .env_agents import PROVIDER_ERRORS, EnvResponseCache, FrozenEnvAgent
 from .environment import (
     TaskSuite,
     aggregate_evaluations,
@@ -40,9 +38,9 @@ from .environment import (
     EpisodeTask,
     LLMAgentPolicy,
     StochopiaStructurerEnv,
-    TrajectoryRecorder,
     create_api_agent_policy,
     load_evaluations,
+    policy_run_metadata,
     replay_and_evaluate,
     run_agent_episode as run_v3_agent_episode,
     save_evaluation_aggregate,
@@ -51,10 +49,11 @@ from .role_config import RoleConfigError, load_judges_config, load_role_specs
 from .llm import BaseLLMClient, LLMError, create_client, load_model_registry
 from .experiment import build_experiment_manifest, manifest_payload, paired_condition_contrasts
 from .pricing import QuotePolicy, calibrate_quote_policy, evaluate_quote_policy, scale_quote_policy_markup
-from .stats import cluster_bootstrap_ci, derive_seed, holm_adjust
+from .stats import cluster_bootstrap_ci, derive_seed
 from .judge import (
     DIMENSIONS,
     DimensionScore,
+    JudgeError,
     JudgeResult,
     aggregate_judge_bundle,
     build_judge_input,
@@ -63,94 +62,18 @@ from .judge import (
 )
 
 RUN_OUTPUT_SCHEMA_VERSION = "stochopia.run-output.v1"
-RUN_FINGERPRINT_VERSION = "stochopia.run-fingerprint.v1"
 
 
-def _canonical_json_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-        default=str,
-    ).encode("utf-8")
+def _json_value(value: object) -> object:
+    """JSON round-trip so in-memory metadata compares equal to a reloaded file."""
 
-
-def _sha256_json(value: object) -> str:
-    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
-
-
-def _source_implementation_sha256() -> str:
-    """Fingerprint the executable package sources and bundled prompts."""
-
-    package_root = Path(__file__).resolve().parent
-    digest = hashlib.sha256()
-    paths = sorted(
-        (
-            path
-            for pattern in ("*.py", "*.md")
-            for path in package_root.rglob(pattern)
-            if "__pycache__" not in path.parts
-        ),
-        key=lambda path: path.relative_to(package_root).as_posix(),
-    )
-    for path in paths:
-        relative = path.relative_to(package_root).as_posix()
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _file_sha256(path: Path | None) -> str | None:
-    if path is None:
-        return None
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return json.loads(canonical_json(value, default=str))
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:
-    """Durably replace one JSON result; partial files are never final results."""
+    """Durably replace one JSON result; key order is preserved as produced."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary_name = handle.name
-            json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_name, path)
-        temporary_name = None
-    finally:
-        if temporary_name is not None:
-            try:
-                Path(temporary_name).unlink()
-            except FileNotFoundError:
-                pass
-
-
-def _quarantine_invalid_result(path: Path) -> Path:
-    """Move an incomplete/stale result aside so the job can be rerun safely."""
-
-    raw = path.read_bytes()
-    digest = hashlib.sha256(raw).hexdigest()[:12]
-    candidate = path.with_name(f"{path.name}.invalid-{digest}")
-    suffix = 1
-    while candidate.exists():
-        candidate = path.with_name(f"{path.name}.invalid-{digest}-{suffix}")
-        suffix += 1
-    os.replace(path, candidate)
-    return candidate
+    atomic_write_json(path, payload, sort_keys=False)
 
 
 def _client() -> ClientProfile:
@@ -192,12 +115,10 @@ def _budget() -> RiskBudget:
 _ENV_ROLE_TYPES = ("client", "risk_control", "trading_desk")
 
 
-def _roles_config_meta(path: Path) -> tuple[str, str]:
-    """Return (npc_lineup_id, roles_config_sha256) for reproducible audit."""
-    raw = path.read_bytes()
-    sha = hashlib.sha256(raw).hexdigest()
-    data = yaml.safe_load(raw) or {}
-    return str(data.get("main_npc_lineup_id", "")), sha
+def _roles_config_meta(path: Path) -> dict[str, str]:
+    """Return the NPC lineup id recorded next to each roles-config result."""
+    data = yaml.safe_load(path.read_bytes()) or {}
+    return {"npc_lineup_id": str(data.get("main_npc_lineup_id", ""))}
 
 
 def _load_env_role_specs(roles_config: Path, registry):
@@ -268,7 +189,11 @@ def _add_v3_policy_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-steps-per-round", type=int, default=12)
     parser.add_argument("--history-records", type=int, default=32)
     parser.add_argument("--history-chars", type=int, default=96_000)
-    parser.add_argument("--redact-raw-output", action="store_true")
+    parser.add_argument(
+        "--redact-raw-output",
+        action="store_true",
+        help="do not record raw agent text; unparseable output is dropped before step()",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -382,7 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent.add_argument(
         "--redact-raw-output",
         action="store_true",
-        help="store only the response hash, not raw agent text, in the trajectory",
+        help="do not record raw agent text; unparseable output is dropped before step()",
     )
     agent.add_argument(
         "--output",
@@ -438,15 +363,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     evaluate = sub.add_parser(
         "evaluate-trajectory",
-        help="cryptographically verify and economically replay one v3 trajectory",
+        help="score one v3 trajectory from its recorded transitions",
     )
     evaluate.add_argument("trajectory", type=Path)
+    evaluate.add_argument(
+        "--replay",
+        action="store_true",
+        help="also re-run every action through a fresh environment and require exact equality",
+    )
     evaluate.add_argument("--suite", type=Path, default=None)
     evaluate.add_argument("--output", type=Path, required=True)
 
     aggregate_v3 = sub.add_parser(
         "aggregate-v3",
-        help="aggregate replay-verified v3 evaluation artifacts by policy",
+        help="aggregate v3 evaluation artifacts by policy",
     )
     aggregate_v3.add_argument("results_dir", type=Path)
     aggregate_v3.add_argument("--output-json", type=Path, required=True)
@@ -482,8 +412,9 @@ def build_parser() -> argparse.ArgumentParser:
     margin.add_argument(
         "--risk-budget-json",
         type=Path,
-        default=None,
-        help="frozen risk budget whose notional capacity runtime quotes use",
+        required=True,
+        help="frozen risk budget whose notional capacity runtime quotes use "
+             "(the same file later passed to run-episode/run-manifest)",
     )
     margin.add_argument(
         "--sensitivity-factors", nargs="+", type=float, default=[0.8, 1.0, 1.2],
@@ -525,6 +456,10 @@ def build_parser() -> argparse.ArgumentParser:
     agg.add_argument("--bootstrap-resamples", type=int, default=10_000)
     agg.add_argument("--n-permutations", type=int, default=20_000)
     agg.add_argument("--alpha", type=float, default=0.05)
+    agg.add_argument(
+        "--manifest", type=Path, default=None,
+        help="experiment manifest; reports per-cell complete/failed/missing jobs",
+    )
     agg.add_argument("--seed", type=int, default=20260802)
     jr = sub.add_parser(
         "judge-runs",
@@ -703,12 +638,6 @@ def _cmd_make_v3_suite(args: argparse.Namespace) -> int:
         split=args.split,
         tasks=tasks,
         metadata={
-            "market_csv_sha256": _file_sha256(args.csv),
-            "client_json_sha256": _file_sha256(args.client_json),
-            "risk_budget_json_sha256": _file_sha256(args.risk_budget_json),
-            "quote_policy_json_sha256": _file_sha256(
-                args.quote_policy_json
-            ),
             "episode_ids": requested,
             "generator": "frozen-market-episode-import-v1",
             "generator_seed": args.seed,
@@ -780,6 +709,7 @@ def _cmd_evaluate_trajectory(args: argparse.Namespace) -> int:
     result = replay_and_evaluate(
         args.trajectory,
         suite_hash=suite_hash,
+        replay=args.replay,
     )
     if suite is not None and result["task_hash"] not in {
         task.task_hash for task in suite.tasks
@@ -791,8 +721,7 @@ def _cmd_evaluate_trajectory(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {
-                "replay_verified": True,
-                "evaluation_hash": result["evaluation_hash"],
+                "replay_verified": result["replay_verified"],
                 "task_hash": result["task_hash"],
                 "output": str(args.output),
             },
@@ -870,7 +799,6 @@ def _cmd_run_v3_suite(args: argparse.Namespace) -> int:
                 not args.force
                 and trajectory_path.exists()
                 and summary_path.exists()
-                and TrajectoryRecorder.verify(trajectory_path)
             ):
                 try:
                     existing = json.loads(
@@ -879,8 +807,11 @@ def _cmd_run_v3_suite(args: argparse.Namespace) -> int:
                     existing_summary = json.loads(
                         summary_path.read_text(encoding="utf-8")
                     )
-                    expected_policy = dict(
-                        policy.reproducibility_metadata()
+                    expected_policy = policy_run_metadata(
+                        policy,
+                        max_history_records=args.history_records,
+                        max_history_chars=args.history_chars,
+                        record_raw_output=not args.redact_raw_output,
                     )
                     matches = (
                         existing.get("status") == "complete"
@@ -889,10 +820,8 @@ def _cmd_run_v3_suite(args: argparse.Namespace) -> int:
                         == task.task_hash
                         and existing.get("environment_configuration")
                         == environment.configuration
-                        and _sha256_json(
-                            existing.get("policy_run_metadata")
-                        )
-                        == _sha256_json(expected_policy)
+                        and existing.get("policy_run_metadata")
+                        == _json_value(expected_policy)
                         and existing_summary.get("suite_hash")
                         == suite.suite_hash
                         and existing_summary.get("replicate") == replicate
@@ -964,7 +893,6 @@ def _cmd_run_v3_suite(args: argparse.Namespace) -> int:
         "evaluation_count": len(evaluations),
         "infrastructure_failures": failures,
         "resumed_runs": resumed,
-        "aggregate_hash": aggregate["aggregate_hash"],
         "aggregate_path": str(aggregate_path),
     }
     _atomic_write_json(args.output_dir / "run-manifest.v3.json", run_manifest)
@@ -1020,7 +948,7 @@ def _cmd_calibrate(args: argparse.Namespace, snapshots: list) -> int:
 
 # ---------------------------------------------------------------------------
 # calibrate-margin: CLI wiring for stochopia.pricing.calibrate_quote_policy
-# (REDESIGN_PLAN.md §4/§5). Samples a fixed-seed subset of the shared
+# (BENCHMARK_PROTOCOL.md "`dealer_margin` economics"). Samples a fixed-seed subset of the shared
 # ProductDomainSpec lattice per (episode, round) development snapshot -- the
 # full lattice is tens of thousands of candidates, more than needed to hit the
 # 20-60% positive-margin / non-degenerate-ranking target and far more MC than
@@ -1060,15 +988,12 @@ def _cmd_calibrate_margin(args: argparse.Namespace, snapshots: list) -> int:
             dev_cases.append((product, market, round_client))
 
     kwargs = {"factors": tuple(args.factors)} if args.factors else {}
-    risk_budget_path = getattr(args, "risk_budget_json", None)
-    if risk_budget_path is not None:
-        frozen_budget = RiskBudget(
-            **json.loads(risk_budget_path.read_text(encoding="utf-8"))
-        )
-        capacity_fn = lambda _client: frozen_budget.notional
-    else:
-        frozen_budget = None
-        capacity_fn = lambda current_client: current_client.capital
+    # Runtime quotes use risk_budget.notional as the Q² capacity, so the
+    # calibration must too (client.capital would mis-scale the capacity term).
+    frozen_budget = RiskBudget(
+        **json.loads(args.risk_budget_json.read_text(encoding="utf-8"))
+    )
+    capacity_fn = lambda _client: frozen_budget.notional
     calibrated, report = calibrate_quote_policy(
         dev_cases,
         seed=args.seed,
@@ -1092,9 +1017,7 @@ def _cmd_calibrate_margin(args: argparse.Namespace, snapshots: list) -> int:
     report["n_snapshots"] = len(wanted_snapshots)
     report["n_dev_cases"] = len(dev_cases)
     report["seed"] = args.seed
-    report["capacity_source"] = (
-        "risk_budget.notional" if frozen_budget is not None else "client.capital"
-    )
+    report["capacity_source"] = "risk_budget.notional"
     report["sensitivity"] = sensitivity_rows
 
     args.report_output.parent.mkdir(parents=True, exist_ok=True)
@@ -1116,38 +1039,81 @@ def _cmd_calibrate_margin(args: argparse.Namespace, snapshots: list) -> int:
     return 0
 
 
-def _run_fingerprint(
-    *,
-    manifest: dict,
-    snapshots: list,
+def _model_identity(registry, name: str) -> dict:
+    """Registry resolution of one model name (no secrets, no hashing)."""
+    config = (registry or {}).get(name)
+    if config is None:
+        return {"name": name}
+    return {
+        "name": name,
+        "provider": config.provider,
+        "model": config.model,
+        "base_url": config.base_url,
+        "max_tokens": config.max_tokens,
+        "timeout": config.timeout,
+    }
+
+
+def _economic_inputs(
+    market_csv: Path,
     client_payload: dict,
     budget_payload: dict,
     quote_policy: QuotePolicy | None,
-    models_config: Path,
-    roles_config: Path | None,
-) -> tuple[str, dict]:
-    inputs = {
-        "fingerprint_version": RUN_FINGERPRINT_VERSION,
-        "run_output_schema_version": RUN_OUTPUT_SCHEMA_VERSION,
-        "manifest": manifest,
-        "market_snapshots": [asdict(snapshot) for snapshot in snapshots],
-        "client": client_payload,
-        "risk_budget": budget_payload,
-        "quote_policy": asdict(quote_policy or QuotePolicy()),
-        "models_config_sha256": _file_sha256(models_config),
-        "roles_config_sha256": _file_sha256(roles_config),
-        "implementation_sha256": _source_implementation_sha256(),
-    }
-    return _sha256_json(inputs), inputs
-
-
-def _completed_result_matches(
-    path: Path,
+    env_specs: dict | None,
     *,
-    run_fingerprint: str,
-    job_fingerprint: str,
-    job_id: str,
-) -> bool:
+    registry=None,
+    model: str | None = None,
+) -> dict:
+    """Inputs of a v2 run, recorded in the result and checked on resume.
+
+    ``tested_model`` is the only entry that legitimately differs between
+    result files of one benchmark (``aggregate`` excludes it when checking
+    that pooled files share inputs).
+    """
+    env_roles = {}
+    for spec in (env_specs or {}).values():
+        if spec.role not in _ENV_ROLE_TYPES:
+            continue
+        prompt_path = Path(spec.system_prompt_file)
+        env_roles[spec.role] = {
+            "role_id": spec.id,
+            "model": _model_identity(registry, spec.inference.model_ref),
+            "temperature": spec.inference.temperature,
+            "max_tokens": spec.inference.max_tokens,
+            "seed_policy": spec.inference.seed_policy,
+            "seed_offset": spec.inference.seed_offset,
+            "history_scope": spec.history_scope,
+            "output_schema": spec.output_schema,
+            "system_prompt_file": str(prompt_path.resolve()),
+            "system_prompt": prompt_path.read_text(encoding="utf-8"),
+        }
+    inputs = {
+        "market_csv": str(Path(market_csv).resolve()),
+        "client_profile": asdict(ClientProfile(**client_payload)),
+        "risk_budget": asdict(RiskBudget(**budget_payload)),
+        "quote_policy": asdict(quote_policy or QuotePolicy()),
+        "role_models": {role: item["model"]["name"] for role, item in env_roles.items()},
+        "env_roles": env_roles,
+    }
+    if model is not None:
+        inputs["tested_model"] = _model_identity(registry, model)
+    return _json_value(inputs)
+
+
+def _failed_result_payload(job_record: dict, inputs: dict, error: str, trace=None) -> dict:
+    """A visible, non-resumable record of one failed v2 job."""
+    return {
+        "schema_version": RUN_OUTPUT_SCHEMA_VERSION,
+        "complete": False,
+        "status": "failed",
+        "error": error,
+        "job": job_record,
+        "inputs": inputs,
+        "trace": trace_to_dict(trace) if trace is not None else None,
+    }
+
+
+def _completed_result_matches(path: Path, *, job_id: str, inputs: dict | None = None) -> bool:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -1158,10 +1124,9 @@ def _completed_result_matches(
     return (
         payload.get("schema_version") == RUN_OUTPUT_SCHEMA_VERSION
         and payload.get("complete") is True
-        and payload.get("run_fingerprint") == run_fingerprint
-        and payload.get("job_fingerprint") == job_fingerprint
         and isinstance(job, dict)
         and job.get("job_id") == job_id
+        and payload.get("inputs") == inputs
         and isinstance(payload.get("trace"), dict)
         and isinstance(payload.get("metrics"), dict)
     )
@@ -1187,17 +1152,7 @@ def _cmd_run_manifest(args: argparse.Namespace, snapshots: list) -> int:
     if args.roles_config is not None:
         env_specs = _load_env_role_specs(args.roles_config, registry)
         env_cache = _env_cache(args.env_cache_dir)
-        npc_lineup_id, roles_sha = _roles_config_meta(args.roles_config)
-        roles_meta = {"npc_lineup_id": npc_lineup_id, "roles_config_sha256": roles_sha}
-    run_fingerprint, fingerprint_inputs = _run_fingerprint(
-        manifest=manifest,
-        snapshots=snapshots,
-        client_payload=client_payload,
-        budget_payload=budget_payload,
-        quote_policy=quote_policy,
-        models_config=args.models_config,
-        roles_config=args.roles_config,
-    )
+        roles_meta = _roles_config_meta(args.roles_config)
     by_episode: dict[str, list] = {}
     for snapshot in snapshots:
         by_episode.setdefault(snapshot.episode_id, []).append(snapshot)
@@ -1207,33 +1162,20 @@ def _cmd_run_manifest(args: argparse.Namespace, snapshots: list) -> int:
         if not isinstance(job, dict) or not isinstance(job.get("job_id"), str):
             raise SystemExit(f"manifest contains an invalid job at index {index - 1}")
         out_path = args.outputs_dir / f"{job['job_id']}.json"
-        job_fingerprint = _sha256_json(
-            {"run_fingerprint": run_fingerprint, "job": job}
+        inputs = _economic_inputs(
+            args.csv, client_payload, budget_payload, quote_policy, env_specs,
+            registry=registry, model=job.get("model"),
         )
-        if out_path.exists():
-            if _completed_result_matches(
-                out_path,
-                run_fingerprint=run_fingerprint,
-                job_fingerprint=job_fingerprint,
-                job_id=job["job_id"],
-            ):
-                skipped += 1
-                continue
-            quarantined = _quarantine_invalid_result(out_path)
-            print(
-                json.dumps(
-                    {
-                        "job_id": job["job_id"],
-                        "quarantined_stale_or_incomplete_result": str(quarantined),
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
+        if out_path.exists() and _completed_result_matches(
+            out_path, job_id=job["job_id"], inputs=inputs,
+        ):
+            skipped += 1
+            continue
         episode_snapshots = by_episode.get(job["episode_id"])
         if not episode_snapshots:
             raise SystemExit(f"manifest references unknown episode: {job['episode_id']}")
         print(f"[{index}/{len(jobs)}] {job['job_id']} ...", flush=True)
+        job_record = {**job, **roles_meta} if roles_meta else job
         try:
             env_agents = (
                 _make_env_agents(env_specs, registry, env_cache) if env_specs is not None else None
@@ -1248,20 +1190,29 @@ def _cmd_run_manifest(args: argparse.Namespace, snapshots: list) -> int:
             )
             llm = create_client(job["model"], registry)
             trace = asyncio.run(run_episode(env, llm, strategy=job["strategy"], seed=job.get("seed")))
+            if trace.status != "complete":
+                failed += 1
+                _atomic_write_json(
+                    out_path,
+                    _failed_result_payload(job_record, inputs, str(trace.error), trace),
+                )
+                print(json.dumps({"job_id": job["job_id"], "error": str(trace.error)[:300]},
+                                 ensure_ascii=False), flush=True)
+                continue
+            metrics = compute_metrics(trace)
         except Exception as exc:  # noqa: BLE001 — 单个作业失败不应终止整批夜跑
             failed += 1
-            print(json.dumps({"job_id": job["job_id"], "error": str(exc)[:300]}, ensure_ascii=False), flush=True)
+            error = f"{type(exc).__name__}: {exc}"[:2000]
+            _atomic_write_json(out_path, _failed_result_payload(job_record, inputs, error))
+            print(json.dumps({"job_id": job["job_id"], "error": error[:300]}, ensure_ascii=False), flush=True)
             continue
-        job_record = {**job, **roles_meta} if roles_meta else job
         payload = {
             "schema_version": RUN_OUTPUT_SCHEMA_VERSION,
             "complete": True,
-            "run_fingerprint": run_fingerprint,
-            "job_fingerprint": job_fingerprint,
-            "fingerprint_inputs": fingerprint_inputs,
             "job": job_record,
+            "inputs": inputs,
             "trace": trace_to_dict(trace),
-            "metrics": compute_metrics(trace),
+            "metrics": metrics,
         }
         _atomic_write_json(out_path, payload)
         done += 1
@@ -1270,14 +1221,13 @@ def _cmd_run_manifest(args: argparse.Namespace, snapshots: list) -> int:
         "skipped": skipped,
         "failed": failed,
         "total": len(jobs),
-        "run_fingerprint": run_fingerprint,
     }, ensure_ascii=False))
     return 1 if failed else 0
 
 
 # ---------------------------------------------------------------------------
-# judge-runs: offline blind judge batch (REDESIGN_PLAN.md §4/§6,
-# draft_codex.md §6, draft_opus.md §6). Runs entirely outside run-manifest:
+# judge-runs: offline blind judge batch (BENCHMARK_PROTOCOL.md "Offline judge protocol",
+# DESIGN_REFERENCE.md C§6, DESIGN_REFERENCE.md O§6). Runs entirely outside run-manifest:
 # it only *reads* frozen `*.json` results and writes independent
 # `<file>.judges.json` + `judge_manifest.json`; it never touches the original
 # result files.
@@ -1299,7 +1249,7 @@ def _collect_voluntary_samples(results_dir: Path) -> list[dict]:
             continue
         payload = json.loads(path.read_text(encoding="utf-8"))
         trace = payload.get("trace")
-        if not isinstance(trace, dict):
+        if not isinstance(trace, dict) or payload.get("complete") is not True:
             continue
         job = payload.get("job") or {}
         model = job.get("model") or payload.get("model") or ""
@@ -1383,7 +1333,9 @@ async def _judge_call_with_retries(
                 model_name=model_name, repeat=repeat, seed=seed,
             )
             return result, None
-        except Exception as exc:  # noqa: BLE001 — one bad judge call must not kill the batch
+        except (*PROVIDER_ERRORS, JudgeError) as exc:
+            # Provider/transport failures and malformed judge output are
+            # recorded as missing; programming errors propagate.
             last_error = str(exc)[:300]
     return None, last_error
 
@@ -1556,8 +1508,8 @@ def _cmd_judge_runs(args: argparse.Namespace) -> int:
     return 0
 
 
-# v2 canonical primary/diagnostic metric names (see REDESIGN_PLAN.md §4 and
-# draft_codex.md §5/§9). Older or partially-finished result directories may
+# v2 canonical primary/diagnostic metric names (see BENCHMARK_PROTOCOL.md "Legacy v2 canonical metrics" and
+# DESIGN_REFERENCE.md C§5/§9). Older or partially-finished result directories may
 # be missing some of these (runner migration in progress); aggregate reads
 # whatever is present and reports the rest as missing rather than failing.
 CANONICAL_METRICS = (
@@ -1589,17 +1541,33 @@ def _judge_result_from_entry(entry: dict) -> JudgeResult | None:
 
 
 def _load_judge_entries(results_dir: Path) -> list[dict]:
+    """Entries of the judge files written by the latest judge-runs only.
+
+    A ``*.judges.json`` left over from an earlier judge-runs (different seed,
+    salt, sample, models or repeats) is ignored: it must belong to a source
+    file selected in ``judge_manifest.json`` and carry the same metadata.
+    """
+    manifest_path = results_dir / "judge_manifest.json"
+    if not manifest_path.is_file():
+        return []
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selected_files = {item.get("file") for item in manifest.get("selected") or []}
+    meta_keys = ("seed", "salt", "judge_models", "repeats")
     entries: list[dict] = []
     for path in sorted(results_dir.glob("*.judges.json")):
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("source_file") not in selected_files or any(
+            payload.get(key) != manifest.get(key) for key in meta_keys
+        ):
+            continue
         entries.extend(payload.get("entries") or [])
     return entries
 
 
 def _judge_markdown_lines(results_dir: Path) -> list[str]:
     """Six-dimension median/IQR/missing plus inter-judge reliability, appended
-    to the aggregate markdown when *.judges.json files exist (REDESIGN_PLAN.md
-    §4/§6: judge dimensions are reported separately, never merged into the
+    to the aggregate markdown when *.judges.json files exist (BENCHMARK_PROTOCOL.md
+    "Offline judge protocol": judge dimensions are reported separately, never merged into the
     economic ranking)."""
     entries = _load_judge_entries(results_dir)
     ok_entries = [entry for entry in entries if entry.get("status") == "ok"]
@@ -1675,43 +1643,108 @@ def _judge_markdown_lines(results_dir: Path) -> list[str]:
     return lines
 
 
+def _job_cell(payload: dict) -> tuple[str, str]:
+    job = payload.get("job") or {}
+    trace = payload.get("trace") or {}
+    return (
+        job.get("model") or payload.get("model") or "?",
+        job.get("condition") or trace.get("condition") or "?",
+    )
+
+
+def _manifest_coverage(manifest_path: Path, complete_ids: set, failed_ids: set) -> list[dict]:
+    """Per (model, condition) cell: expected manifest jobs vs complete/failed/missing."""
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("jobs"), list):
+        raise SystemExit(f"invalid experiment manifest: {manifest_path}")
+    cells: dict[tuple[str, str], dict] = {}
+    for job in manifest["jobs"]:
+        key = (str(job.get("model")), str(job.get("condition")))
+        cell = cells.setdefault(key, {
+            "model": key[0], "condition": key[1],
+            "expected": 0, "complete": 0, "failed": 0, "missing": 0, "missing_job_ids": [],
+        })
+        cell["expected"] += 1
+        job_id = job.get("job_id")
+        if job_id in complete_ids:
+            cell["complete"] += 1
+        elif job_id in failed_ids:
+            cell["failed"] += 1
+        else:
+            cell["missing"] += 1
+            cell["missing_job_ids"].append(job_id)
+    return [cells[key] for key in sorted(cells)]
+
+
 def _cmd_aggregate(args: argparse.Namespace) -> int:
     rows: list[dict] = []
-    run_fingerprints: set[str] = set()
-    legacy_unfingerprinted = 0
+    pooled: tuple[object, str] | None = None
+    tested_models: dict[str, tuple[object, str]] = {}
+    skipped_unversioned: list[str] = []
+    failed: list[dict] = []
+    complete_ids: set = set()
     for path in sorted(args.results_dir.glob("*.json")):
+        if path.name.endswith(".judges.json") or path.name == "judge_manifest.json":
+            continue
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != RUN_OUTPUT_SCHEMA_VERSION:
+            # Old-schema (or foreign) files carry no recorded inputs and cannot
+            # be checked for poolability.
+            skipped_unversioned.append(path.name)
+            continue
+        job = payload.get("job") or {}
+        job_id = job.get("job_id") or path.stem
+        if payload.get("complete") is not True:
+            model, condition = _job_cell(payload)
+            failed.append({
+                "file": path.name, "job_id": job_id, "model": model, "condition": condition,
+                "status": payload.get("status") or "incomplete",
+                "error": str(payload.get("error") or "")[:300],
+            })
+            continue
         metrics = payload.get("metrics")
         if not isinstance(metrics, dict):
             continue
-        fingerprint = payload.get("run_fingerprint")
-        if fingerprint is None:
-            legacy_unfingerprinted += 1
-        elif isinstance(fingerprint, str) and fingerprint:
-            run_fingerprints.add(fingerprint)
-        else:
-            raise SystemExit(f"invalid run_fingerprint in result: {path}")
-        if (
-            payload.get("schema_version") == RUN_OUTPUT_SCHEMA_VERSION
-            and payload.get("complete") is not True
-        ):
-            raise SystemExit(f"incomplete v3 result cannot be aggregated: {path}")
-        job = payload.get("job") or {}
+        inputs = payload.get("inputs")
+        shared = (
+            {key: value for key, value in inputs.items() if key != "tested_model"}
+            if isinstance(inputs, dict) else inputs
+        )
+        if pooled is None:
+            pooled = (shared, path.name)
+        elif shared != pooled[0]:
+            raise SystemExit(
+                f"refusing to pool result files with different inputs: {pooled[1]} vs {path.name}"
+            )
+        model_name = job.get("model") or payload.get("model") or ""
+        tested = inputs.get("tested_model") if isinstance(inputs, dict) else None
+        previous = tested_models.setdefault(model_name, (tested, path.name))
+        if previous[0] != tested:
+            raise SystemExit(
+                f"refusing to pool model {model_name!r} with different registry "
+                f"resolutions: {previous[1]} vs {path.name}"
+            )
+        complete_ids.add(job_id)
         rows.append({
             "file": path.name,
-            "model": job.get("model") or payload.get("model") or "",
+            "model": model_name,
             "strategy": job.get("strategy"),
-            "run_fingerprint": fingerprint,
             **metrics,
         })
+    coverage = (
+        _manifest_coverage(args.manifest, complete_ids, {item["job_id"] for item in failed})
+        if getattr(args, "manifest", None) is not None else None
+    )
     if not rows:
+        if args.output_md and (failed or skipped_unversioned or coverage is not None):
+            args.output_md.parent.mkdir(parents=True, exist_ok=True)
+            args.output_md.write_text("\n".join(
+                ["# Aggregate report"]
+                + _coverage_markdown_lines(failed, skipped_unversioned, coverage)
+            ) + "\n", encoding="utf-8")
+        print(json.dumps({"failed_results": failed, "skipped_unversioned_files": skipped_unversioned,
+                          "manifest_coverage": coverage}, ensure_ascii=False))
         raise SystemExit(f"no result json with metrics found in {args.results_dir}")
-    if len(run_fingerprints) > 1 or (run_fingerprints and legacy_unfingerprinted):
-        details = sorted(run_fingerprints)
-        raise SystemExit(
-            "refusing to aggregate mixed run fingerprints: "
-            f"fingerprints={details}, legacy_unfingerprinted={legacy_unfingerprinted}"
-        )
 
     missing_counts = {
         name: sum(1 for row in rows if not isinstance(row.get(name), (int, float)))
@@ -1737,6 +1770,7 @@ def _cmd_aggregate(args: argparse.Namespace) -> int:
             })
     if args.output_md:
         lines = _aggregate_markdown(rows, args, fully_missing, partially_missing)
+        lines.extend(_coverage_markdown_lines(failed, skipped_unversioned, coverage))
         lines.extend(_judge_markdown_lines(args.results_dir))
         args.output_md.parent.mkdir(parents=True, exist_ok=True)
         args.output_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1744,12 +1778,45 @@ def _cmd_aggregate(args: argparse.Namespace) -> int:
         "rows": len(rows),
         "csv": str(args.output_csv),
         "md": str(args.output_md) if args.output_md else None,
-        "run_fingerprint": next(iter(run_fingerprints), None),
-        "legacy_unfingerprinted_rows": legacy_unfingerprinted,
         "fully_missing_metrics": fully_missing,
         "partially_missing_metrics": partially_missing,
+        "failed_results": failed,
+        "skipped_unversioned_files": skipped_unversioned,
+        "manifest_coverage": coverage,
     }, ensure_ascii=False))
     return 0
+
+
+def _coverage_markdown_lines(
+    failed: list[dict], skipped_unversioned: list[str], coverage: list[dict] | None,
+) -> list[str]:
+    lines = ["", "## Run coverage", ""]
+    if skipped_unversioned:
+        lines.append(
+            f"> skipped {len(skipped_unversioned)} file(s) without "
+            f"`schema_version: {RUN_OUTPUT_SCHEMA_VERSION}`: " + ", ".join(skipped_unversioned)
+        )
+        lines.append("")
+    if failed:
+        lines.append("| file | model | condition | status | error |")
+        lines.append("|---|---|---|---|---|")
+        for item in failed:
+            error = item["error"].replace("|", "/").replace("\n", " ")
+            lines.append(
+                f"| {item['file']} | {item['model']} | {item['condition']} | {item['status']} | {error} |"
+            )
+        lines.append("")
+    if coverage is not None:
+        lines.append("| model | condition | expected | complete | failed | missing |")
+        lines.append("|---|---|---|---|---|---|")
+        for cell in coverage:
+            lines.append(
+                f"| {cell['model']} | {cell['condition']} | {cell['expected']} | "
+                f"{cell['complete']} | {cell['failed']} | {cell['missing']} |"
+            )
+    elif not failed and not skipped_unversioned:
+        lines.append("no failed or skipped result files (pass --manifest to check missing jobs)")
+    return lines
 
 
 def _aggregate_markdown(
@@ -1764,18 +1831,21 @@ def _aggregate_markdown(
     lines = ["# Aggregate report", ""]
     if fully_missing:
         lines.append(
-            "> missing metrics (absent from every result file in this directory -- "
-            "likely an old-schema or partially-finished run): " + ", ".join(fully_missing)
+            "> metrics undefined in every result file (a conditional metric is None when "
+            "its conditioning event never occurred, e.g. no voluntary accepted trade or "
+            "no hard-passed submission; or the field is absent from the result): "
+            + ", ".join(fully_missing)
         )
     if partially_missing:
         lines.append(
-            "> partially missing metrics (absent from some result files; those rows "
-            "are skipped for the metric): " + ", ".join(partially_missing)
+            "> metrics undefined in some result files (conditioning event absent or "
+            "field missing; those rows are skipped for the metric): " + ", ".join(partially_missing)
         )
     if fully_missing or partially_missing:
         lines.append("")
 
-    lines.append("## Per (model, condition): mean +/- 95% CI (cluster bootstrap over episode_id)")
+    level = f"{100.0 * (1.0 - args.alpha):g}%"
+    lines.append(f"## Per (model, condition): mean +/- {level} CI (cluster bootstrap over episode_id)")
     lines.append("")
     header = ["model", "condition", "n_rows", "n_episodes"] + available_metrics
     lines.append("| " + " | ".join(header) + " |")
@@ -1793,7 +1863,10 @@ def _aggregate_markdown(
                 usable, name, cluster_key="episode_id",
                 n_resamples=args.bootstrap_resamples, alpha=args.alpha, seed=metric_seed,
             )
-            cells.append(f"{mean:.4g} [{lo:.4g}, {hi:.4g}]")
+            cells.append(
+                f"{mean:.4g} [{lo:.4g}, {hi:.4g}]" if lo is not None
+                else f"{mean:.4g} [CI n/a: 1 episode]"
+            )
         lines.append("| " + " | ".join(cells) + " |")
 
     lines.append("")
@@ -1805,7 +1878,7 @@ def _aggregate_markdown(
     )
     lines.append("")
     contrast_header = [
-        "model", "metric", "contrast", "mean_drop", "ci_95", "n_pairs",
+        "model", "metric", "contrast", "mean_drop", f"ci_{level}", "n_pairs",
         "wilcoxon_p", "wilcoxon_p_holm", "permutation_p",
     ]
     lines.append("| " + " | ".join(contrast_header) + " |")
@@ -1826,6 +1899,7 @@ def _aggregate_markdown(
                 result = paired_condition_contrasts(
                     usable, metric, seed=contrast_seed,
                     n_resamples=args.bootstrap_resamples, n_permutations=args.n_permutations,
+                    alpha=args.alpha,
                 )
             except BenchmarkError:
                 continue
@@ -1835,7 +1909,7 @@ def _aggregate_markdown(
                 if not stats["n_pairs"]:
                     continue
                 ci = stats["ci"]
-                ci_text = f"[{ci[0]:.4g}, {ci[1]:.4g}]" if ci else "-"
+                ci_text = f"[{ci[0]:.4g}, {ci[1]:.4g}]" if ci else "n/a (n_pairs<2)"
                 holm_p = holm.get(contrast_name)
                 flag = "*" if holm_p is not None and holm_p < args.alpha else ""
                 lines.append("| " + " | ".join([
@@ -1901,29 +1975,52 @@ def main(argv: list[str] | None = None) -> int:
         budget_payload = json.loads(args.risk_budget_json.read_text(encoding="utf-8"))
         registry = load_model_registry(args.models_config)
         env_agents = None
+        specs = None
         roles_meta: dict = {}
         if args.roles_config is not None:
             specs = _load_env_role_specs(args.roles_config, registry)
             env_agents = _make_env_agents(specs, registry, _env_cache(args.env_cache_dir))
-            npc_lineup_id, roles_sha = _roles_config_meta(args.roles_config)
-            roles_meta = {"npc_lineup_id": npc_lineup_id, "roles_config_sha256": roles_sha}
+            roles_meta = _roles_config_meta(args.roles_config)
+        quote_policy = _load_quote_policy(args.quote_policy_json)
         episode_env = LongHorizonEnvironment(
             selected,
             ClientProfile(**client_payload),
             RiskBudget(**budget_payload),
             BenchmarkCondition(full_information=args.full, dynamic=not args.static),
-            quote_policy=_load_quote_policy(args.quote_policy_json),
+            quote_policy=quote_policy,
             env_agents=env_agents,
         )
         llm = create_client(args.model, registry)
-        trace = asyncio.run(run_episode(episode_env, llm, strategy=args.strategy, seed=args.seed))
-        payload = {"model": args.model, "trace": trace_to_dict(trace), "metrics": compute_metrics(trace)}
+        inputs = _economic_inputs(
+            args.csv, client_payload, budget_payload, quote_policy, specs,
+            registry=registry, model=args.model,
+        )
+        failure: Exception | None = None
+        try:
+            trace = asyncio.run(run_episode(episode_env, llm, strategy=args.strategy, seed=args.seed))
+            if trace.status != "complete":
+                payload = _failed_result_payload({}, inputs, str(trace.error), trace)
+            else:
+                payload = {
+                    "schema_version": RUN_OUTPUT_SCHEMA_VERSION,
+                    "complete": True,
+                    "model": args.model,
+                    "inputs": inputs,
+                    "trace": trace_to_dict(trace),
+                    "metrics": compute_metrics(trace),
+                }
+        except Exception as exc:  # noqa: BLE001 — record the failure, then re-raise
+            failure = exc
+            payload = _failed_result_payload({}, inputs, f"{type(exc).__name__}: {exc}"[:2000])
+        payload.setdefault("model", args.model)
         if roles_meta:
             payload.update(roles_meta)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(json.dumps({"output": str(args.output), "metrics": payload["metrics"]}, ensure_ascii=False))
-        return 0
+        _atomic_write_json(args.output, payload)
+        if failure is not None:
+            raise failure
+        print(json.dumps({"output": str(args.output), "status": payload.get("status", "complete"),
+                          "metrics": payload.get("metrics")}, ensure_ascii=False))
+        return 0 if payload["complete"] else 1
 
     product = parse_product_spec(json.loads(args.product_json.read_text(encoding="utf-8")))
     env = LongHorizonEnvironment(

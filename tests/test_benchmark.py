@@ -20,11 +20,9 @@ from stochopia.benchmark import (
     TradingDesk,
     WorkflowOutcome,
     calibrate_risk_budget,
-    carry_sensitivity,
     client_contract_pass,
     enumerate_domain,
     load_market_snapshots,
-    option_implied_forward,
     oracle_best_quote,
     settle_submission,
     validate_domain,
@@ -161,10 +159,6 @@ def test_market_volatility_fallback_and_no_raw_chain_leakage():
     assert brief["volatility_source"] == "atm_iv_3m"
     assert first.pricing_volatility(1) == (0.22, "atm_iv_1m")
 
-
-def test_option_implied_forward_absorbs_carry():
-    result = option_implied_forward(call=105.0, put=95.0, strike=6000.0, rate=0.02, years=0.5)
-    assert result == pytest.approx(6010.10050167)
 
 
 def test_trend_alpha_reaches_runtime_quote_and_does_not_cross_contaminate_cache():
@@ -402,7 +396,7 @@ def test_partial_settlement_redacts_contract_thresholds():
     assert "query" in hurdle["reason"]
 
 
-def test_client_contract_pass_pure_function_mirrors_would_buy_dimensions():
+def test_client_contract_pass_pure_function_checks_every_client_dimension():
     cli = client(allowed=["snowball"])  # vanilla off whitelist
     pricing = {
         "loss_frac": 0.05,
@@ -433,9 +427,12 @@ def test_dealer_margin_is_not_one_percent_of_fair_value():
     assert abs(call["dealer_margin"] - 0.01 * call["fair_value"]) > 1.0
     # Margin per unit notional varies with structure risk (was identically constant).
     assert call["margin_rate"] != snow["margin_rate"]
-    # public payload exposes margin_rate / suitability but never the breakdown.
-    assert "margin_rate" in call and "suitability" in call
+    # public payload exposes margin_rate but never the breakdown; suitability is
+    # a function of the hidden mandate and only Full information sees it.
+    assert "margin_rate" in call and "suitability" not in call
     assert "breakdown" not in call
+    full_call = make_env(full=True, cli=permissive_client()).request_quote(product())
+    assert "suitability" in full_call
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +568,7 @@ def test_maturity_closes_position_into_cashflow_and_zero_sum_pnl_ledger():
         principal_protected=(False,),
     )
     env = make_env(
+        full=True,
         dynamic=True,
         cli=permissive_client(),
         domain=one_month_domain,
@@ -741,12 +739,6 @@ def test_budget_calibration_is_explicit_and_freezable():
     assert "freeze" in report["warning"]
 
 
-def test_carry_sensitivity_reports_pre_registered_tolerance():
-    report = carry_sensitivity(product(maturity=6), snapshots()[0], client(), PortfolioState(), budget())
-    assert report["shock_bp"] == 25.0
-    assert len(report["rows"]) == 3
-    assert report["max_fv_change_pct_notional"] >= 0
-
 
 # ---------------------------------------------------------------------------
 # v2: settle_submission is a pure (no-I/O) composition of the three env roles
@@ -756,7 +748,7 @@ def test_carry_sensitivity_reports_pre_registered_tolerance():
 def _role(role_id, action, *, degraded=False) -> RoleResponse:
     return RoleResponse(
         role_id=role_id, status="error" if degraded else "ok", action=action,
-        payload={}, narrative="", cited_fact_ids=(), raw_hash="", degraded=degraded,
+        payload={}, narrative="", cited_fact_ids=(), degraded=degraded,
     )
 
 
@@ -799,3 +791,183 @@ def test_settle_submission_missing_or_degraded_role_marks_degraded():
         _role("risk_control", "approve"), _role("client", "accept"),
     )
     assert degraded.degraded is True
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: non-converged quotes, autocall settlement, schema, consult scope
+# ---------------------------------------------------------------------------
+
+
+def _fail_first_quote(monkeypatch):
+    from stochopia.benchmark import QuoteNotConvergedError
+
+    original = TradingDesk.quote
+
+    def quote(self, product, snapshot, client, portfolio, state_version, index):
+        if index == 1:
+            raise QuoteNotConvergedError("quote equilibrium did not converge (test)")
+        return original(self, product, snapshot, client, portfolio, state_version, index)
+
+    monkeypatch.setattr(TradingDesk, "quote", quote)
+
+
+def test_oracle_skips_and_counts_nonconverged_lattice_points(monkeypatch):
+    _fail_first_quote(monkeypatch)
+    skipped: list = []
+    result = oracle_best_quote(
+        SMALL_DOMAIN, snapshots()[0], permissive_client(), PortfolioState(), budget(),
+        nonconverged=skipped,
+    )
+    assert result is not None
+    assert len(skipped) == 1
+
+
+def test_budget_calibration_skips_nonconverged_candidates(monkeypatch):
+    _fail_first_quote(monkeypatch)
+    products = [product(notional=value) for value in (400_000, 1_000_000, 2_000_000)]
+    base = RiskBudget(1_000_000, 500_000, 1_000_000, 100_000, 500_000)
+    report = calibrate_risk_budget(
+        products, [(snapshots()[0], client(), PortfolioState())], base, factors=(1.0,),
+    )
+    row = report["grid"][0]
+    assert row["skipped_nonconverged"] == 1
+    assert row["total"] == 2
+
+
+def test_knocked_in_autocall_redeems_without_coupon_after_recovery():
+    """Settlement follows the pricing contract: knocked in -> min(S_T/S0, 1)."""
+    from stochopia.benchmark import Position, _position_settlement_amount
+
+    note = ProductSpec(
+        product_type="autocallable", notional=1_000_000, maturity_months=3,
+        strike_pct=1.0, barrier_pct=0.85, barrier_type="knock_in", coupon_rate=0.08,
+        participation_rate=1.0, principal_protected=False, target_client="institutional",
+        pitch="p", hedging_plan="h", barrier_direction="down",
+    )
+    position = Position(
+        "P1", note, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "funded_note", 1_000_000, 1.0,
+        1_000_000, None, 0.0, 0.0,
+        initial_fixing=6000.0, absolute_strike=6000.0, absolute_barrier=5100.0,
+        barrier_direction="down", elapsed_months=3, knock_in_state=True,
+    )
+    # 6200 is above the fixing but below the 1.05 autocall trigger (reachable).
+    recovered = replace(snapshots()[0], spot=6200.0)
+    assert _position_settlement_amount(position, recovered) == pytest.approx(1_000_000)
+    position.knock_in_state = False
+    assert _position_settlement_amount(position, recovered) == pytest.approx(1_020_000)
+
+
+def test_action_schema_funding_rules_match_lattice():
+    domain = ProductDomainSpec(notional_fractions=(.05,), maturities=(3,))
+    cli = permissive_client()
+    env = LongHorizonEnvironment(
+        snapshots(), cli, budget(), BenchmarkCondition(full_information=False, dynamic=True),
+        domain=domain,
+    )
+    rules = env.policy_action_schema()["funding_constraints"]
+    for candidate in enumerate_domain(cli, domain):
+        style = candidate.effective_funding_style
+        assert candidate.product_type in rules[style]["applies_to"]
+        if style == "premium_paid":
+            assert candidate.principal_protected in rules[style]["principal_protected"]
+    assert any(
+        candidate.principal_protected and candidate.product_type == "vanilla_call"
+        and candidate.effective_funding_style == "funded_note"
+        for candidate in enumerate_domain(cli, domain)
+    )
+
+
+async def test_client_consult_does_not_share_hidden_profile_history():
+    import json as _json
+
+    from stochopia.env_agents import FrozenEnvAgent
+    from stochopia.llm import BaseLLMClient
+    from stochopia.role_config import ROLE_PROTOCOL_VERSION, InferenceSpec, RetryPolicy, RoleSpecV2
+    from pathlib import Path
+
+    class Recording(BaseLLMClient):
+        def __init__(self):
+            super().__init__()
+            self.calls: list[list[dict]] = []
+
+        async def chat(self, messages, temperature=None, max_tokens=None, seed=None):
+            self.calls.append(messages)
+            return _json.dumps({"action": "answer", "narrative": "好的", "disclose_fields": []})
+
+    spec = RoleSpecV2(
+        id="client_main", protocol_version=ROLE_PROTOCOL_VERSION, role="client",
+        system_prompt_file=Path("dummy.md"),
+        inference=InferenceSpec(model_ref="mock", temperature=0.0, max_tokens=500,
+                                seed_policy="derived", seed_offset=0),
+        retry=RetryPolicy(transport_retries=0),
+        output_schema="stochopia.role.client-response.v1", history_scope="episode",
+        numeric_authority="supplied_facts_only", failure_policy="abstain",
+    )
+    llm = Recording()
+    agent = FrozenEnvAgent(spec, llm, system_prompt="SYS")
+    env = LongHorizonEnvironment(
+        snapshots(), client(), budget(), BenchmarkCondition(full_information=False, dynamic=True),
+        env_agents={"client": agent},
+    )
+    await env.query_client_llm("loss_tolerance")
+    assert "client_profile" in _json.dumps(llm.calls[-1], ensure_ascii=False)
+    await env.consult("client", "你能接受多大亏损？")
+    consult_messages = _json.dumps(llm.calls[-1], ensure_ascii=False)
+    assert "client_profile" not in consult_messages
+    assert "max_loss_pct" not in consult_messages
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-09 (三): mandate leaks, unquotable quotes, lattice disclosure
+# ---------------------------------------------------------------------------
+
+
+def test_partial_submit_hides_capital_derived_client_account_fields():
+    env = make_env(cli=permissive_client())
+    quote = env.request_quote(product())
+    account = env.submit_design(quote["quote_id"])["client_account"]
+    for key in ("initial_cash", "available_cash", "wealth", "net_liquidation_wealth", "book_wealth"):
+        assert key not in account
+    assert account["locked_cash"] == pytest.approx(quote["cash_outlay"])
+    full = make_env(full=True, cli=permissive_client())
+    full_quote = full.request_quote(product())
+    assert full.submit_design(full_quote["quote_id"])["client_account"]["initial_cash"] == 20_000_000
+
+
+def test_zero_fair_value_premium_paid_quote_is_unavailable_and_free():
+    from stochopia.benchmark import QuoteNotConvergedError
+
+    domain = ProductDomainSpec(
+        product_types=("barrier_call",), notional_fractions=(.05,), maturities=(3,),
+        strikes=(.95,), barriers=(.75,), coupons=(.08,), participations=(1.0,),
+        principal_protected=(False,),
+    )
+    low_vol = [replace(item, atm_iv_1m=None, atm_iv_3m=None, realized_vol_20d=0.10)
+               for item in snapshots()]
+    env = LongHorizonEnvironment(
+        low_vol, permissive_client(), budget(), BenchmarkCondition(False, True), domain=domain,
+    )
+    candidate = next(iter(enumerate_domain(env.client, domain)))
+    with pytest.raises(QuoteNotConvergedError, match="not quotable"):
+        env.request_quote(candidate)
+    assert env.quote_count == 0
+    # The one-step frontier skips it instead of crashing.
+    skipped: list = []
+    assert oracle_best_quote(domain, low_vol[0], env.client, env.portfolio, budget(),
+                             nonconverged=skipped) is None
+    assert len(skipped) == 1
+
+
+def test_domain_error_and_partial_action_schema_never_reveal_capital_notionals():
+    env = make_env(cli=permissive_client())
+    with pytest.raises(BenchmarkError) as excinfo:
+        env.request_quote(product(maturity=4))
+    message = str(excinfo.value)
+    assert message.startswith("DOMAIN:")
+    assert '"maturities": [3, 6]' in message
+    assert "400000" not in message and "20000000" not in message
+    rule = env.policy_action_schema()["notional_rule"]
+    assert rule["base_amount"] is None and rule["allowed_values"] is None
+    assert rule["fractions"] == [.02, .05, .10]
+    full_rule = make_env(full=True, cli=permissive_client()).policy_action_schema()["notional_rule"]
+    assert full_rule["allowed_values"] == [400_000, 1_000_000, 2_000_000]

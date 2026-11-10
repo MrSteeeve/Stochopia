@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
-import os
-import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from ..common import atomic_write_json, canonical_json, sha256_json
 from ..products import ProductSpec
 from ..stats import cluster_bootstrap_ci, derive_seed
 from .agent_runner import parse_environment_action
 from .core import StochopiaStructurerEnv
-from .trajectory import TrajectoryRecorder, to_jsonable
+from .trajectory import TRAJECTORY_FORMAT, to_jsonable
 from .types import (
     EpisodeTask,
     InvalidAction,
@@ -29,46 +27,21 @@ from .types import (
 TASK_SUITE_FORMAT = "stochopia.task-suite.v1"
 EVALUATION_FORMAT = "stochopia.trajectory-evaluation.v1"
 AGGREGATE_FORMAT = "stochopia.evaluation-aggregate.v1"
+# Every DSL environment version; the exact one is checked on --replay.
+_DSL_VERSION_PREFIX = "v3-spine-dsl-experimental."
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(
-        to_jsonable(value),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    return canonical_json(to_jsonable(value))
 
 
 def _digest(value: Any) -> str:
-    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+    return sha256_json(to_jsonable(value))
 
 
 def _atomic_write(path: str | Path, payload: Mapping[str, Any]) -> Path:
     destination = Path(path).expanduser().resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    encoded = (
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    ).encode("utf-8")
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        dir=destination.parent,
-    )
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
-    return destination
+    return atomic_write_json(destination, payload)
 
 
 @dataclass(frozen=True)
@@ -129,7 +102,7 @@ class TaskSuite:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "TaskSuite":
         raw = dict(payload)
-        expected_hash = raw.pop("suite_hash", None)
+        raw.pop("suite_hash", None)
         tasks_payload = raw.get("tasks")
         if not isinstance(tasks_payload, list):
             raise ValueError("task suite tasks must be a list")
@@ -141,12 +114,6 @@ class TaskSuite:
             metadata=raw.get("metadata") or {},
             format=raw.get("format", ""),
         )
-        if raw.get("task_count") != len(suite.tasks):
-            raise ValueError("task suite task_count mismatch")
-        if raw.get("task_hashes") != [item.task_hash for item in suite.tasks]:
-            raise ValueError("task suite task_hashes mismatch")
-        if expected_hash != suite.suite_hash:
-            raise ValueError("task suite hash mismatch")
         return suite
 
     @classmethod
@@ -162,6 +129,12 @@ class TaskSuite:
 
 def _action_from_transition(payload: Mapping[str, Any]):
     action_name = payload.get("action")
+    if action_name == "request_dsl_quote":
+        from ..adapters.structurer_dsl import DSLContract, DSLProductSpec
+        from .dsl import RequestDSLQuote
+
+        contract = DSLContract(**dict(payload["product"]["contract"]))
+        return RequestDSLQuote(DSLProductSpec.from_contract(contract))
     if action_name == "invalid":
         return InvalidAction(
             reason=str(payload.get("reason", "invalid action")),
@@ -195,7 +168,7 @@ def _numeric_total(summary: Mapping[str, Any], name: str) -> float:
 
 def _metrics_from_transitions(
     transitions: Sequence[Mapping[str, Any]],
-) -> tuple[dict[str, float], Mapping[str, Any], Mapping[str, Any]]:
+) -> tuple[dict[str, float | None], Mapping[str, Any], Mapping[str, Any]]:
     if not transitions:
         return {}, {}, {}
     final_info = transitions[-1].get("info") or {}
@@ -217,8 +190,8 @@ def _metrics_from_transitions(
                 hard_passes += 1
                 if constraints.get("client_contract_pass") is not None:
                     contract_eligible += 1
-            if constraints.get("client_contract_pass") is True:
-                contract_passes += 1
+                if constraints.get("client_contract_pass") is True:
+                    contract_passes += 1
         tool_result = transition.get("tool_result") or {}
         lifecycle_closures += sum(
             1
@@ -242,14 +215,16 @@ def _metrics_from_transitions(
         "steps": float(steps),
         "invalid_action_rate": invalid / steps if steps else 0.0,
         "submission_rate": submissions / steps if steps else 0.0,
+        # Conditional rates are undefined (None) on an empty denominator;
+        # aggregation skips non-numeric values instead of pooling a fake 0.
         "hard_execution_rate_given_submission": (
-            hard_passes / submissions if submissions else 0.0
+            hard_passes / submissions if submissions else None
         ),
         "contract_acceptance_rate_given_hard_pass": (
-            contract_passes / contract_eligible if contract_eligible else 0.0
+            contract_passes / contract_eligible if contract_eligible else None
         ),
         "settlement_acceptance_rate": (
-            accepted / submissions if submissions else 0.0
+            accepted / submissions if submissions else None
         ),
         "accepted_submissions": float(accepted),
         "lifecycle_closures": float(lifecycle_closures),
@@ -277,21 +252,19 @@ def _metrics_from_transitions(
     return metrics, reward_summary, constraint_summary
 
 
-def replay_and_evaluate_payload(
-    payload: Mapping[str, Any],
-    *,
-    suite_hash: str | None = None,
-) -> dict[str, Any]:
-    """Re-run every action and require exact economic transition equality."""
+def _replay_transitions(
+    payload: Mapping[str, Any], task: EpisodeTask
+) -> list[Mapping[str, Any]]:
+    """Re-run every recorded action and require exact economic equality."""
 
-    if not TrajectoryRecorder.verify_payload(payload):
-        raise ValueError("trajectory hash verification failed")
     metadata = payload["metadata"]
-    task = EpisodeTask.from_manifest(payload["task_manifest"])
-    if task.task_hash != metadata["task_hash"]:
-        raise ValueError("trajectory task hash does not match reconstructed task")
     configuration = dict(payload["environment_configuration"])
-    environment = StochopiaStructurerEnv(task, **configuration)
+    if str(metadata["environment_version"]).startswith(_DSL_VERSION_PREFIX):
+        from .dsl import StochopiaDSLEnv
+
+        environment = StochopiaDSLEnv(task, **configuration)
+    else:
+        environment = StochopiaStructurerEnv(task, **configuration)
     if metadata["environment_version"] != environment.environment_version:
         raise ValueError(
             "trajectory environment version differs from installed evaluator"
@@ -301,13 +274,10 @@ def replay_and_evaluate_payload(
             "trajectory pricing version differs from installed evaluator"
         )
     entries = payload.get("entries") or []
-    seed = int(payload["run_id_seed"])
-    _, reset_info = environment.reset(
-        seed=seed,
+    environment.reset(
+        seed=int(payload["run_id_seed"]),
         options=payload.get("reset_options") or {},
     )
-    if reset_info["state_hash"] != payload["initial_state_hash"]:
-        raise ValueError("trajectory initial state cannot be reproduced")
     if to_jsonable(environment.action_schema) != payload["public_action_schema"]:
         raise ValueError("trajectory public action schema cannot be reproduced")
 
@@ -330,10 +300,33 @@ def replay_and_evaluate_payload(
                 f"{entry.get('index')}: {mismatched}"
             )
         replayed.append(actual)
+    return replayed
 
-    metrics, reward_summary, constraint_summary = _metrics_from_transitions(
-        replayed
-    )
+
+def replay_and_evaluate_payload(
+    payload: Mapping[str, Any],
+    *,
+    suite_hash: str | None = None,
+    replay: bool = False,
+) -> dict[str, Any]:
+    """Score one trajectory from its recorded transitions.
+
+    With ``replay=True`` every action is first re-run through a fresh
+    environment and each transition must match exactly; this doubles the
+    evaluation cost and is off by default.
+    """
+
+    if payload.get("format") != TRAJECTORY_FORMAT:
+        raise ValueError(
+            f"unsupported trajectory format {payload.get('format')!r}; expected {TRAJECTORY_FORMAT}"
+        )
+    metadata = payload["metadata"]
+    task = EpisodeTask.from_manifest(payload["task_manifest"])
+    if replay:
+        transitions = _replay_transitions(payload, task)
+    else:
+        transitions = [entry["transition"] for entry in payload.get("entries") or []]
+    metrics, reward_summary, constraint_summary = _metrics_from_transitions(transitions)
     metrics = dict(metrics)
     metrics.setdefault("completion_rate", 0.0)
     metrics.setdefault("truncation_rate", 0.0)
@@ -345,17 +338,17 @@ def replay_and_evaluate_payload(
         and run_outcome.get("status") == "infrastructure_error"
     )
     metrics["partial_run_rate"] = float(payload["status"] == "partial")
+    is_dsl = str(metadata["environment_version"]).startswith(_DSL_VERSION_PREFIX)
     result = {
-        "format": EVALUATION_FORMAT,
-        "replay_verified": True,
-        "trajectory_root_hash": payload["root_hash"],
+        "format": "stochopia.dsl-experiment-evaluation.v1" if is_dsl else EVALUATION_FORMAT,
+        "replay_verified": bool(replay),
         "run_id_seed": payload["run_id_seed"],
         "task_hash": task.task_hash,
         "public_task_id": task.public_task_id,
         "suite_hash": suite_hash,
         "policy_kind": payload["policy_run_metadata"].get("policy_kind", ""),
         "policy_name": payload["policy_run_metadata"].get("policy_name", ""),
-        "policy_config_hash": metadata["policy_run_metadata_hash"],
+        "policy_config_hash": _digest(payload["policy_run_metadata"]),
         "environment_version": metadata["environment_version"],
         "pricing_version": metadata["pricing_version"],
         "status": payload["status"],
@@ -363,7 +356,6 @@ def replay_and_evaluate_payload(
         "reward_summary": reward_summary,
         "constraint_summary": constraint_summary,
     }
-    result["evaluation_hash"] = _digest(result)
     return result
 
 
@@ -372,6 +364,7 @@ def replay_and_evaluate(
     *,
     output_path: str | Path | None = None,
     suite_hash: str | None = None,
+    replay: bool = False,
 ) -> dict[str, Any]:
     try:
         payload = json.loads(Path(trajectory_path).read_text(encoding="utf-8"))
@@ -379,7 +372,7 @@ def replay_and_evaluate(
         raise ValueError(f"cannot load trajectory: {exc}") from exc
     if not isinstance(payload, Mapping):
         raise ValueError("trajectory root must be an object")
-    result = replay_and_evaluate_payload(payload, suite_hash=suite_hash)
+    result = replay_and_evaluate_payload(payload, suite_hash=suite_hash, replay=replay)
     if output_path is not None:
         _atomic_write(output_path, result)
     return result
@@ -397,13 +390,8 @@ def aggregate_evaluations(
     if not rows:
         raise ValueError("at least one evaluation is required")
     for row in rows:
-        if row.get("format") != EVALUATION_FORMAT or row.get("replay_verified") is not True:
-            raise ValueError("all evaluations must be replay-verified v3 results")
-        expected_hash = row.get("evaluation_hash")
-        check = dict(row)
-        check.pop("evaluation_hash", None)
-        if expected_hash != _digest(check):
-            raise ValueError("evaluation hash mismatch")
+        if row.get("format") != EVALUATION_FORMAT:
+            raise ValueError("all evaluations must be v3 Level-0 results")
     suite_hashes = {row.get("suite_hash") for row in rows}
     if len(suite_hashes) != 1:
         raise ValueError("cannot aggregate evaluations from mixed suites")
@@ -411,6 +399,13 @@ def aggregate_evaluations(
         raise ValueError(
             "v3 aggregation requires evaluations bound to a frozen task suite"
         )
+    for version_key in ("environment_version", "pricing_version"):
+        versions = {row.get(version_key) for row in rows}
+        if len(versions) != 1:
+            raise ValueError(
+                f"cannot aggregate evaluations with mixed {version_key}: "
+                f"{sorted(map(str, versions))}"
+            )
 
     metric_names = sorted(
         {
@@ -497,13 +492,14 @@ def aggregate_evaluations(
     result = {
         "format": AGGREGATE_FORMAT,
         "suite_hash": next(iter(suite_hashes)),
+        "environment_version": rows[0].get("environment_version"),
+        "pricing_version": rows[0].get("pricing_version"),
         "evaluation_count": len(rows),
         "policy_count": len(summaries),
         "bootstrap_resamples": n_resamples,
         "seed": seed,
         "policies": summaries,
     }
-    result["aggregate_hash"] = _digest(result)
     return result
 
 

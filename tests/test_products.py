@@ -7,10 +7,8 @@ import pytest
 from stochopia.products import (
     DRAFT_TARGET,
     ClientProfile,
-    Constraint,
     ProductError,
     ProductSpec,
-    check_protection_claim,
     parse_product_draft,
     parse_product_spec,
 )
@@ -48,173 +46,6 @@ def _client(**overrides) -> ClientProfile:
     )
     base.update(overrides)
     return ClientProfile(**base)
-
-
-# ---------------------------------------------------------------------------
-# ClientProfile.would_buy
-# ---------------------------------------------------------------------------
-
-
-def test_would_buy_rejects_unprotected_for_conservative():
-    """保守型客户遇到不保本产品，第一条规则即拒绝。"""
-    client = _client(risk_appetite="conservative")
-    product = _spec(principal_protected=False)
-    pricing = {"client_price": 10_000.0, "expected_payoff": 50_000.0, "loss_frac": 0.05}
-    ok, reason = client.would_buy(product, pricing)
-    assert ok is False
-    assert "不保本" in reason
-
-
-def test_would_buy_conservative_accepts_protected_product():
-    """保守型客户遇到保本产品，且其余条件满足，应通过第一条检查继续往下判断并最终接受。"""
-    client = _client(risk_appetite="conservative", capital=2_000_000.0, max_loss_pct=0.1, min_return_pct=0.02)
-    product = _spec(principal_protected=True, notional=1_000_000.0, maturity_months=12)
-    pricing = {"client_price": 10_000.0, "loss_frac": 0.0, "hurdle_hit_prob": 0.8}
-    ok, reason = client.would_buy(product, pricing)
-    assert ok is True
-    assert reason == "符合投资标准"
-
-
-def test_would_buy_checks_cash_outlay_not_exposure_notional():
-    """客户资本约束按实际出资，而不是 standalone option 的风险名义。"""
-    client = _client(capital=500_000.0)
-    product = _spec(principal_protected=False, notional=1_000_000.0)
-    pricing = {
-        "client_price": 600_000.0,
-        "cash_outlay": 600_000.0,
-        "expected_payoff": 50_000.0,
-        "loss_frac": 0.0,
-        "hurdle_hit_prob": 1.0,
-    }
-    ok, reason = client.would_buy(product, pricing)
-    assert ok is False
-    assert "实际现金出资" in reason
-
-
-def test_would_buy_rejects_loss_frac_exceeds_tolerance():
-    """潜在损失超过客户承受范围，第三条规则拒绝，原因中带两个百分数。"""
-    client = _client(max_loss_pct=0.1)
-    product = _spec(notional=1_000_000.0)
-    pricing = {"client_price": 10_000.0, "expected_payoff": 50_000.0, "loss_frac": 0.2}
-    ok, reason = client.would_buy(product, pricing)
-    assert ok is False
-    assert "潜在损失" in reason
-    assert "20" in reason
-    assert "10" in reason
-
-
-def test_would_buy_rejects_low_hit_prob():
-    """实现客户期望年化的把握不足时拒绝，理由用定性口吻（不报小数概率）。"""
-    client = _client(min_return_pct=0.05, min_hit_prob=0.6)
-    product = _spec(notional=1_000_000.0, maturity_months=12)
-    pricing = {"client_price": 10_000.0, "loss_frac": 0.0, "hurdle_hit_prob": 0.25}
-    ok, reason = client.would_buy(product, pricing)
-    assert ok is False
-    assert "年化 5.0%" in reason
-    assert "把握较小" in reason
-    # 概率只以定性表述出现，门槛数字之外不再出现百分号
-    assert reason.count("%") == 1
-
-
-def test_would_buy_accepts_when_all_checks_pass():
-    """所有检查均通过时接受，理由为标准通过语。"""
-    client = _client(
-        risk_appetite="balanced", capital=2_000_000.0, max_loss_pct=0.2, min_return_pct=0.02
-    )
-    product = _spec(notional=1_000_000.0, maturity_months=6)
-    pricing = {"client_price": 10_000.0, "loss_frac": 0.05, "hurdle_hit_prob": 0.75}
-    ok, reason = client.would_buy(product, pricing)
-    assert ok is True
-    assert reason == "符合投资标准"
-
-
-# ---------------------------------------------------------------------------
-# Constraint.validate
-# ---------------------------------------------------------------------------
-
-
-def _constraint(**overrides) -> Constraint:
-    base = dict(
-        id="con1",
-        activate_round=1,
-        source="监管",
-        description="delta 不得超限",
-        check_field="delta",
-        check_type="max",
-        check_value=0.5,
-    )
-    base.update(overrides)
-    return Constraint(**base)
-
-
-def test_constraint_max_pass_and_fail():
-    con = _constraint(check_type="max", check_value=0.5, check_field="delta")
-    product = _spec()
-    ok, _ = con.validate(product, {"delta": 0.5})
-    assert ok is True
-    ok, reason = con.validate(product, {"delta": 0.6})
-    assert ok is False
-    assert "delta" in reason
-    assert "0.6" in reason
-
-
-def test_constraint_min_pass_and_fail():
-    con = _constraint(check_type="min", check_value=0.2, check_field="vega")
-    product = _spec()
-    ok, _ = con.validate(product, {"vega": 0.2})
-    assert ok is True
-    ok, reason = con.validate(product, {"vega": 0.1})
-    assert ok is False
-    assert "vega" in reason
-
-
-def test_constraint_max_abs_pass_and_fail():
-    con = _constraint(check_type="max_abs", check_value=0.3, check_field="gamma")
-    product = _spec()
-    ok, _ = con.validate(product, {"gamma": -0.3})
-    assert ok is True
-    ok, reason = con.validate(product, {"gamma": -0.4})
-    assert ok is False
-    assert "gamma" in reason
-
-
-def test_constraint_forbidden_type_pass_and_fail():
-    con = _constraint(check_type="forbidden_type", check_value="snowball", check_field="product_type")
-    ok, _ = con.validate(_spec(product_type="vanilla_call"), {})
-    assert ok is True
-    ok, reason = con.validate(_spec(product_type="snowball", coupon_rate=0.1), {})
-    assert ok is False
-    assert "snowball" in reason
-
-
-def test_constraint_resolves_field_from_greeks_over_product():
-    """check_field 若存在于 greeks 中，优先取 greeks 的值。"""
-    con = _constraint(check_type="max", check_value=100.0, check_field="notional")
-    product = _spec(notional=1_000_000.0)
-    # greeks 里给出一个更小的 notional 值，应该被采用而不是 product.notional
-    ok, _ = con.validate(product, {"notional": 50.0})
-    assert ok is True
-
-
-def test_constraint_resolves_field_from_product_when_absent_in_greeks():
-    con = _constraint(check_type="max", check_value=2_000_000.0, check_field="notional")
-    product = _spec(notional=1_000_000.0)
-    ok, _ = con.validate(product, {})
-    assert ok is True
-
-
-def test_constraint_unknown_field_raises():
-    con = _constraint(check_field="nonexistent_field")
-    product = _spec()
-    with pytest.raises(ProductError):
-        con.validate(product, {})
-
-
-def test_constraint_unknown_check_type_raises():
-    con = _constraint(check_type="weird_type")
-    product = _spec()
-    with pytest.raises(ProductError):
-        con.validate(product, {"delta": 0.1})
 
 
 # ---------------------------------------------------------------------------
@@ -441,45 +272,6 @@ def test_parse_product_spec_participation_must_be_strictly_positive(
 
 
 # ---------------------------------------------------------------------------
-# check_protection_claim
-# ---------------------------------------------------------------------------
-
-
-def test_check_protection_claim_snowball_protected_is_inconsistent():
-    product = _spec(product_type="snowball", coupon_rate=0.1, principal_protected=True)
-    ok, reason = check_protection_claim(product)
-    assert ok is False
-    assert "雪球" in reason
-
-
-def test_check_protection_claim_autocall_with_knock_in_protected_is_inconsistent():
-    product = _spec(
-        product_type="autocallable",
-        coupon_rate=0.1,
-        barrier_pct=0.8,
-        barrier_type="knock_in",
-        principal_protected=True,
-    )
-    ok, reason = check_protection_claim(product)
-    assert ok is False
-    assert "敲入" in reason
-
-
-def test_check_protection_claim_protected_vanilla_is_consistent():
-    product = _spec(product_type="vanilla_call", principal_protected=True)
-    ok, reason = check_protection_claim(product)
-    assert ok is True
-    assert reason == "一致"
-
-
-def test_check_protection_claim_custom_cannot_be_checked():
-    product = _spec(product_type="custom", principal_protected=True)
-    ok, reason = check_protection_claim(product)
-    assert ok is True
-    assert reason == "无法校验"
-
-
-# ---------------------------------------------------------------------------
 # parse_product_spec：显式 null 处理（TASK 4）
 # ---------------------------------------------------------------------------
 
@@ -560,3 +352,10 @@ def test_parse_product_draft_invalid_fields_still_raise():
     )
     with pytest.raises(ProductError):
         parse_product_draft(payload)
+
+
+@pytest.mark.parametrize("bad_type", [["vanilla_call"], {"x": 1}, 3])
+def test_parse_product_spec_rejects_non_string_product_type(bad_type):
+    """An LLM emitting a list/object product_type is a ProductError, not a TypeError."""
+    with pytest.raises(ProductError, match="product_type"):
+        parse_product_spec(_valid_payload(product_type=bad_type))

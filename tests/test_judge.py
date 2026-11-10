@@ -8,6 +8,7 @@ import pytest
 
 from stochopia.benchmark_cli import (
     _collect_voluntary_samples,
+    _load_judge_entries,
     _run_judge_runs,
     _stratified_sample,
 )
@@ -23,9 +24,8 @@ from stochopia.judge import (
     spearman_correlation,
     validate_evidence_spans,
     weighted_cohens_kappa,
-    score_flip_rate,
 )
-from stochopia.llm import MockLLMClient
+from stochopia.llm import LLMError, MockLLMClient
 
 
 def payload(scores: list[int]) -> str:
@@ -54,7 +54,6 @@ def test_reliability_metrics_perfect_agreement():
     assert report["exact_total_agreement"] == 1.0
     assert report["spearman_total"] == pytest.approx(1.0)
     assert "not expert-grounded" in report["claim"]
-    assert score_flip_rate(left, right) == 0.0
 
 
 def test_metric_input_validation():
@@ -247,6 +246,7 @@ def _round(round_num: int, origin: str) -> dict:
 
 def _result_payload(job_id: str, model: str, condition: str, episode_id: str, rounds: list[dict]) -> dict:
     return {
+        "complete": True,
         "job": {
             "job_id": job_id, "episode_id": episode_id, "model": model,
             "strategy": "quote_and_revise", "condition": condition, "replicate": 0, "seed": 1,
@@ -285,6 +285,31 @@ def test_stratified_sample_is_deterministic_and_balanced():
 
     picked_all = _stratified_sample(samples, 100, seed=123)
     assert len(picked_all) == len(samples)
+
+
+def test_collect_voluntary_samples_skips_incomplete_results(tmp_path):
+    payload_dict = _result_payload("job1", "model_a", "full_static", "E1", [_round(1, "voluntary")])
+    payload_dict["complete"] = False
+    (tmp_path / "run1.json").write_text(json.dumps(payload_dict), encoding="utf-8")
+    assert _collect_voluntary_samples(tmp_path) == []
+
+
+async def test_aggregate_ignores_stale_judge_files(tmp_path):
+    for name in ("run_a", "run_b"):
+        payload = _result_payload(name, "model_a", "full_static", "E1", [_round(1, "voluntary")])
+        (tmp_path / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
+    clients = {"judge_x": MockLLMClient([_judge_payload_json()]),
+               "judge_y": MockLLMClient([_judge_payload_json()])}
+    kwargs = dict(results_dir=tmp_path, judge_models=["judge_x", "judge_y"],
+                  clients=clients, repeats=1, salt="s")
+    await _run_judge_runs(sample_size=2, seed=1, **kwargs)
+    assert len(_load_judge_entries(tmp_path)) == 4
+    # Re-run with a different seed and a 1-file sample: the other file's
+    # judges.json from the first run is stale and must not be pooled.
+    await _run_judge_runs(sample_size=1, seed=2, **kwargs)
+    entries = _load_judge_entries(tmp_path)
+    assert len(entries) == 2
+    assert len({entry["submission_id"] for entry in entries}) == 1
 
 
 def test_collect_voluntary_samples_only_takes_voluntary_with_product(tmp_path):
@@ -383,7 +408,7 @@ async def test_judge_runs_retries_then_marks_missing_without_aborting_batch(tmp_
     class AlwaysFailsClient(MockLLMClient):
         async def chat(self, messages, temperature=None, max_tokens=None, seed=None) -> str:
             self.total_usage["calls"] += 1
-            raise RuntimeError("simulated judge API failure")
+            raise LLMError("simulated judge API failure")
 
     clients = {"judge_x": AlwaysFailsClient(), "judge_y": MockLLMClient([_judge_payload_json()])}
 
@@ -406,3 +431,45 @@ async def test_judge_runs_retries_then_marks_missing_without_aborting_batch(tmp_
     assert failing_entries[0]["judge_result"] is None
     # 1 initial attempt + 2 retries = 3 calls to the always-failing client.
     assert clients["judge_x"].total_usage["calls"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-09 (三): evidence sources, shared JSON parser, narrowed retries
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_may_quote_pitch_or_hedging_plan_but_not_unseen_text():
+    result = parse_judge_result(payload([3] * len(DIMENSIONS)))
+    dims = dict(result.dimensions)
+    dims["client_understanding"] = DimensionScore(3, "保本 看涨", "r")
+    dims["hedging_rationale"] = DimensionScore(3, "ETF delta", "r")
+    validated = validate_evidence_spans(
+        JudgeResult(dims), "说明里没有这些", "保本  看涨参与", "ETF delta hedge",
+    )
+    assert validated.dimensions["client_understanding"].score == 3
+    assert validated.dimensions["hedging_rationale"].score == 3
+    assert validated.dimensions["non_misleading"].score is None
+
+
+def test_parse_judge_result_uses_shared_json_extractor():
+    raw = "评审如下：\n```json\n" + payload([2] * len(DIMENSIONS)) + "\n```\n以上。"
+    assert parse_judge_result(raw).dimensions["risk_explanation"].score == 2
+    with pytest.raises(JudgeError):
+        parse_judge_result("no json here")
+
+
+async def test_judge_retries_do_not_swallow_programming_errors(tmp_path):
+    rounds = [_round(1, "voluntary")]
+    payload_only = _result_payload("job1", "model_a", "full_static", "E1", rounds)
+    (tmp_path / "run1.json").write_text(json.dumps(payload_only, ensure_ascii=False), encoding="utf-8")
+
+    class BuggyClient(MockLLMClient):
+        async def chat(self, messages, temperature=None, max_tokens=None, seed=None) -> str:
+            raise AttributeError("bug in judge plumbing")
+
+    with pytest.raises(AttributeError):
+        await _run_judge_runs(
+            results_dir=tmp_path, judge_models=["judge_x", "judge_y"],
+            clients={"judge_x": BuggyClient(), "judge_y": MockLLMClient([_judge_payload_json()])},
+            repeats=1, sample_size=5, salt="s", seed=1,
+        )

@@ -182,7 +182,7 @@ cython_debug/
 
 # Stochopia local artifacts
 blobs/
-docs/research/2026-08-31-claude-artifact-stochopia-research-session.md
+artifacts/
 outputs/
 output/
 data/raw/cffex/

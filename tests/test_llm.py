@@ -75,9 +75,14 @@ def _client(max_tokens: int = 2000) -> OpenAICompatClient:
 async def test_truncation_retries_with_doubled_max_tokens(fake_http):
     """首次截断后自动把 max_tokens 翻倍重试，第二次成功返回内容。"""
     fake_http.scripted = [_response("被截断的内", "length"), _response("完整回复", "stop")]
-    result = await _client().chat([{"role": "user", "content": "hi"}])
+    client = _client()
+    result = await client.chat([{"role": "user", "content": "hi"}])
     assert result == "完整回复"
     assert [p["max_tokens"] for p in fake_http.payloads] == [2000, 4000]
+    # The effective (escalated) max_tokens is recorded with the usage/trace.
+    assert client.total_usage["max_tokens_escalations"] == [
+        {"requested_max_tokens": 2000, "effective_max_tokens": 4000}
+    ]
 
 
 async def test_truncation_exhausts_retries_then_raises(fake_http):

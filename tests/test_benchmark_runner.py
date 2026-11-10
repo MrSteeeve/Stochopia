@@ -23,17 +23,17 @@ from stochopia.benchmark import (
     oracle_best_quote,
 )
 from stochopia.benchmark_runner import (
+    STRUCTURER_SYSTEM_PROMPT,
     PROTOCOL_POLICIES,
-    RUNNER_SYSTEM_PROMPT,
     EpisodeTrace,
     RoundTrace,
     compute_metrics,
     run_episode,
 )
 from stochopia.env_agents import FrozenEnvAgent
-from stochopia.llm import BaseLLMClient, MockLLMClient
+from stochopia.llm import BaseLLMClient, LLMError, MockLLMClient
 from stochopia.pricing import PricingError, QuotePolicy
-from stochopia.products import ClientProfile
+from stochopia.products import ClientProfile, parse_product_spec
 from stochopia.role_config import InferenceSpec, RetryPolicy, RoleSpecV2
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -168,11 +168,11 @@ def test_protocol_policies_are_immutable_and_one_shot_is_strict():
 
 
 def test_packaged_runner_prompt_matches_parser_contract():
-    assert "purchase_status|risk_appetite|return_hurdle" in RUNNER_SYSTEM_PROMPT
-    assert "participation_rate：正数" in RUNNER_SYSTEM_PROMPT
-    assert 'barrier_direction：障碍期权可选 "down" | "up"' in RUNNER_SYSTEM_PROMPT
-    assert '"action":"consult"' in RUNNER_SYSTEM_PROMPT
-    assert "cash_outlay" in RUNNER_SYSTEM_PROMPT
+    assert "purchase_status|risk_appetite|return_hurdle" in STRUCTURER_SYSTEM_PROMPT
+    assert "participation_rate：正数" in STRUCTURER_SYSTEM_PROMPT
+    assert 'barrier_direction：障碍期权可选 "down" | "up"' in STRUCTURER_SYSTEM_PROMPT
+    assert '"action":"consult"' in STRUCTURER_SYSTEM_PROMPT
+    assert "cash_outlay" in STRUCTURER_SYSTEM_PROMPT
 
 
 @pytest.mark.asyncio
@@ -374,7 +374,9 @@ async def test_no_submission_when_model_never_submits_or_skips():
         assert round_trace.imputed_counterfactual_margin is None
     metrics = compute_metrics(trace)
     assert metrics["total_dealer_margin"] == 0.0
-    assert metrics["mean_dealer_margin"] == 0.0
+    # Conditional metric: undefined without a voluntary accepted trade.
+    assert metrics["mean_dealer_margin"] is None
+    assert metrics["mean_dealer_margin_per_voluntary_accepted_trade"] is None
     assert metrics["forced_prompt_margin"] == 0.0
     assert metrics["hard_feasibility_rate"] == 0.0
     assert metrics["voluntary_submission_rate"] == 0.0
@@ -415,7 +417,9 @@ async def test_forced_prompt_submission_is_tagged_and_excluded_from_primary_marg
 
     metrics = compute_metrics(trace)
     assert metrics["total_dealer_margin"] == 0.0
-    assert metrics["mean_dealer_margin"] == 0.0
+    # Conditional metric: undefined without a voluntary accepted trade.
+    assert metrics["mean_dealer_margin"] is None
+    assert metrics["mean_dealer_margin_per_voluntary_accepted_trade"] is None
     assert metrics["forced_prompt_margin"] == round_trace.dealer_margin
     assert metrics["voluntary_submission_rate"] == 0.0
     assert metrics["forced_prompt_rate"] == 1.0
@@ -600,7 +604,7 @@ class _RaisingClient(BaseLLMClient):
     """Always raises: exercises the FrozenEnvAgent degraded fallback path."""
 
     async def chat(self, messages, temperature=None, max_tokens=None, seed=None) -> str:
-        raise RuntimeError("simulated provider outage")
+        raise LLMError("simulated provider outage")
 
 
 class _EchoQuoteDeskClient(BaseLLMClient):
@@ -628,10 +632,10 @@ class _EchoQuoteDeskClient(BaseLLMClient):
 def _env_spec(role: str, schema: str, failure: str, seed_offset: int) -> RoleSpecV2:
     return RoleSpecV2(
         id=role, protocol_version="stochopia.csi.legacy.v1", role=role,
-        system_prompt_file=Path("dummy.md"), system_prompt_sha256="",
-        inference=InferenceSpec("mock", 0.0, 500, 30.0, "derived", seed_offset),
-        retry=RetryPolicy(transport_retries=0, format_retries=1),
-        output_schema=schema, tools=(), max_calls_per_round=3, history_scope="episode",
+        system_prompt_file=Path("dummy.md"),
+        inference=InferenceSpec("mock", 0.0, 500, "derived", seed_offset),
+        retry=RetryPolicy(transport_retries=0),
+        output_schema=schema, history_scope="episode",
         numeric_authority="supplied_facts_only", failure_policy=failure,
     )
 
@@ -886,6 +890,115 @@ def test_cli_builds_env_agents_from_real_config():
     specs = _load_env_role_specs(ROOT / "config" / "benchmark_roles.yaml", registry)
     agents = _make_env_agents(specs, registry, None)
     assert set(agents) == {"client", "risk_control", "trading_desk"}
-    npc_lineup_id, roles_sha = _roles_config_meta(ROOT / "config" / "benchmark_roles.yaml")
-    assert npc_lineup_id == "stochopia.npc-lineup.fixed.v1"
-    assert len(roles_sha) == 64
+    assert _roles_config_meta(ROOT / "config" / "benchmark_roles.yaml") == {
+        "npc_lineup_id": "stochopia.npc-lineup.fixed.v1"
+    }
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-09 (三): history scopes, consult gate, failed runs, lattice brief
+# ---------------------------------------------------------------------------
+
+
+class _CapturingClient(BaseLLMClient):
+    def __init__(self, reply: str):
+        super().__init__()
+        self.reply = reply
+        self.calls: list[list[dict]] = []
+
+    async def chat(self, messages, temperature=None, max_tokens=None, seed=None) -> str:
+        self.calls.append(messages)
+        return self.reply
+
+
+@pytest.mark.asyncio
+async def test_client_decision_review_does_not_enter_query_history():
+    client_llm = _CapturingClient(_CLIENT_ACCEPT)
+    env = env_with_agents(_make_agents(client=client_llm), full=False)
+    quote = env.request_quote(parse_product_spec(product_payload()))
+    env.submit_design(quote["quote_id"], "ok")
+    await env.workflow_review(quote["quote_id"], "ok")
+    assert "client_decision" in json.dumps(client_llm.calls[-1], ensure_ascii=False)
+    await env.query_client_llm("maturity")
+    query_messages = json.dumps(client_llm.calls[-1], ensure_ascii=False)
+    # The later topic query is answered from a history without the full profile.
+    assert "client_decision" not in query_messages
+    assert "risk_appetite" not in query_messages
+
+
+@pytest.mark.asyncio
+async def test_consult_draft_outside_lattice_is_not_priced():
+    desk = MockLLMClient(
+        ['{"action":"request_revision","quote_id":null,"hedge_tags":[],"suggestions":[],"narrative":""}'])
+    env = env_with_agents(_make_agents(desk=desk))
+    draft = {**product_payload(notional=1_234_567), "maturity_months": 4}
+    resp = await env.consult("trading_desk", "price this", draft)
+    assert resp["deterministic_block"] is None
+    assert resp["draft_error"].startswith("DOMAIN:")
+    assert "suitability" not in (await env.consult(
+        "trading_desk", "again", product_payload()))["deterministic_block"]
+
+
+@pytest.mark.asyncio
+async def test_provider_error_returns_failed_partial_trace():
+    quote = json.dumps({"action": "request_quote", "product": product_payload()})
+
+    class _DiesOnSecondCall(MockLLMClient):
+        async def chat(self, messages, temperature=None, max_tokens=None, seed=None) -> str:
+            self.total_usage["calls"] += 1
+            if self.total_usage["calls"] > 1:
+                raise LLMError("non-retryable 400")
+            return quote
+
+    trace = await run_episode(environment(), _DiesOnSecondCall([]), strategy="quote_and_revise")
+    assert trace.status == "failed"
+    assert "non-retryable 400" in trace.error
+    assert len(trace.rounds) == 1
+    assert trace.rounds[0].actions[0].action == "request_quote"
+
+
+@pytest.mark.asyncio
+async def test_round_message_lists_lattice_without_changing_brief_snapshot():
+    skip = json.dumps({"action": "submit_product", "product": product_payload(), "explanation": "ok"})
+
+    class _Recorder(MockLLMClient):
+        seen: list = []
+
+        async def chat(self, messages, temperature=None, max_tokens=None, seed=None) -> str:
+            self.seen.append(messages[-1]["content"])
+            return skip
+
+    client = _Recorder([])
+    trace = await run_episode(single_round_environment(), client, strategy="quote_and_revise")
+    first = json.loads(client.seen[0].split("\n", 1)[1])
+    assert first["product_domain"]["maturities"] == [3]
+    assert first["product_domain"]["notional_rule"]["allowed_values"] is None  # partial
+    assert trace.status == "complete"
+    snapshot = trace.rounds[0].client_brief_snapshot
+    assert snapshot is not None and "product_domain" not in snapshot
+
+
+def test_partial_dynamic_capital_query_discloses_round_lattice_notionals():
+    """After an accepted trade the capital topic returns available cash, not the
+    scheduled capital the lattice scales; the query also lists the exact
+    lattice notionals so a legal notional stays constructible."""
+    domain = ProductDomainSpec(
+        product_types=("vanilla_call",), notional_fractions=(.02, .05, .10), maturities=(3,),
+        strikes=(.95,), barriers=(.85,), coupons=(.08,), participations=(1.0,),
+        principal_protected=(True,),
+    )
+    env = LongHorizonEnvironment(
+        environment().snapshots, _client_profile(), _risk_budget(),
+        BenchmarkCondition(False, True), domain=domain,
+    )
+    assert env.policy_action_schema()["notional_rule"]["allowed_values"] is None
+    first = env.query_client("capital")
+    quote = env.request_quote(parse_product_spec(product_payload(notional=first["allowed_notionals"][-1])))
+    assert env.submit_design(quote["quote_id"], "x")["accepted"] is True
+    env.advance_round()
+    assert env.policy_action_schema()["notional_rule"]["allowed_values"] is None
+    second = env.query_client("capital")
+    assert second["answer"] < 10_000_000  # available cash after the locked issue
+    assert second["allowed_notionals"] == [200_000, 500_000, 1_000_000]
+    assert env.policy_action_schema()["notional_rule"]["allowed_values"] == [200_000, 500_000, 1_000_000]
+    env.request_quote(parse_product_spec(product_payload(notional=second["allowed_notionals"][0])))

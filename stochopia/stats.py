@@ -15,6 +15,8 @@ import math
 import random
 from typing import Literal, Mapping, Sequence
 
+from .common import normal_cdf
+
 
 class StatsError(Exception):
     """Inputs to a statistics routine are empty, misaligned, or malformed."""
@@ -65,13 +67,14 @@ def bootstrap_ci(
     n_resamples: int = 10_000,
     alpha: float = 0.05,
     seed: int,
-) -> tuple[float, float, float]:
+) -> tuple[float, float | None, float | None]:
     """Percentile bootstrap CI for the mean of ``values``.
 
     Returns ``(mean, lo, hi)`` where ``mean`` is the observed sample mean and
     ``(lo, hi)`` is the ``1 - alpha`` percentile bootstrap interval computed
     from ``n_resamples`` resamples-with-replacement, using a seeded RNG so
-    the result is exactly reproducible.
+    the result is exactly reproducible. With one value the interval is not
+    estimable and ``lo``/``hi`` are ``None``.
     """
     values = [float(v) for v in values]
     if not values:
@@ -79,7 +82,7 @@ def bootstrap_ci(
     n = len(values)
     mean = sum(values) / n
     if n == 1:
-        return mean, mean, mean
+        return mean, None, None
     rng = random.Random(seed)
     means = []
     for _ in range(n_resamples):
@@ -101,7 +104,7 @@ def cluster_bootstrap_ci(
     n_resamples: int = 10_000,
     alpha: float = 0.05,
     seed: int,
-) -> tuple[float, float, float]:
+) -> tuple[float, float | None, float | None]:
     """Cluster (two-stage) percentile bootstrap CI for the mean of ``metric``.
 
     Rows are grouped by ``cluster_key`` (episode by default, per the
@@ -113,7 +116,8 @@ def cluster_bootstrap_ci(
 
     Rows missing ``cluster_key`` or ``metric`` (or with a non-numeric /
     ``None`` metric value) are silently skipped so partially-populated
-    result directories degrade gracefully instead of raising.
+    result directories degrade gracefully instead of raising. With one
+    cluster the interval is not estimable and ``lo``/``hi`` are ``None``.
     """
     grouped: dict[str, list[float]] = {}
     for row in rows:
@@ -130,7 +134,7 @@ def cluster_bootstrap_ci(
     point_mean = sum(all_values) / len(all_values)
     n_clusters = len(clusters)
     if n_clusters == 1:
-        return point_mean, point_mean, point_mean
+        return point_mean, None, None
     rng = random.Random(seed)
     means = []
     for _ in range(n_resamples):
@@ -181,10 +185,6 @@ def _exact_signed_rank_distribution(doubled_ranks: Sequence[int]) -> list[int]:
             if dp[s - rank]:
                 dp[s] += dp[s - rank]
     return dp
-
-
-def _normal_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
 def wilcoxon_signed_rank(
@@ -254,7 +254,7 @@ def wilcoxon_signed_rank(
         z = (w_pos - mean - 0.5) / sd
     else:
         z = (w_pos - mean + 0.5) / sd
-    p_value = 2.0 * (1.0 - _normal_cdf(abs(z)))
+    p_value = 2.0 * (1.0 - normal_cdf(abs(z)))
     return statistic, min(1.0, max(0.0, p_value))
 
 

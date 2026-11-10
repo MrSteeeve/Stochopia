@@ -25,7 +25,7 @@ from stochopia.env_agents import (
     parse_risk_response,
     validate_grounding,
 )
-from stochopia.llm import BaseLLMClient, MockLLMClient, load_model_registry
+from stochopia.llm import BaseLLMClient, LLMError, MockLLMClient, load_model_registry
 from stochopia.role_config import (
     InferenceSpec,
     JudgesConfig,
@@ -82,19 +82,15 @@ def build_spec(
         protocol_version=ROLE_PROTOCOL_VERSION,
         role=role,  # type: ignore[arg-type]
         system_prompt_file=Path("dummy.md"),
-        system_prompt_sha256="",
         inference=InferenceSpec(
             model_ref="mock",
             temperature=0.0,
             max_tokens=500,
-            timeout_s=30.0,
             seed_policy=seed_policy,  # type: ignore[arg-type]
             seed_offset=seed_offset,
         ),
-        retry=RetryPolicy(transport_retries=1, format_retries=1),
+        retry=RetryPolicy(transport_retries=1),
         output_schema=output_schema,
-        tools=(),
-        max_calls_per_round=3,
         history_scope=history_scope,  # type: ignore[arg-type]
         numeric_authority=numeric_authority,  # type: ignore[arg-type]
         failure_policy=failure_policy,
@@ -127,19 +123,17 @@ def client_agent(responses, **kw) -> FrozenEnvAgent:
 def test_load_real_benchmark_roles():
     reg = load_model_registry(ROOT / "config" / "models.yaml")
     specs = load_role_specs(ROOT / "config" / "benchmark_roles.yaml", reg)
-    assert set(specs) == {"structurer", "client_main", "risk_control", "trading_desk"}
-    assert specs["structurer"].inference.model_ref == "${job.model}"
+    # The tested structurer uses the packaged prompt; it is not a config role.
+    assert set(specs) == {"client_main", "risk_control", "trading_desk"}
     assert all(
         spec.protocol_version == ROLE_PROTOCOL_VERSION for spec in specs.values()
     )
-    assert specs["structurer"].numeric_authority == "none"
     for rid in ("client_main", "risk_control", "trading_desk"):
         assert specs[rid].numeric_authority == "supplied_facts_only"
     # seed_offset 互异
     offsets = {s.inference.seed_offset for s in specs.values()}
     assert len(offsets) == len(specs)
-    # prompt hash 在加载时计算
-    assert all(len(s.system_prompt_sha256) == 64 for s in specs.values())
+    assert all(s.system_prompt_file.is_file() for s in specs.values())
 
 
 def _write_config(tmp_path: Path, roles: dict, *, judges: dict | None = None) -> Path:
@@ -154,14 +148,15 @@ def _write_config(tmp_path: Path, roles: dict, *, judges: dict | None = None) ->
 
 def _good_roles() -> dict:
     return {
-        "structurer": {
-            "role": "structurer",
-            "model_ref": "${job.model}",
+        "risk_control": {
+            "role": "risk_control",
+            "model_ref": "mock",
             "system_prompt_file": "p.md",
-            "output_schema": "stochopia.role.structurer-action.v1",
+            "output_schema": "stochopia.role.risk-response.v1",
             "seed_offset": 1000,
-            "numeric_authority": "none",
-            "failure_policy": "no_action",
+            "history_scope": "round",
+            "numeric_authority": "supplied_facts_only",
+            "failure_policy": "escalate",
         },
         "client_main": {
             "role": "client",
@@ -179,7 +174,7 @@ def test_load_good_temp_config(tmp_path):
     reg = load_model_registry(ROOT / "config" / "models.yaml")
     path = _write_config(tmp_path, _good_roles())
     specs = load_role_specs(path, reg, base_dir=tmp_path)
-    assert set(specs) == {"structurer", "client_main"}
+    assert set(specs) == {"risk_control", "client_main"}
 
 
 def test_reject_missing_or_wrong_protocol_version(tmp_path):
@@ -209,7 +204,7 @@ def test_reject_unknown_field(tmp_path):
 def test_reject_duplicate_seed_offset(tmp_path):
     reg = load_model_registry(ROOT / "config" / "models.yaml")
     roles = _good_roles()
-    roles["client_main"]["seed_offset"] = 1000  # 与 structurer 撞
+    roles["client_main"]["seed_offset"] = 1000  # 与 risk_control 撞
     path = _write_config(tmp_path, roles)
     with pytest.raises(RoleConfigError, match="seed_offset"):
         load_role_specs(path, reg, base_dir=tmp_path)
@@ -261,10 +256,18 @@ def _judges_node(**overrides) -> dict:
         "repeats": 3,
         "temperature": 0.0,
         "max_tokens": 1200,
-        "blind_model_identity": True,
     }
     node.update(overrides)
     return node
+
+
+def test_structurer_is_not_a_config_role(tmp_path):
+    reg = load_model_registry(ROOT / "config" / "models.yaml")
+    roles = _good_roles()
+    roles["risk_control"]["role"] = "structurer"
+    path = _write_config(tmp_path, roles)
+    with pytest.raises(RoleConfigError, match="role 非法"):
+        load_role_specs(path, reg, base_dir=tmp_path)
 
 
 def test_real_benchmark_roles_judges_config_matches_yaml():
@@ -273,7 +276,6 @@ def test_real_benchmark_roles_judges_config_matches_yaml():
     assert isinstance(judges, JudgesConfig)
     assert judges.models == ("deepseek-v4-pro", "qwen-max")
     assert judges.repeats == 3
-    assert judges.blind_model_identity is True
 
 
 def test_load_judges_config_reads_repeats_and_models(tmp_path):
@@ -418,21 +420,21 @@ def test_validate_grounding_direct():
 
     ok_resp = RoleResponse(
         role_id="client", status="ok", action="answer", payload={},
-        narrative="资金 5,000,000 元", cited_fact_ids=("capital",), raw_hash="",
+        narrative="资金 5,000,000 元", cited_fact_ids=("capital",),
     )
     ok, viol = validate_grounding(ok_resp, facts)
     assert ok and viol == ()
 
     bad_num = RoleResponse(
         role_id="client", status="ok", action="answer", payload={},
-        narrative="我最多亏 999 万", cited_fact_ids=(), raw_hash="",
+        narrative="我最多亏 999 万", cited_fact_ids=(),
     )
     ok, viol = validate_grounding(bad_num, facts)
     assert not ok and any("未授权数字" in v for v in viol)
 
     bad_ref = RoleResponse(
         role_id="risk", status="ok", action="approve", payload={},
-        narrative="", cited_fact_ids=("FAKE_CHECK",), raw_hash="",
+        narrative="", cited_fact_ids=("FAKE_CHECK",),
     )
     ok, viol = validate_grounding(bad_ref, facts)
     assert not ok and any("id" in v for v in viol)
@@ -610,6 +612,46 @@ async def test_agent_uses_cache_across_instances():
     assert r2.action == "answer"
 
 
+async def test_cache_replay_after_format_repair_reproduces_history():
+    """A cached reply that needed a repair turn replays the same history, so
+    the next request's cache key still hits."""
+    good = '{"action":"answer","disclose_fields":[],"reason_codes":[],"narrative":"hi"}'
+    cache = EnvResponseCache()
+    spec = build_spec("client", "stochopia.role.client-response.v1", "abstain")
+
+    async def run(responses):
+        agent = FrozenEnvAgent(spec, MockLLMClient(responses), system_prompt="SYS", cache=cache)
+        for turn in range(2):
+            await agent.respond(make_request(turn_id=turn, payload={"turn": turn}))
+        return agent
+
+    live = await run(["garbage", good, good])
+    replay = await run([good])
+    assert replay.client.total_usage["calls"] == 0
+    assert replay.history == live.history
+
+
+async def test_programming_error_in_client_is_not_swallowed():
+    class Broken(BaseLLMClient):
+        async def chat(self, messages, temperature=None, max_tokens=None, seed=None):
+            raise ValueError("bug")
+
+    spec = build_spec("client", "stochopia.role.client-response.v1", "abstain")
+    agent = FrozenEnvAgent(spec, Broken(), system_prompt="SYS")
+    with pytest.raises(ValueError):
+        await agent.respond(make_request())
+
+
+async def test_provider_error_degrades():
+    class Down(BaseLLMClient):
+        async def chat(self, messages, temperature=None, max_tokens=None, seed=None):
+            raise LLMError("HTTP 503")
+
+    spec = build_spec("client", "stochopia.role.client-response.v1", "abstain")
+    resp = await FrozenEnvAgent(spec, Down(), system_prompt="SYS").respond(make_request())
+    assert resp.degraded and resp.error_class == "provider"
+
+
 # ===========================================================================
 # 6. FrozenEnvAgent 端到端 + 降级
 # ===========================================================================
@@ -711,3 +753,16 @@ def test_normalize_number_forms():
     assert normalize_number("1.0") == "1"
     assert normalize_number("0.080") == "0.08"
     assert normalize_number("8%") == "8"
+
+
+def test_desk_and_risk_roles_must_use_round_history(tmp_path):
+    """workflow_review hands desk/risk the unredacted quote; only round scope
+    keeps it out of later policy-visible consult replies."""
+    roles = _good_roles()
+    roles["risk_control"]["history_scope"] = "episode"
+    with pytest.raises(RoleConfigError, match="history_scope"):
+        load_role_specs(
+            _write_config(tmp_path, roles),
+            load_model_registry(ROOT / "config" / "models.yaml"),
+            base_dir=tmp_path,
+        )

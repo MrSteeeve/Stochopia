@@ -55,7 +55,7 @@ def test_manifest_custom_replicates_by_condition():
     payload = manifest_payload(jobs)
     assert payload["protocol"]["replicates_by_condition"]["full_static"] == 4
     assert payload["protocol"]["replicates_by_condition"]["partial_dynamic"] == 8
-    assert payload["manifest_fingerprint"]
+    assert "manifest_fingerprint" not in payload
 
 
 def test_manifest_rejects_replicates_below_three():
@@ -80,6 +80,8 @@ def test_paired_condition_contrasts_means_backward_compatible():
     # market-path replication unit before inference.
     assert result["dynamic_pairs"] == 1
     assert result["partial_pairs"] == 1
+    # One pair: the bootstrap interval is not estimable, not [mean, mean].
+    assert result["dynamic_degradation"]["ci"] is None
 
 
 def test_paired_condition_contrasts_adds_ci_and_significance():

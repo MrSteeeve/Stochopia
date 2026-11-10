@@ -1,15 +1,14 @@
 """Download and parse CFFEX monthly daily-market archives.
 
 The public archive contains one GB18030-encoded CSV per trading day.  This
-module keeps the downloaded ZIP files immutable, records their SHA256 hashes,
-and emits a normalized CSV containing only IC, IM, and MO contracts.
+module keeps the downloaded ZIP files immutable, writes one metadata sidecar per
+month, and emits a normalized CSV containing only IC, IM, and MO contracts.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import io
 import json
 import os
@@ -20,9 +19,10 @@ import urllib.error
 import urllib.request
 import zipfile
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import BinaryIO, ContextManager
+from .common import atomic_write_text, canonical_json
 
 
 DEFAULT_BASE_URL = (
@@ -30,10 +30,19 @@ DEFAULT_BASE_URL = (
 )
 DEFAULT_RAW_DIR = Path("data/raw/cffex")
 DEFAULT_PRODUCTS = ("IC", "IM", "MO")
-DEFAULT_START_MONTH = "202201"
+DEFAULT_START_MONTH = "201504"
 DEFAULT_END_MONTH = "202512"
 DEFAULT_MIN_INTERVAL = 2.1
 USER_AGENT = "Stochopia-CFFEX-downloader/0.1"
+CFFEX_ARCHIVE_SIDECAR_SCHEMA = "stochopia.cffex-archive-sidecar.v1"
+CFFEX_SOURCE_RECORD = {
+    "provider": "China Financial Futures Exchange",
+    "historical_download_page": "https://www.cffex.com.cn/lssjxz/",
+    "data_service_page": "https://www.cffex.com.cn/lssjfw/",
+    "license_decision_path": "data/reference/license_decision.json",
+    "permitted_use": "local_research_only",
+    "raw_redistribution": False,
+}
 
 _MONTH_RE = re.compile(r"^(?P<year>\d{4})(?P<month>\d{2})$")
 _DAILY_MEMBER_RE = re.compile(r"(?P<date>\d{8})_1\.csv$", re.IGNORECASE)
@@ -105,10 +114,10 @@ class ArchiveRecord:
     month: str
     path: str
     url: str
-    sha256: str
     size_bytes: int
     csv_members: int
     cached: bool
+    sidecar_path: str | None = None
 
 
 def validate_month(value: str) -> str:
@@ -138,16 +147,6 @@ def iter_months(start: str, end: str) -> Iterator[str]:
         if month == 13:
             year += 1
             month = 1
-
-
-def sha256_file(path: Path) -> str:
-    """Compute a file SHA256 without loading the whole archive into memory."""
-
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def validate_archive(path: Path) -> int:
@@ -180,11 +179,31 @@ def _archive_record(month: str, path: Path, url: str, cached: bool) -> ArchiveRe
         month=month,
         path=str(path),
         url=url,
-        sha256=sha256_file(path),
         size_bytes=path.stat().st_size,
         csv_members=validate_archive(path),
         cached=cached,
     )
+
+
+def _archive_sidecar_payload(record: ArchiveRecord) -> dict[str, object]:
+    return {
+        "schema": CFFEX_ARCHIVE_SIDECAR_SCHEMA,
+        "provider": CFFEX_SOURCE_RECORD["provider"],
+        "month": record.month,
+        "url": record.url,
+        "archive_path": Path(record.path).name,
+        "size_bytes": record.size_bytes,
+        "csv_members": record.csv_members,
+        "source": CFFEX_SOURCE_RECORD,
+    }
+
+
+def write_archive_sidecar(record: ArchiveRecord, raw_dir: Path) -> ArchiveRecord:
+    """Write (or refresh) the archive's ``metadata/<month>.json`` sidecar."""
+
+    target = raw_dir / "metadata" / f"{record.month}.json"
+    atomic_write_text(target, canonical_json(_archive_sidecar_payload(record)) + "\n")
+    return replace(record, sidecar_path=str(target))
 
 
 def download_month(
@@ -197,7 +216,7 @@ def download_month(
     opener: Callable[[str, float], ContextManager[BinaryIO]] = _default_opener,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> ArchiveRecord:
-    """Download one month with retries, ZIP validation, and atomic replacement."""
+    """Download one month, reusing a valid cached archive when present."""
 
     month = validate_month(month)
     if retries < 1:
@@ -206,12 +225,14 @@ def download_month(
     target = raw_dir / f"{month}.zip"
     url = base_url.format(yyyymm=month)
 
+    def complete(record: ArchiveRecord) -> ArchiveRecord:
+        return write_archive_sidecar(record, raw_dir)
+
     if target.exists():
         try:
-            return _archive_record(month, target, url, cached=True)
+            return complete(_archive_record(month, target, url, cached=True))
         except ValueError:
-            # Preserve the suspect file until a verified replacement is ready.
-            pass
+            pass  # corrupt or truncated archive: download it again
 
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
@@ -233,7 +254,7 @@ def download_month(
             validate_archive(temp_path)
             os.replace(temp_path, target)
             temp_path = None
-            return _archive_record(month, target, url, cached=False)
+            return complete(_archive_record(month, target, url, cached=False))
         except (OSError, urllib.error.URLError, ValueError) as exc:
             last_error = exc
             if temp_path is not None:
@@ -294,16 +315,6 @@ def download_range(
         if not record.cached:
             last_new_download_completed = clock()
     return records
-
-
-def write_sha256_manifest(records: Iterable[ArchiveRecord], path: Path) -> None:
-    """Atomically write a conventional SHA256 manifest sorted by month."""
-
-    rows = sorted(records, key=lambda record: record.month)
-    content = "".join(
-        f"{record.sha256}  {Path(record.path).name}\n" for record in rows
-    )
-    _atomic_write_text(path, content)
 
 
 def _parse_number(value: str | None) -> float | None:
@@ -409,22 +420,6 @@ def write_normalized_csv(
     return row_count
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-    except BaseException:
-        Path(temp_name).unlink(missing_ok=True)
-        raise
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CFFEX IC/IM/MO archive utilities")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -439,7 +434,6 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--retries", type=int, default=1)
     download.add_argument("--timeout", type=float, default=30.0)
     download.add_argument("--min-interval", type=float, default=DEFAULT_MIN_INTERVAL)
-    download.add_argument("--manifest", type=Path)
 
     parse = subparsers.add_parser(
         "parse", help="parse downloaded archives into one normalized CSV"
@@ -464,15 +458,9 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             min_interval=args.min_interval,
         )
-        manifest = args.manifest or args.raw_dir / "manifest.sha256"
-        write_sha256_manifest(records, manifest)
         print(
             json.dumps(
-                {
-                    "archives": len(records),
-                    "cached": sum(record.cached for record in records),
-                    "manifest": str(manifest),
-                },
+                {"archives": len(records), "cached": sum(record.cached for record in records)},
                 ensure_ascii=False,
             )
         )

@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 
-import inspect
 import stochopia.pricing as pricing_module
 
 from stochopia.products import (
@@ -23,8 +23,6 @@ from stochopia.pricing import (
     bs_greeks,
     bs_put,
     barrier_option,
-    best_case_line,
-    build_payoff_table,
     evaluate_product,
     expected_payoff,
     hurdle_hit_prob,
@@ -560,10 +558,11 @@ def test_evaluate_product_returns_required_keys(kwargs):
         "hedging_cost",
         "pricing_details",
         "client_price",
-        "expected_payoff",
         "loss_frac",
     ):
         assert key in result
+    # The unread P-measure expected payoff is no longer computed here.
+    assert "expected_payoff" not in result
     for key in ("delta", "gamma", "vega", "theta", "vega_pct"):
         assert key in result["greeks"]
     assert result["client_price"] == pytest.approx(1.03 * result["fair_value"])
@@ -722,7 +721,8 @@ def test_fair_value_stress_keeps_fixed_barrier_direction_after_spot_crossing():
     market = _market()
     base_fair_value = price_product(product, market)["fair_value"]
 
-    loss, worst_id = pricing_module._fair_value_stress_loss(product, market)
+    profile = pricing_module.fair_value_stress_profile(product, market)
+    loss, worst_id = profile.client_value_loss, profile.client_worst_stress_id
 
     assert worst_id == "spot_up_20"
     assert loss == pytest.approx(base_fair_value)
@@ -748,7 +748,7 @@ def test_fair_value_stress_freezes_reference_without_rescaling_terms(
         return {"fair_value": 1.0}
 
     monkeypatch.setattr(pricing_module, "price_product", _capture_price)
-    pricing_module._fair_value_stress_loss(product, _market())
+    pricing_module.fair_value_stress_profile(product, _market())
 
     stressed = captured[1:]
     assert len(stressed) == 3
@@ -777,7 +777,7 @@ def test_fair_value_stress_freezes_reference_for_implicit_coupon_barriers(
         return {"fair_value": 1.0}
 
     monkeypatch.setattr(pricing_module, "price_product", _capture_price)
-    pricing_module._fair_value_stress_loss(product, _market(spot=100.0))
+    pricing_module.fair_value_stress_profile(product, _market(spot=100.0))
 
     assert all(p.reference_spot == pytest.approx(100.0) for p in captured[1:])
     assert all(p.barrier_pct == pytest.approx(0.75) for p in captured[1:])
@@ -927,120 +927,83 @@ def test_barrier_hurdle_and_diagnostics_honor_explicit_fixed_direction():
     assert diag.pv_mean_frac == 0.0
 
 
-# ---------------------------------------------------------------------------
-# build_payoff_table
-# ---------------------------------------------------------------------------
+def test_barrier_closed_form_uses_monthly_monitoring_correction():
+    """Closed form (BGK-shifted) tracks the monthly-monitored MC used by the
+    lifecycle; the uncorrected continuous formula is much further off."""
+    from stochopia.pricing import barrier_option, mc_diagnostics, price_product
+    from stochopia.products import MarketState, ProductSpec
+
+    market = MarketState(1, "CSI500", 6000.0, 0.20, 0.02, 0.0, "", "")
+    spec = ProductSpec("barrier_call", 1e6, 12, 1.0, 1.20, "knock_out", None, 1.0, False, "x", "", "")
+    closed = price_product(spec, market)["fair_value"] / 1e6
+    monthly = mc_diagnostics(spec, market, n_paths=20000, seed=1).pv_mean_frac
+    continuous = barrier_option(
+        6000.0, 6000.0, 1.0, 0.02, 0.20, 0.0, 7200.0, "knock_out", "call", "up",
+    ) / 6000.0
+    assert abs(closed - monthly) < 0.5 * abs(continuous - monthly)
+    assert abs(closed - monthly) / monthly < 0.10
 
 
-def test_build_payoff_table_custom_is_none():
-    assert build_payoff_table(_product(product_type="custom"), 100.0) is None
+def test_barrier_delta_has_no_jump_when_bump_crosses_untouched_barrier():
+    """A delta bump across the true barrier only moves the future path's start:
+    with no observed touch it must not price as knocked (review example)."""
+    from stochopia.pricing import price_product
+    from stochopia.products import MarketState, ProductSpec
 
-
-def test_build_payoff_table_no_market_state_in_signature():
-    """build_payoff_table 签名不含 MarketState 参数（防信息泄漏）。"""
-    sig = inspect.signature(build_payoff_table)
-    param_annotations = [p.annotation for p in sig.parameters.values()]
-    from stochopia.products import MarketState as _MS
-    assert _MS not in param_annotations
-
-
-def test_build_payoff_table_protected_vanilla_call_floor_rows():
-    """保本 ATM 看涨期权：所有负涨跌情景的到期收益 = 1.0000（保本地板）。"""
-    product = _product(
-        product_type="vanilla_call",
-        principal_protected=True,
-        participation_rate=1.0,
-        strike_pct=1.0,
+    market = MarketState(1, "CSI500", 109.0, 0.20, 0.02, 0.0, "", "")
+    spec = ProductSpec(
+        "barrier_call", 1e6, 3, 1.0, 1.10, "knock_out", None, 1.0, False, "x", "", "",
+        reference_spot=100.0, barrier_direction="up", elapsed_months=1,
     )
-    table = build_payoff_table(product, 100.0)
-    assert table is not None
-    # 解析表格行，检查 -20%/-10%/-5%/0% 各行收益均为 1.0000
-    for label in ["-20%", "-10%", "-5%", "0%"]:
-        # 找到含该标签的行
-        row = next(line for line in table.splitlines() if label in line)
-        # 最后一个空格分隔字段是收益值
-        value = float(row.strip().split()[-1])
-        assert value == pytest.approx(1.0, abs=1e-4), f"{label} 行收益应为 1.0，实际 {value}"
-
-
-def test_build_payoff_table_barrier_ko_triggered_column():
-    """barrier knock_out：已触发列 = 保本时 1.0000，非保本时 0.0000。"""
-    # 非保本
-    p_noprotect = _product(
-        product_type="barrier_call",
-        barrier_pct=1.2,
-        barrier_type="knock_out",
-        principal_protected=False,
-    )
-    table_np = build_payoff_table(p_noprotect, 100.0)
-    assert table_np is not None
-    # 所有数据行的第三列（已触发障碍）应为 0.0000
-    data_lines = [
-        line for line in table_np.splitlines()
-        if "%" in line and "-" not in line.strip()[0:1]
-    ]
-    # 取含 % 的数据行
-    data_lines = [l for l in table_np.splitlines() if "%" in l and l.strip() and not l.startswith("-")]
-    for row in data_lines:
-        parts = row.strip().split()
-        triggered_val = float(parts[-1])
-        assert triggered_val == pytest.approx(0.0, abs=1e-4)
-
-    # 保本
-    p_protect = _product(
-        product_type="barrier_call",
-        barrier_pct=1.2,
-        barrier_type="knock_out",
-        principal_protected=True,
-    )
-    table_p = build_payoff_table(p_protect, 100.0)
-    assert table_p is not None
-    data_lines_p = [l for l in table_p.splitlines() if "%" in l and l.strip() and not l.startswith("-")]
-    for row in data_lines_p:
-        parts = row.strip().split()
-        triggered_val = float(parts[-1])
-        assert triggered_val == pytest.approx(1.0, abs=1e-4)
-
-
-def test_build_payoff_table_snowball_mentions_knock_lines():
-    """雪球情景表包含敲出和敲入场景描述。"""
-    product = _product(
-        product_type="snowball",
-        barrier_pct=0.75,
-        barrier_type="knock_in",
-        coupon_rate=0.12,
-    )
-    table = build_payoff_table(product, 100.0)
-    assert table is not None
-    assert "敲出" in table
-    assert "敲入" in table
+    result = price_product(spec, market)
+    assert -0.4 < result["greeks"]["delta"] < 0.0  # was -0.79 from the bump jump
+    bumped = price_product(spec, replace(market, spot=110.09))
+    assert bumped["fair_value"] > 0.5 * result["fair_value"]
 
 
 # ---------------------------------------------------------------------------
-# best_case_line
+# 2026-11-09 (三): t=0 is not a knock-in observation; stress base reuse
 # ---------------------------------------------------------------------------
 
 
-def test_best_case_line_custom_is_none():
-    assert best_case_line(_product(product_type="custom"), _market(), 50_000.0) is None
+def test_mc_knock_in_ignores_bumped_current_spot():
+    """A bumped spot below KI at t=0 must not count as an observed knock-in.
+
+    Mid-life unprotected autocall, KI 0.85, current spot 85.5% of fixing: a
+    -1% delta bump used to land below the barrier at t=0 and knock in every
+    path, giving a finite-difference delta of ~1.34 of notional.
+    """
+    ref = 100.0
+
+    def pv(spot: float, **kwargs) -> float:
+        return pricing_module.autocallable_price(
+            spot, 12, 0.02, 0.22, 0.0, 0.08, barrier_pct=0.85,
+            fixing_ratio=ref / spot, elapsed_months=3, **kwargs,
+        )["fair_value"]
+
+    delta = (pv(85.5 * 1.01) - pv(85.5 * 0.99)) / 0.02
+    assert delta < 1.1
+    # Observed history still knocks in through the explicit flag.
+    assert pv(90.0, already_knocked_in=True) < pv(90.0)
 
 
-def test_best_case_line_snowball_contains_coupon_pct():
-    """雪球最高情景行包含票息年化百分比。"""
-    product = _product(
-        product_type="snowball",
-        barrier_pct=0.75,
-        barrier_type="knock_in",
-        coupon_rate=0.12,
-    )
-    line = best_case_line(product, _market(), 50_000.0)
-    assert line is not None
-    assert "12.0%" in line
+def test_stress_profile_reuses_supplied_base():
+    product = _product(maturity_months=6)
+    market = _market()
+    base = evaluate_product(product, market)
+    calls = {"n": 0}
+    original = pricing_module.price_product
 
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs)
 
-def test_best_case_line_vanilla_call_uncapped_suffix():
-    """无封顶香草看涨期权摘要行包含「上不封顶」。"""
-    product = _product(product_type="vanilla_call")
-    line = best_case_line(product, _market(), 50_000.0)
-    assert line is not None
-    assert "上不封顶" in line
+    pricing_module.price_product = counting
+    try:
+        with_base = pricing_module.fair_value_stress_profile(product, market, base=base)
+        n_with_base = calls["n"]
+        without = pricing_module.fair_value_stress_profile(product, market)
+    finally:
+        pricing_module.price_product = original
+    assert calls["n"] - n_with_base == n_with_base + 1
+    assert with_base == without

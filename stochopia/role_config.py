@@ -1,15 +1,15 @@
 """角色配置 schema（v2 全角色 LLM 化基础设施）。
 
-按 draft_codex §2 实现 RoleSpecV2 / InferenceSpec / RetryPolicy 与
+按 DESIGN_REFERENCE.md C§2 实现 RoleSpecV2 / InferenceSpec / RetryPolicy 与
 ``load_role_specs``。连接信息仍放 ``config/models.yaml``，角色行为放
 ``config/benchmark_roles.yaml``；本模块只负责把后者严格加载为冻结的
-RoleSpecV2 集合，并在加载时计算 system prompt 的 SHA256。
+RoleSpecV2 集合。
 
 loader 采取 fail-fast：任何未知字段、重复 role、缺失 prompt、模型不在
 registry、seed_offset 重复、或 client/risk/desk 的 numeric_authority 不是
-``supplied_facts_only`` 都会抛 :class:`RoleConfigError`。structurer 的
-``model_ref`` 支持 ``${job.model}`` 占位，加载时原样保留，由调用方在建 job
-时解析为具体测试模型名。
+``supplied_facts_only`` 都会抛 :class:`RoleConfigError`。只收代码真正读取的字段。被测
+structurer 不在此配置：其模型由 CLI/manifest 指定，prompt 为打包的
+``stochopia/resources/structurer.md``。
 
 ``judges:`` 节（离线 judge-runs 批跑的默认模型/repeats）由 :func:`load_judges_config`
 加载为 :class:`JudgesConfig`；``load_role_specs`` 在其存在时也会做同样的校验，
@@ -19,7 +19,6 @@ judge-runs 的自评跳过按精确模型名比较实现，模型家族推断不
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -28,41 +27,33 @@ import yaml
 
 from .llm import ModelRegistry
 
-# structurer 的 model_ref 占位：加载时不解析，由调用方在建 job 时替换为具体测试模型
-JOB_MODEL_PLACEHOLDER = "${job.model}"
 ROLE_PROTOCOL_VERSION = "stochopia.csi.legacy.v1"
 
-# 环境角色（非 structurer、非 judge）的数值权威只允许这一个取值：一切数字都来自
+# 环境角色（非 judge）的数值权威只允许这一个取值：一切数字都来自
 # 系统注入的 supplied facts，角色不得自行编造数字。
 _SUPPLIED_FACTS_ONLY = "supplied_facts_only"
 
-_ROLE_TYPES = ("structurer", "client", "risk_control", "trading_desk", "judge")
+_ROLE_TYPES = ("client", "risk_control", "trading_desk", "judge")
 # 这些角色类型必须 numeric_authority == supplied_facts_only
 _NUMERIC_LOCKED_ROLES = frozenset({"client", "risk_control", "trading_desk"})
 
 _ALLOWED_TOP_KEYS = frozenset({"protocol_version", "main_npc_lineup_id", "roles", "judges"})
-_ALLOWED_JUDGES_KEYS = frozenset({
-    "models", "repeats", "temperature", "max_tokens", "blind_model_identity",
-})
+_ALLOWED_JUDGES_KEYS = frozenset({"models", "repeats", "temperature", "max_tokens"})
 _ALLOWED_ROLE_KEYS = frozenset({
     "role",
     "model_ref",
     "system_prompt_file",
-    "private_state_file",
     "temperature",
     "max_tokens",
-    "timeout_s",
     "seed_policy",
     "seed_offset",
     "retry",
     "output_schema",
-    "tools",
-    "max_calls_per_round",
     "history_scope",
     "numeric_authority",
     "failure_policy",
 })
-_ALLOWED_RETRY_KEYS = frozenset({"transport_retries", "format_retries", "backoff_s"})
+_ALLOWED_RETRY_KEYS = frozenset({"transport_retries"})
 _SEED_POLICIES = ("derived", "fixed", "none")
 _HISTORY_SCOPES = ("round", "episode")
 
@@ -78,18 +69,15 @@ class InferenceSpec:
     model_ref: str
     temperature: float
     max_tokens: int
-    timeout_s: float
     seed_policy: Literal["derived", "fixed", "none"]
     seed_offset: int
 
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """传输层与格式层的重试策略。"""
+    """传输层重试次数（格式错只做一次 repair，见 env_agents）。"""
 
     transport_retries: int = 2
-    format_retries: int = 1
-    backoff_s: tuple[float, ...] = (1.0, 2.0)
 
 
 @dataclass(frozen=True)
@@ -105,37 +93,28 @@ class JudgesConfig:
     repeats: int
     temperature: float
     max_tokens: int
-    blind_model_identity: bool
 
 
 @dataclass(frozen=True)
 class RoleSpecV2:
-    """一个角色的完整规格（行为契约 + 推理参数 + prompt 指纹）。"""
+    """一个角色的完整规格（行为契约 + 推理参数 + prompt 文件）。"""
 
     id: str
     protocol_version: str
-    role: Literal["structurer", "client", "risk_control", "trading_desk", "judge"]
+    role: Literal["client", "risk_control", "trading_desk", "judge"]
     system_prompt_file: Path
-    system_prompt_sha256: str
     inference: InferenceSpec
     retry: RetryPolicy
     output_schema: str
-    tools: tuple[str, ...]
-    max_calls_per_round: int
     history_scope: Literal["round", "episode"]
     numeric_authority: Literal["none", "supplied_facts_only"]
     failure_policy: str
-    private_state_file: Path | None = None
 
 
 def _require(mapping: dict, key: str, ctx: str):
     if key not in mapping or mapping[key] is None:
         raise RoleConfigError(f"{ctx} 缺少必填字段 {key!r}")
     return mapping[key]
-
-
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _resolve_path(base_dir: Path, raw: str) -> Path:
@@ -151,13 +130,7 @@ def _parse_retry(raw, ctx: str) -> RetryPolicy:
     unknown = set(raw) - _ALLOWED_RETRY_KEYS
     if unknown:
         raise RoleConfigError(f"{ctx} 的 retry 含未知字段：{sorted(unknown)}")
-    transport = int(raw.get("transport_retries", 2))
-    fmt = int(raw.get("format_retries", 1))
-    backoff_raw = raw.get("backoff_s", (1.0, 2.0))
-    if not isinstance(backoff_raw, (list, tuple)):
-        raise RoleConfigError(f"{ctx} 的 retry.backoff_s 必须是列表")
-    backoff = tuple(float(x) for x in backoff_raw)
-    return RetryPolicy(transport_retries=transport, format_retries=fmt, backoff_s=backoff)
+    return RetryPolicy(transport_retries=int(raw.get("transport_retries", 2)))
 
 
 def _parse_role(
@@ -179,7 +152,7 @@ def _parse_role(
         raise RoleConfigError(f"{ctx} 的 role 非法：{role!r}，合法值 {_ROLE_TYPES}")
 
     model_ref = str(_require(raw, "model_ref", ctx))
-    if model_ref != JOB_MODEL_PLACEHOLDER and model_ref not in registry:
+    if model_ref not in registry:
         available = "、".join(sorted(registry)) or "（无）"
         raise RoleConfigError(
             f"{ctx} 的 model_ref {model_ref!r} 不在模型注册表中，可用模型：{available}"
@@ -189,12 +162,6 @@ def _parse_role(
     prompt_path = _resolve_path(base_dir, prompt_rel)
     if not prompt_path.is_file():
         raise RoleConfigError(f"{ctx} 的 system_prompt_file 不存在：{prompt_path}")
-    prompt_sha = _sha256_text(prompt_path.read_text(encoding="utf-8"))
-
-    private_state_file = raw.get("private_state_file")
-    private_path: Path | None = None
-    if private_state_file is not None:
-        private_path = _resolve_path(base_dir, str(private_state_file))
 
     numeric_authority = str(raw.get("numeric_authority", "none"))
     if numeric_authority not in ("none", _SUPPLIED_FACTS_ONLY):
@@ -216,17 +183,17 @@ def _parse_role(
         raise RoleConfigError(
             f"{ctx} 的 history_scope 非法：{history_scope!r}，合法值 {_HISTORY_SCOPES}"
         )
-
-    tools_raw = raw.get("tools", [])
-    if not isinstance(tools_raw, (list, tuple)):
-        raise RoleConfigError(f"{ctx} 的 tools 必须是列表")
-    tools = tuple(str(t) for t in tools_raw)
+    if role in ("trading_desk", "risk_control") and history_scope != "round":
+        # workflow_review 把未脱敏报价（suitability、客户检查的 observed/limit）交给
+        # 交易台/风控；只有 round 作用域保证它不会进入下一轮 consult 回复的历史。
+        raise RoleConfigError(
+            f"{ctx}（{role}）的 history_scope 必须是 'round'，实际为 {history_scope!r}"
+        )
 
     inference = InferenceSpec(
         model_ref=model_ref,
         temperature=float(raw.get("temperature", 0.0)),
         max_tokens=int(raw.get("max_tokens", 600)),
-        timeout_s=float(raw.get("timeout_s", 30.0)),
         seed_policy=seed_policy,  # type: ignore[arg-type]
         seed_offset=int(raw.get("seed_offset", 0)),
     )
@@ -236,16 +203,12 @@ def _parse_role(
         protocol_version=protocol_version,
         role=role,  # type: ignore[arg-type]
         system_prompt_file=prompt_path,
-        system_prompt_sha256=prompt_sha,
         inference=inference,
         retry=_parse_retry(raw.get("retry"), ctx),
         output_schema=str(_require(raw, "output_schema", ctx)),
-        tools=tools,
-        max_calls_per_round=int(raw.get("max_calls_per_round", 3)),
         history_scope=history_scope,  # type: ignore[arg-type]
         numeric_authority=numeric_authority,  # type: ignore[arg-type]
         failure_policy=str(raw.get("failure_policy", "no_action")),
-        private_state_file=private_path,
     )
 
 
@@ -294,7 +257,6 @@ def _parse_judges(raw: dict, registry: ModelRegistry, ctx: str) -> JudgesConfig:
         repeats=int(raw.get("repeats", 3)),
         temperature=float(raw.get("temperature", 0.0)),
         max_tokens=int(raw.get("max_tokens", 1200)),
-        blind_model_identity=bool(raw.get("blind_model_identity", True)),
     )
 
 
@@ -323,7 +285,7 @@ def load_role_specs(
 ) -> dict[str, RoleSpecV2]:
     """加载 ``benchmark_roles.yaml`` 为 ``dict[role_id -> RoleSpecV2]``。
 
-    ``base_dir`` 用于解析 prompt / private_state 相对路径；缺省时取配置文件所在
+    ``base_dir`` 用于解析 prompt 相对路径；缺省时取配置文件所在
     目录的父目录（即 ``config/benchmark_roles.yaml`` → 仓库根），这样 yaml 里的
     ``scenarios/stochopia_csi/prompts/…`` 这类仓库相对路径可直接命中。
 

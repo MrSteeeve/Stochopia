@@ -8,8 +8,11 @@ from datetime import date
 from statistics import median, pstdev
 from typing import Mapping, Sequence
 
+from .common import normal_cdf
+
 
 SHIBOR_NODES = (1, 7, 14, 30, 91, 182, 274, 365)
+SHIBOR_COLUMNS = {1: "on", 7: "1w", 14: "2w", 30: "1m", 91: "3m", 182: "6m", 274: "9m", 365: "1y"}
 
 
 @dataclass(frozen=True)
@@ -55,10 +58,6 @@ class ShiborCurve:
         return -self.log_discount(days) / (days / 365.0)
 
 
-def _normal_cdf(value: float) -> float:
-    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
-
-
 def _call_put_sign(call_put: str) -> int:
     normalized = call_put.upper()
     if normalized not in {"C", "P"}:
@@ -82,7 +81,7 @@ def black76_price(
     d2 = d1 - sigma * root_t
     discount = math.exp(-rate * maturity)
     return discount * sign * (
-        forward * _normal_cdf(sign * d1) - strike * _normal_cdf(sign * d2)
+        forward * normal_cdf(sign * d1) - strike * normal_cdf(sign * d2)
     )
 
 

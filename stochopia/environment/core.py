@@ -10,7 +10,6 @@ outside this module.
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import math
 from dataclasses import dataclass, field, fields, is_dataclass, replace
@@ -18,8 +17,14 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..benchmark import BenchmarkCondition, BenchmarkError, LongHorizonEnvironment
-from ..pricing import PricingError
+from ..benchmark import (
+    BenchmarkCondition,
+    BenchmarkError,
+    LongHorizonEnvironment,
+    QuoteNotConvergedError,
+)
+from ..common import canonical_json, sha256_json
+from ..pricing import QuoteUnavailableError
 from ..products import ProductError, ProductSpec, parse_product_spec
 from .types import (
     AskClient,
@@ -40,8 +45,12 @@ from .types import (
 )
 
 
-ENVIRONMENT_VERSION = "v3-spine-level0.3-terminal-snapshot"
-PRICING_VERSION = "benchmark-pricing-v3.1-funding-stress-equilibrium"
+ENVIRONMENT_VERSION = "v3-spine-level0.5-quote-unavailable"
+PRICING_VERSION = "benchmark-pricing-v3.3-mc-unobserved-t0-unquotable"
+
+
+def _stable_hash(value: Any) -> str:
+    return sha256_json(_jsonable(value))
 
 
 def _jsonable(value: Any) -> Any:
@@ -65,15 +74,13 @@ def _jsonable(value: Any) -> Any:
     raise TypeError(f"unsupported canonical value: {type(value).__name__}")
 
 
-def _stable_hash(value: Any) -> str:
-    raw = json.dumps(
-        _jsonable(value),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+def _recordable(value: Any) -> Any:
+    """JSON-safe copy of arbitrary invalid-action input (repr as a fallback)."""
+
+    try:
+        return json.loads(canonical_json(_jsonable(value)))
+    except (TypeError, ValueError):
+        return repr(value)
 
 
 @dataclass
@@ -97,6 +104,7 @@ class _EpisodeState:
             "steps": 0,
             "valid_actions": 0,
             "invalid_actions": 0,
+            "unavailable_quotes": 0,
             "accepted_submissions": 0,
             "hard_failure_counts": {},
             "contract_failure_counts": {},
@@ -195,10 +203,6 @@ class StochopiaStructurerEnv:
         return bool(state.terminated or state.truncated)
 
     @property
-    def state_hash(self) -> str:
-        return self._state_hash(self._require_state())
-
-    @property
     def action_schema(self) -> dict[str, Any]:
         """Current machine-readable policy contract."""
 
@@ -227,11 +231,13 @@ class StochopiaStructurerEnv:
         if isinstance(effective_seed, bool) or not isinstance(effective_seed, int):
             raise TypeError("seed must be an int or None")
         copied_options = copy.deepcopy(dict(options or {}))
-        if "curriculum" in copied_options:
+        if copied_options:
+            # Level 0 implements no reset option; accepting one as a silent
+            # no-op label (e.g. a curriculum) would misreport the run.
             raise ValueError(
-                "reset(options['curriculum']) is not implemented and must not "
-                "be used as a no-op label; construct an EpisodeTask from a "
-                "versioned TaskGenerator before reset"
+                f"unsupported reset options {sorted(map(str, copied_options))}: "
+                "Level-0 reset accepts none; construct an EpisodeTask from a "
+                "versioned TaskGenerator instead"
             )
 
         # The v2 client is mutable, and the backend mutates portfolio/client
@@ -242,7 +248,7 @@ class StochopiaStructurerEnv:
         # v3 exposes a fixed alias so published trajectories cannot turn a
         # stable client id into a task-specific lookup key.
         client = replace(client, id=V3_PUBLIC_CLIENT_ALIAS)
-        backend = LongHorizonEnvironment(
+        backend = self._make_backend(
             snapshots,
             client,
             risk_budget,
@@ -260,6 +266,9 @@ class StochopiaStructurerEnv:
         info = self._info(self._state)
         return observation, info
 
+    def _make_backend(self, *args, **kwargs) -> LongHorizonEnvironment:
+        return LongHorizonEnvironment(*args, **kwargs)
+
     def step(self, action: EnvironmentAction) -> StepTransition:
         """Apply one typed action through the sole state-transition entrypoint."""
 
@@ -268,40 +277,44 @@ class StochopiaStructurerEnv:
             raise RuntimeError("step() called after the episode ended; call reset()")
 
         previous_observation = self._observation(state)
-        state_hash_before = self._state_hash(state)
         economic_before = state.backend.economic_state()
         state.step_index += 1
         state.round_step_index += 1
 
         effective_action: EnvironmentAction
-        if isinstance(
-            action,
-            (AskClient, RequestQuote, SubmitDesign, SubmitProduct, Skip, InvalidAction),
-        ):
+        if isinstance(action, InvalidAction):
+            # raw may be arbitrary caller input; keep a JSON-recordable view.
+            effective_action = replace(action, raw=_recordable(action.raw))
+        elif isinstance(action, (AskClient, SubmitDesign, Skip)):
+            effective_action = action
+        elif isinstance(action, (RequestQuote, SubmitProduct)):
             # Preserve product values at the call boundary even when a caller
-            # later mutates a v2 ProductSpec instance. InvalidAction.raw may be
-            # deliberately non-copyable, so only product actions need copying.
-            effective_action = (
-                copy.deepcopy(action)
-                if isinstance(action, (RequestQuote, SubmitProduct))
-                else action
-            )
+            # later mutates a v2 ProductSpec instance.
+            effective_action = copy.deepcopy(action)
         else:
             effective_action = InvalidAction(
                 reason=f"unsupported action object: {type(action).__name__}",
-                raw=action,
+                raw=_recordable(action),
             )
 
         try:
             rewards, constraints, ends_round = self._apply(state, effective_action)
-        except (
-            BenchmarkError,
-            ProductError,
-            PricingError,
-            ArithmeticError,
-            TypeError,
-            ValueError,
-        ) as exc:
+        except (QuoteNotConvergedError, QuoteUnavailableError) as exc:
+            # A legal lattice point the desk cannot price (no equilibrium or a
+            # non-positive premium) is not the policy's fault: no invalid-action
+            # cost, no quote cost; the backend counts only priced quotes.
+            message = str(exc)
+            constraints = ConstraintSignals(quote_unavailable=True, error=message)
+            rewards = RewardComponents()
+            state.last_event = {
+                "type": "quote_unavailable",
+                "action": effective_action.action,
+                "error": message,
+            }
+            ends_round = False
+        except (BenchmarkError, ProductError) as exc:
+            # Only action-validation failures are the policy's fault; pricing
+            # or other internal errors propagate to the caller.
             message = str(exc)
             exhausted: tuple[str, ...] = ()
             if "query budget exhausted" in message:
@@ -351,7 +364,6 @@ class StochopiaStructurerEnv:
         )
         self._accumulate_episode_summary(state, rewards, constraints)
         observation = self._observation(state)
-        state_hash_after = self._state_hash(state)
         info = self._info(state)
         return StepTransition(
             previous_observation=previous_observation,
@@ -363,8 +375,6 @@ class StochopiaStructurerEnv:
             terminated=state.terminated,
             truncated=state.truncated,
             info=info,
-            state_hash_before=state_hash_before,
-            state_hash_after=state_hash_after,
         )
 
     def _apply(
@@ -378,7 +388,7 @@ class StochopiaStructurerEnv:
             state.last_event = {
                 "type": "invalid_action",
                 "reason": action.reason,
-                "raw": _jsonable(action.raw),
+                "raw": action.raw,
             }
             return (
                 RewardComponents(
@@ -393,7 +403,7 @@ class StochopiaStructurerEnv:
 
         if isinstance(action, AskClient):
             if not isinstance(action.topic, str) or not action.topic:
-                raise ValueError("AskClient.topic must be a non-empty string")
+                raise BenchmarkError("AskClient.topic must be a non-empty string")
             result = backend.query_client(action.topic)
             state.disclosed_client[action.topic] = copy.deepcopy(result.get("answer"))
             state.last_event = {"type": "client_answer", "payload": copy.deepcopy(result)}
@@ -433,7 +443,7 @@ class StochopiaStructurerEnv:
 
         if isinstance(action, SubmitDesign):
             if not isinstance(action.quote_id, str) or not action.quote_id:
-                raise ValueError("SubmitDesign.quote_id must be a non-empty string")
+                raise BenchmarkError("SubmitDesign.quote_id must be a non-empty string")
             internal_quote_id = state.quote_aliases.get(action.quote_id)
             if internal_quote_id is None:
                 raise BenchmarkError("unknown public quote_id")
@@ -660,6 +670,8 @@ class StochopiaStructurerEnv:
             summary["valid_actions"] += 1
         else:
             summary["invalid_actions"] += 1
+        if constraints.quote_unavailable:
+            summary["unavailable_quotes"] += 1
         if constraints.accepted is True:
             summary["accepted_submissions"] += 1
         for field_name, destination in (
@@ -712,7 +724,7 @@ class StochopiaStructurerEnv:
 
         internal_quote_id = quote.get("quote_id")
         if not isinstance(internal_quote_id, str) or not internal_quote_id:
-            raise BenchmarkError("desk quote is missing its internal quote_id")
+            raise RuntimeError("desk quote is missing its internal quote_id")
         alias = next(
             (
                 public_id
@@ -751,7 +763,7 @@ class StochopiaStructurerEnv:
                 None,
             )
             if alias is None:
-                raise BenchmarkError(
+                raise RuntimeError(
                     "submission refers to an unregistered internal quote"
                 )
             public_result["quote_id"] = alias
@@ -804,7 +816,7 @@ class StochopiaStructurerEnv:
     @staticmethod
     def _require_product(product: ProductSpec | None) -> ProductSpec:
         if not isinstance(product, ProductSpec):
-            raise TypeError("action.product must be a ProductSpec")
+            raise ProductError("action.product must be a ProductSpec")
         forged: list[str] = []
         if product.reference_spot is not None:
             forged.append("reference_spot")
@@ -846,35 +858,6 @@ class StochopiaStructurerEnv:
 
         backend = state.backend
         event = copy.deepcopy(state.last_event) if state.last_event is not None else {}
-        if backend.round_index >= len(backend.snapshots) - 1:
-            # Defensive only: EpisodeTask exposes the last snapshot as terminal
-            # truth, so a policy should never receive an action at this point.
-            closed_ids = backend.liquidate_horizon()
-            lifecycle_events = list(backend.portfolio.last_lifecycle_events)
-            state.terminated = True
-            event["episode_terminated"] = True
-            event["horizon_liquidated_position_ids"] = closed_ids
-            event["horizon_liquidations"] = [
-                {
-                    "position_id": item.position_id,
-                    "settlement_amount": item.settlement_amount,
-                    "client_realized_pnl": item.client_realized_pnl,
-                    "dealer_liability_realized_pnl": (
-                        item.dealer_liability_realized_pnl
-                    ),
-                    "dealer_hedge_pnl": item.dealer_hedge_pnl,
-                    "dealer_hedged_realized_pnl": (
-                        item.dealer_hedged_realized_pnl
-                    ),
-                    "pnl_provenance": item.pnl_provenance,
-                }
-                for item in lifecycle_events
-            ]
-            event["lifecycle_events"] = _jsonable(lifecycle_events)
-            event["open_at_horizon"] = []
-            state.last_event = event
-            return 0.0
-
         previous_date = backend.snapshot.as_of
         closed_ids = backend.advance_round()
         next_date = backend.snapshot.as_of
@@ -916,7 +899,8 @@ class StochopiaStructurerEnv:
             lifecycle_events.extend(horizon_events)
             state.terminated = True
             event["episode_terminated"] = True
-            event["terminal_snapshot"] = _jsonable(backend.snapshot)
+            # Policy-facing view only: no source, P drift (trend_alpha) or ids.
+            event["terminal_snapshot"] = backend.snapshot.public_brief()
             event["horizon_liquidated_position_ids"] = horizon_ids
             event["horizon_liquidations"] = [
                 {
@@ -1028,7 +1012,6 @@ class StochopiaStructurerEnv:
 
     def _info(self, state: _EpisodeState) -> dict[str, Any]:
         info = {
-            "state_hash": self._state_hash(state),
             "schema_version": self.task.schema,
             "environment_version": self.environment_version,
             "pricing_version": self.pricing_version,
@@ -1040,39 +1023,12 @@ class StochopiaStructurerEnv:
             "run_id_seed": state.seed,
             "seed": state.seed,
             "seed_role": "run_id_only",
-            "options_hash": _stable_hash(state.options),
             "episode_summary": self._episode_summary(state),
         }
         if self.expose_privileged_info:
             info["privileged_state"] = self._privileged_state(state)
             info["reset_options"] = copy.deepcopy(state.options)
         return info
-
-    def _state_hash(self, state: _EpisodeState) -> str:
-        payload = {
-            "task_schema": self.task.schema,
-            "task_version": self.task.version,
-            "environment_version": self.environment_version,
-            "pricing_version": self.pricing_version,
-            "reward_schema_version": REWARD_SCHEMA_VERSION,
-            "environment_configuration": self.configuration,
-            "seed": state.seed,
-            "options": state.options,
-            "step_index": state.step_index,
-            "round_step_index": state.round_step_index,
-            "disclosed_client": state.disclosed_client,
-            "quote_payloads": state.quote_payloads,
-            "quote_aliases": state.quote_aliases,
-            "last_event": state.last_event,
-            "reward_raw_totals": state.reward_raw_totals,
-            "reward_normalized_totals": state.reward_normalized_totals,
-            "reward_available_counts": state.reward_available_counts,
-            "constraint_summary": state.constraint_summary,
-            "terminated": state.terminated,
-            "truncated": state.truncated,
-            "privileged_state": self._privileged_state(state),
-        }
-        return _stable_hash(payload)
 
     def _require_state(self) -> _EpisodeState:
         if self._state is None:

@@ -4,11 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
-import math
-import os
-import tempfile
 from collections import Counter, defaultdict
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -16,6 +12,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .benchmark import MarketSnapshot, load_market_snapshots
 from .market_data_math import (
+    SHIBOR_COLUMNS,
     ShiborCurve,
     futures_implied_q,
     realized_volatility,
@@ -23,6 +20,8 @@ from .market_data_math import (
     trailing_return,
 )
 from .formal_option_iv import apply_full_phase
+from .tushare_batch import load_endpoint_rows
+from .common import atomic_write_bytes, atomic_write_json, parse_yyyymmdd, read_csv_rows
 
 
 RAW_TUSHARE = Path("data/raw/tushare")
@@ -38,58 +37,6 @@ UNDERLYINGS = {
     "CSI500": {"ts_code": "000905.SH", "future": "IC"},
     "CSI1000": {"ts_code": "000852.SH", "future": "IM"},
 }
-SHIBOR_COLUMNS = {1: "on", 7: "1w", 14: "2w", 30: "1m", 91: "3m", 182: "6m", 274: "9m", 365: "1y"}
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _atomic_write(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        Path(temporary).unlink(missing_ok=True)
-        raise
-
-
-def _read_csv(path: Path) -> list[dict[str, str]]:
-    with path.open(encoding="utf-8", newline="") as handle:
-        return list(csv.DictReader(handle))
-
-
-def _load_endpoint(root: Path, endpoint: str) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for metadata_path in sorted((root / endpoint).glob("*.json")):
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        csv_path = metadata_path.with_suffix(".csv")
-        if metadata.get("endpoint") != endpoint or metadata.get("status") != "complete":
-            raise ValueError(f"invalid {endpoint} cache metadata")
-        if not csv_path.is_file() or metadata.get("sha256") != _sha256(csv_path):
-            raise ValueError(f"invalid {endpoint} cache hash")
-        cached = _read_csv(csv_path)
-        if len(cached) != metadata.get("row_count"):
-            raise ValueError(f"invalid {endpoint} cache row count")
-        rows.extend(cached)
-    if not rows:
-        raise ValueError(f"no cached rows for {endpoint}")
-    return rows
-
-
-def _parse_yyyymmdd(value: str) -> date:
-    return datetime.strptime(value, "%Y%m%d").date()
-
-
 def _regime(return_20d: float, vol_20d: float) -> str:
     volatility = "high_vol" if vol_20d >= 0.25 else "low_vol"
     trend = "uptrend" if return_20d >= 0.03 else "downtrend" if return_20d <= -0.03 else "sideways"
@@ -101,10 +48,15 @@ def _episode(year: int, month: int, underlying: str) -> tuple[str, int]:
     return f"{underlying}_{year}{half}", month if month <= 6 else month - 6
 
 
-def _month_ends(rows: Sequence[tuple[date, float]]) -> list[int]:
+def _month_ends(
+    rows: Sequence[tuple[date, float]],
+    *,
+    panel_start: date,
+    panel_end: date,
+) -> list[int]:
     result: dict[tuple[int, int], int] = {}
     for index, (asof, _) in enumerate(rows):
-        if date(2023, 1, 1) <= asof <= date(2025, 12, 31):
+        if panel_start <= asof <= panel_end:
             result[(asof.year, asof.month)] = index
     return [result[key] for key in sorted(result)]
 
@@ -134,7 +86,7 @@ def _carry_for(
         master = master_by_symbol.get(row.get("contract", ""))
         if not master:
             continue
-        list_date, delist_date = _parse_yyyymmdd(master["list_date"]), _parse_yyyymmdd(master["delist_date"])
+        list_date, delist_date = parse_yyyymmdd(master["list_date"]), parse_yyyymmdd(master["delist_date"])
         settlement = float(row.get("settlement", "") or 0)
         if list_date <= asof <= delist_date and delist_date > asof and settlement > 0:
             observations.append(((delist_date - asof).days, settlement))
@@ -153,13 +105,16 @@ def build_base_panel(
     shibor_rows: Iterable[Mapping[str, str]],
     futures_rows: Iterable[Mapping[str, str]],
     futures_master_rows: Iterable[Mapping[str, str]],
-    raw_manifest_hashes: Mapping[str, str],
+    panel_start: date = date(2023, 1, 1),
+    panel_end: date = date(2025, 12, 31),
 ) -> tuple[list[MarketSnapshot], list[dict[str, Any]]]:
+    if panel_end < panel_start:
+        raise ValueError("panel_end precedes panel_start")
     indices: dict[str, list[tuple[date, float]]] = {}
     index_input = list(index_rows)
     for underlying, spec in UNDERLYINGS.items():
         rows = sorted(
-            (_parse_yyyymmdd(row["trade_date"]), float(row["close"]))
+            (parse_yyyymmdd(row["trade_date"]), float(row["close"]))
             for row in index_input if row.get("ts_code") == spec["ts_code"]
         )
         if len({item[0] for item in rows}) != len(rows) or any(value <= 0 for _, value in rows):
@@ -167,11 +122,11 @@ def build_base_panel(
         indices[underlying] = rows
     shibor: dict[date, dict[int, float]] = {}
     for row in shibor_rows:
-        source = _parse_yyyymmdd(row["date"])
+        source = parse_yyyymmdd(row["date"])
         shibor[source] = {days: float(row[column]) for days, column in SHIBOR_COLUMNS.items()}
     futures_by_date: dict[date, list[Mapping[str, str]]] = defaultdict(list)
     for row in futures_rows:
-        futures_by_date[_parse_yyyymmdd(row["trade_date"])].append(row)
+        futures_by_date[parse_yyyymmdd(row["trade_date"])].append(row)
     master_by_symbol = {
         row["symbol"]: row for row in futures_master_rows
         if row.get("fut_code") in {"IC", "IM"}
@@ -182,7 +137,7 @@ def build_base_panel(
     provenance: list[dict[str, Any]] = []
     for underlying, rows in indices.items():
         spec = UNDERLYINGS[underlying]
-        for index in _month_ends(rows):
+        for index in _month_ends(rows, panel_start=panel_start, panel_end=panel_end):
             asof, spot = rows[index]
             history = [value for _, value in rows[: index + 1]]
             ret20 = trailing_return(history, 20)
@@ -215,7 +170,6 @@ def build_base_panel(
                 "round": round_num,
                 "as_of": asof.isoformat(),
                 "underlying": underlying,
-                "raw_manifest_hashes": dict(raw_manifest_hashes),
                 "spot": {"ts_code": spec["ts_code"], "observation_date": asof.isoformat()},
                 "rate": {"observation_date": rate_source.isoformat(), "target_days": 91},
                 "carry": {
@@ -267,7 +221,9 @@ def _gate(snapshots: Sequence[MarketSnapshot], provenance: Sequence[Mapping[str,
             item.spot > 0 and item.risk_free_rate >= 0 and item.realized_vol_20d is not None
             and item.realized_vol_60d is not None for item in snapshots
         ),
-        "carry_complete": len(provenance) == len(snapshots) and all(row.get("carry") for row in provenance),
+        "carry_complete": len(provenance) == len(snapshots) and all(
+            not row["carry"]["fallback_zero"] for row in provenance
+        ),
         "max_input_not_after_asof": all(row["max_input_date"] <= row["as_of"] for row in provenance),
         "index_spot_only": all(row["spot"]["ts_code"] in {"000905.SH", "000852.SH"} for row in provenance),
         "phase_a_iv_null": all(item.atm_iv_1m is None and item.atm_iv_3m is None and item.atm_iv_6m is None for item in snapshots),
@@ -291,39 +247,39 @@ def run_base_build(
 ) -> dict[str, Any]:
     if phase not in {"base", "full"}:
         raise ValueError("phase must be base or full")
-    manifest_hashes = {
-        "tushare": _sha256(tushare_root / "manifest.sha256"),
-        "cffex": _sha256(cffex_path.parents[2] / "raw" / "cffex" / "manifest.sha256"),
-    }
-    index_rows = _load_endpoint(tushare_root, "index_daily")
-    shibor_rows = _load_endpoint(tushare_root, "shibor")
-    futures_rows = _read_csv(cffex_path)
+    index_rows = load_endpoint_rows(tushare_root, "index_daily")
+    shibor_rows = load_endpoint_rows(tushare_root, "shibor")
+    futures_rows = read_csv_rows(cffex_path)
     snapshots, provenance = build_base_panel(
         index_rows=index_rows,
         shibor_rows=shibor_rows,
         futures_rows=futures_rows,
-        futures_master_rows=_load_endpoint(tushare_root, "fut_basic"),
-        raw_manifest_hashes=manifest_hashes,
+        futures_master_rows=load_endpoint_rows(tushare_root, "fut_basic"),
     )
     expiry_rows: list[dict[str, Any]] = []
     iv_stats: dict[str, Any] | None = None
     if phase == "full":
         snapshots, provenance, expiry_rows, iv_stats = apply_full_phase(
             snapshots, provenance,
-            sse_rows=_load_endpoint(tushare_root, "opt_daily"),
+            sse_rows=load_endpoint_rows(tushare_root, "opt_daily"),
             mo_rows=futures_rows,
-            option_master_rows=_load_endpoint(tushare_root, "opt_basic"),
-            fund_rows=_load_endpoint(tushare_root, "fund_daily"),
+            option_master_rows=load_endpoint_rows(tushare_root, "opt_basic"),
+            fund_rows=load_endpoint_rows(tushare_root, "fund_daily"),
             index_rows=index_rows,
             shibor_rows=shibor_rows,
+            exchange_open_dates=[
+                parse_yyyymmdd(row["cal_date"])
+                for row in load_endpoint_rows(tushare_root, "trade_cal")
+                if row.get("is_open") == "1"
+            ],
         )
     snapshot_path = output_root / "market_snapshots.csv"
     provenance_path = output_root / "market_snapshot_provenance.jsonl"
     gate_path = output_root / "gate_report.json"
-    _atomic_write(snapshot_path, _csv_bytes(snapshots))
+    atomic_write_bytes(snapshot_path, _csv_bytes(snapshots))
     loaded = load_market_snapshots(snapshot_path)
     provenance_bytes = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in provenance).encode("utf-8")
-    _atomic_write(provenance_path, provenance_bytes)
+    atomic_write_bytes(provenance_path, provenance_bytes)
     gate = _gate(loaded, provenance)
     gate["phase"] = phase
     gate["checks"]["load_market_snapshots"] = len(loaded) == len(snapshots)
@@ -370,14 +326,9 @@ def run_base_build(
         expiry_writer = csv.DictWriter(expiry_buffer, fieldnames=expiry_fields, lineterminator="\n")
         expiry_writer.writeheader()
         expiry_writer.writerows(expiry_rows)
-        _atomic_write(expiry_path, expiry_buffer.getvalue().encode("utf-8"))
+        atomic_write_bytes(expiry_path, expiry_buffer.getvalue().encode("utf-8"))
     gate["ready"] = all(gate["checks"].values())
-    _atomic_write(gate_path, (json.dumps(gate, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
-    manifest_paths = [snapshot_path, provenance_path, gate_path]
-    if phase == "full":
-        manifest_paths.append(output_root / "option_expiry_points.csv")
-    manifest_lines = "".join(f"{_sha256(path)}  {path.name}\n" for path in manifest_paths)
-    _atomic_write(output_root / "manifest.sha256", manifest_lines.encode("utf-8"))
+    atomic_write_json(gate_path, gate)
     return gate
 
 

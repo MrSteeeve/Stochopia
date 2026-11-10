@@ -19,6 +19,11 @@ dependencies = [
 stochopia-benchmark = "stochopia.benchmark_cli:main"
 
 [project.optional-dependencies]
+research = [
+    "numpy",
+    "torch",
+    "scipy>=1.11",
+]
 dev = [
     "pytest",
     "pytest-asyncio",

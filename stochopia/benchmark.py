@@ -23,8 +23,10 @@ if TYPE_CHECKING:  # runtime import avoided (env_agents imports CheckResult from
     from .env_agents import FormalFacts, FrozenEnvAgent, RoleResponse
 
 from .pricing import (
+    AUTOCALL_TRIGGER_PCT,
+    SNOWBALL_KNOCK_OUT_PCT,
     QuotePolicy,
-    _fair_value_stress_loss,
+    QuoteUnavailableError,
     client_loss_measure,
     evaluate_product,
     fair_value_stress_profile,
@@ -43,11 +45,15 @@ from .products import (
 # Fixed diagnostic MC seed for desk/oracle quotes. Constant across candidates so
 # the structure-keyed mc_diagnostics cache is shared during oracle enumeration.
 QUOTE_DIAGNOSTIC_SEED = 42
-ACTION_SCHEMA_VERSION = "stochopia.environment.action-schema.v1"
+ACTION_SCHEMA_VERSION = "stochopia.environment.action-schema.v2"
 
 
 class BenchmarkError(Exception):
     """Benchmark configuration or state transition is invalid."""
+
+
+class QuoteNotConvergedError(BenchmarkError):
+    """The premium/hurdle fixed point has no solution: the product is not quotable."""
 
 
 @dataclass(frozen=True)
@@ -232,19 +238,6 @@ def load_market_snapshots(path: str | Path) -> list[MarketSnapshot]:
     return sorted(snapshots, key=lambda s: (s.episode_id, s.round_num))
 
 
-def option_implied_forward(call: float, put: float, strike: float, rate: float, years: float) -> float:
-    """Compute F=K+exp(rT)(C-P), absorbing dividend/carry expectations."""
-    values = (call, put, strike, rate, years)
-    if not all(math.isfinite(v) for v in values) or call < 0 or put < 0:
-        raise BenchmarkError("invalid put-call parity input")
-    if strike <= 0 or years <= 0:
-        raise BenchmarkError("strike and years must be positive")
-    forward = strike + math.exp(rate * years) * (call - put)
-    if forward <= 0:
-        raise BenchmarkError("option-implied forward is non-positive")
-    return forward
-
-
 @dataclass(frozen=True)
 class RiskBudget:
     notional: float
@@ -331,12 +324,6 @@ class Position:
     settlement_amount: float | None = None
     client_realized_pnl: float | None = None
     dealer_liability_realized_pnl: float | None = None
-
-    @property
-    def stress_loss(self) -> float:
-        """Deprecated alias for the client-long value-loss measure."""
-
-        return self.client_value_loss
 
 
 @dataclass(frozen=True)
@@ -676,7 +663,11 @@ def _process_position_observation(position: Position, snapshot: MarketSnapshot) 
         if barrier is not None and spot <= barrier:
             position.knock_in_state = True
         if position.initial_fixing is not None:
-            autocall_ratio = 1.03 if position.product.product_type == "snowball" else 1.05
+            autocall_ratio = (
+                SNOWBALL_KNOCK_OUT_PCT
+                if position.product.product_type == "snowball"
+                else AUTOCALL_TRIGGER_PCT
+            )
             if spot >= position.initial_fixing * autocall_ratio:
                 position.autocall_state = True
                 position.status = "autocalled"
@@ -712,7 +703,7 @@ def _revalue_position(position: Position, snapshot: MarketSnapshot) -> None:
     pricing = evaluate_product(product, market)
     if pricing is None:
         raise BenchmarkError(f"cannot revalue unsupported position {position.position_id}")
-    stress = fair_value_stress_profile(product, market)
+    stress = fair_value_stress_profile(product, market, base=pricing)
     position.current_fair_value = float(pricing["fair_value"])
     position.delta_dollars = float(pricing["greeks"].get("delta", 0.0)) * product.notional
     position.vega_dollars = float(pricing["greeks"].get("vega_pct", 0.0)) * product.notional
@@ -806,11 +797,9 @@ def _position_settlement_amount(position: Position, snapshot: MarketSnapshot) ->
         return face * (1.0 + coupon * product.maturity_months / 12.0)
 
     if product.product_type == "autocallable":
-        if (
-            position.knock_in_state
-            and not product.principal_protected
-            and spot < reference
-        ):
+        # Same contract as pricing._mc_stats: knocked in (and not knocked out)
+        # redeems min(S_T/S0, 1) with no coupon, even if spot recovered.
+        if position.knock_in_state and not product.principal_protected:
             return face * min(spot / reference, 1.0)
         return face * (1.0 + coupon * product.maturity_months / 12.0)
 
@@ -918,6 +907,14 @@ class PortfolioState:
     dealer_account: DealerAccount | None = None
     revision: int = 0
 
+    def _advance_position(self, position: Position, snapshot: MarketSnapshot) -> None:
+        _accrue_static_delta_hedge(position, snapshot)
+        _process_position_observation(position, snapshot)
+        _revalue_position(position, snapshot)
+
+    def _settlement_amount(self, position: Position, snapshot: MarketSnapshot) -> float:
+        return _position_settlement_amount(position, snapshot)
+
     def totals(self) -> dict[str, float]:
         return {
             "notional": sum(p.product.notional for p in self.positions),
@@ -960,13 +957,14 @@ class PortfolioState:
                 if position.remaining_months <= 0 and position.status == "active":
                     position.status = "matured"
             else:
-                _accrue_static_delta_hedge(position, snapshot)
-                _process_position_observation(position, snapshot)
-                _revalue_position(position, snapshot)
+                self._advance_position(position, snapshot)
             if position.remaining_months <= 0 or position.status != "active":
                 closed.append(position.position_id)
                 if snapshot is not None:
-                    event = _close_position(position, snapshot)
+                    event = _close_position(
+                        position, snapshot,
+                        settlement_override=self._settlement_amount(position, snapshot),
+                    )
                     events.append(event)
                     self.lifecycle_events.append(event)
                     self.cashflow_ledger.extend(event.cashflows)
@@ -1093,6 +1091,32 @@ _PRIVATE_CLIENT_CHECK_IDS = frozenset({
     "CONTRACT_HURDLE",
 })
 
+# Quote fields computed from the private mandate.  ``suitability`` is a closed
+# function of the whitelist/protection/maturity/hurdle factors (e.g.
+# ``12/(2-suitability)`` recovers ``max_maturity_months``), so Partial-
+# information conditions never see it.  client_price/margin still depend on it
+# through the equilibrium; that economic signal is a documented residual.
+_PRIVATE_QUOTE_FIELDS = frozenset({"suitability"})
+
+# Lattice fields echoed in a DOMAIN rejection (combination rules stay in the
+# full policy_action_schema / v2 round-brief ``product_domain``).
+_DOMAIN_ERROR_SCHEMA_KEYS = (
+    "allowed_product_types", "notional_rule", "maturities", "strikes",
+    "barriers", "coupons", "participations", "principal_protected",
+)
+
+# Client-account fields that reveal the hidden capital level or schedule.
+_PRIVATE_CLIENT_ACCOUNT_FIELDS = frozenset({
+    "initial_cash",
+    "available_cash",
+    "book_wealth",
+    "wealth",
+    "net_liquidation_wealth",
+    "external_inflows",
+    "external_outflows",
+    "pending_external_withdrawal",
+})
+
 
 @dataclass(frozen=True)
 class Quote:
@@ -1135,21 +1159,11 @@ class Quote:
     def hard_pass(self) -> bool:
         return all(item.passed for item in self.checks if item.severity == "HARD")
 
-    @property
-    def stress_loss(self) -> float:
-        """Deprecated public alias for client-long value loss."""
-
-        return self.client_value_loss
-
-    @property
-    def worst_stress_id(self) -> str:
-        """Deprecated alias for the client-long worst scenario."""
-
-        return self.client_worst_stress_id
-
     def public_payload(self) -> dict:
-        # Deliberately exposes margin_rate and suitability, but never the margin
-        # breakdown, so the tested model cannot reverse-engineer the quote formula.
+        # Deliberately exposes margin_rate, but never the margin breakdown, so the
+        # tested model cannot reverse-engineer the quote formula.  suitability is
+        # stripped at the condition-aware boundary in Partial information
+        # (LongHorizonEnvironment.public_quote_payload).
         return {
             "quote_id": self.quote_id,
             "fair_value": self.fair_value,
@@ -1496,13 +1510,12 @@ def client_contract_pass(
     *,
     available_cash: float | None = None,
 ) -> tuple[bool, list[CheckResult]]:
-    """Deterministic client contract gate (the settlement counterpart of would_buy).
+    """Deterministic client contract gate applied at settlement.
 
     Checks capital, maturity, whitelist, protection preference, the continuous
     loss proxy and hurdle_hit_prob >= min_hit_prob. Uses the enriched engine
     pricing dict (must carry ``loss_frac``, ``stress_loss``, ``hurdle_hit_prob``).
-    Mirrors stochopia.products.ClientProfile.would_buy but on the continuous loss
-    measure. The client LLM's attitude never overrides this gate.
+    The client LLM's attitude never overrides this gate.
     """
     client_value_loss = float(quote_pricing.get("client_value_loss", 0.0))
     worst_stress_id = str(quote_pricing.get("worst_stress_id", ""))
@@ -1557,6 +1570,9 @@ class HardConstraintEngine:
         self.risk_budget = risk_budget
         self.description_tolerance_bp = description_tolerance_bp
 
+    def _payoff_floor(self, product: ProductSpec) -> float:
+        return worst_case_payoff_ratio(product)
+
     def evaluate(
         self,
         product: ProductSpec,
@@ -1580,7 +1596,7 @@ class HardConstraintEngine:
             else client.capital
         )
         protection_tolerance = self.description_tolerance_bp / 10_000.0
-        floor = worst_case_payoff_ratio(product)
+        floor = self._payoff_floor(product)
         floor_amount = floor * product.effective_face_value
         cash_outlay = float(pricing["cash_outlay"])
         protected_amount = float(pricing["protected_amount"])
@@ -1669,7 +1685,7 @@ class HardConstraintEngine:
 
 # ---------------------------------------------------------------------------
 # Structure-level pricing caches (notional-independent). The heavy MC in
-# evaluate_product / _fair_value_stress_loss / hurdle_hit_prob is invariant to
+# evaluate_product / fair_value_stress_profile / hurdle_hit_prob is invariant to
 # notional (fair value and stress loss scale linearly; hurdle depends only on the
 # per-notional client price), so oracle enumeration shares one MC per structure
 # across the whole notional ladder instead of repeating it 14x.
@@ -1727,7 +1743,7 @@ def _structural_pricing(product: ProductSpec, market: MarketState) -> dict:
     pr = evaluate_product(ref, market)
     if pr is None:
         raise BenchmarkError("custom products are outside the finite benchmark grammar")
-    stress = fair_value_stress_profile(ref, market)
+    stress = fair_value_stress_profile(ref, market, base=pr)
     cached = {
         "frac_fair": pr["fair_value"] / _PRICE_REF_NOTIONAL,
         "greeks": pr["greeks"],
@@ -1839,25 +1855,30 @@ class TradingDesk:
         capacity_notional = self.hard_checks.risk_budget.notional
         post_notional = totals["notional"] + product.notional
 
-        equilibrium = solve_quote_equilibrium(
-            product,
-            market,
-            client,
-            pricing,
-            diag,
-            dealer_stress_loss=dealer_hedged_loss,
-            post_notional=post_notional,
-            capacity_notional=capacity_notional,
-            policy=self.policy,
-            hurdle_probability=lambda price: _cached_hurdle(
+        try:
+            equilibrium = solve_quote_equilibrium(
                 product,
                 market,
-                client.min_return_pct,
-                price / product.notional if product.notional else 0.0,
-            ),
-        )
+                client,
+                pricing,
+                diag,
+                dealer_stress_loss=dealer_hedged_loss,
+                post_notional=post_notional,
+                capacity_notional=capacity_notional,
+                policy=self.policy,
+                hurdle_probability=lambda price: _cached_hurdle(
+                    product,
+                    market,
+                    client.min_return_pct,
+                    price / product.notional if product.notional else 0.0,
+                ),
+            )
+        except QuoteUnavailableError as exc:
+            # Unquotable is the same outcome as a non-converged fixed point:
+            # no quote exists, so callers skip it instead of crashing.
+            raise QuoteNotConvergedError(str(exc)) from exc
         if not equilibrium.converged:
-            raise BenchmarkError(
+            raise QuoteNotConvergedError(
                 "quote equilibrium did not converge "
                 f"(residual={equilibrium.price_residual:.6g})"
             )
@@ -1994,7 +2015,7 @@ def _consult_fallback(role: str) -> str:
 
 @dataclass(frozen=True)
 class WorkflowOutcome:
-    """Second-layer, LLM-driven result of a submission (draft_codex §1.1).
+    """Second-layer, LLM-driven result of a submission (DESIGN_REFERENCE.md C§1.1).
 
     ``workflow_deal`` requires the deterministic hard-executability AND all three
     env roles affirming (desk issues, risk approves, client accepts). It is a
@@ -2054,6 +2075,10 @@ class LongHorizonEnvironment:
         "return_hurdle": ("min_return_pct", "min_hit_prob"),
     }
     CLIENT_TOPICS = frozenset(CLIENT_TOPIC_FIELDS)
+
+    def _make_position(self, **kwargs) -> Position:
+        return Position(**kwargs)
+
     def __init__(
         self,
         snapshots: Sequence[MarketSnapshot],
@@ -2106,10 +2131,18 @@ class LongHorizonEnvironment:
         # None -> pure deterministic fallback: every existing byte-for-byte
         # behaviour is unchanged and no LLM env role is ever consulted.
         self.env_agents = env_agents
+        # Separate conversation scopes for consult("client", ...) and the
+        # client_decision review: see consult() / _role_review().
+        self._client_consult_agent: "FrozenEnvAgent | None" = None
+        self._client_review_agent: "FrozenEnvAgent | None" = None
         self.round_index = 0
         self.quote_count = 0
         self.query_count = 0
         self.consult_count = 0
+        # Partial v2: the lattice scales the round's scheduled capital, which the
+        # "capital" topic does not return once cash is locked.  After capital is
+        # disclosed this round, the exact lattice notionals are disclosed too.
+        self._capital_disclosed = False
         self._turn_id = 0
         self.quotes: dict[str, tuple[Quote, ProductSpec]] = {}
         self.submitted = False
@@ -2178,13 +2211,21 @@ class LongHorizonEnvironment:
         The schema is derived from the same ``ProductDomainSpec`` and topic
         enum enforced by runtime checks. It contains no hidden mandate values;
         the public notional base exists solely to make the finite action lattice
-        constructible by a policy.
+        constructible by a policy.  A legacy v2 domain (no public base) scales
+        the hidden client capital, so Partial information gets only the
+        fractions, never the capital-derived absolute notionals.
         """
 
         domain = self.domain
-        notionals = _domain_notionals(self.client, domain)
+        reveal_notionals = (
+            domain.public_notional_base is not None
+            or self.condition.full_information
+            or self._capital_disclosed
+        )
+        notionals = _domain_notionals(self.client, domain) if reveal_notionals else None
         public_notional_base = (
-            self.client.capital
+            None if not reveal_notionals
+            else self.client.capital
             if domain.public_notional_base is None
             else domain.public_notional_base
         )
@@ -2196,7 +2237,11 @@ class LongHorizonEnvironment:
             "target_client": self.client.id,
             "allowed_product_types": list(domain.product_types),
             "notional_rule": {
-                "kind": "fraction_of_public_domain_base",
+                "kind": (
+                    "fraction_of_public_domain_base"
+                    if domain.public_notional_base is not None
+                    else "fraction_of_client_capital"
+                ),
                 "base_amount": public_notional_base,
                 "fractions": list(domain.notional_fractions),
                 "allowed_values": notionals,
@@ -2252,6 +2297,8 @@ class LongHorizonEnvironment:
                     "strike_pct": [1.0],
                 },
             },
+            # Mirrors enumerate_domain: funding_style is fixed by product type
+            # and principal_protected (the parser's inferred default).
             "funding_constraints": {
                 "premium_paid": {
                     "applies_to": [
@@ -2260,13 +2307,23 @@ class LongHorizonEnvironment:
                         "barrier_call",
                         "barrier_put",
                     ],
+                    "principal_protected": [False],
                     "issue_price_pct": None,
-                    "protected_amount_rule": (
-                        "face_value when principal_protected else 0"
-                    ),
+                    "protected_amount_rule": "0",
                 },
                 "funded_note": {
-                    "applies_to": ["autocallable", "snowball"],
+                    "applies_to": [
+                        "vanilla_call",
+                        "vanilla_put",
+                        "barrier_call",
+                        "barrier_put",
+                        "autocallable",
+                        "snowball",
+                    ],
+                    "principal_protected_rule": (
+                        "vanilla/barrier: principal_protected=true only; "
+                        "autocallable/snowball: always funded_note"
+                    ),
                     "issue_price_pct": 1.0,
                     "face_value_rule": "equals notional at Level-0",
                     "protected_amount_rule": (
@@ -2311,8 +2368,18 @@ class LongHorizonEnvironment:
         self.query_count += 1
         profile, _ = self._client_profile_facts(self.CLIENT_TOPIC_FIELDS[topic])
         answer = next(iter(profile.values())) if len(profile) == 1 else profile
-        return {"topic": topic, "answer": answer,
-                "queries_left": self.max_client_queries_per_round - self.query_count}
+        result = {"topic": topic, "answer": answer,
+                  "queries_left": self.max_client_queries_per_round - self.query_count}
+        if topic == "capital":
+            result.update(self._disclose_lattice_notionals())
+        return result
+
+    def _disclose_lattice_notionals(self) -> dict:
+        """After a capital disclosure, the exact notional lattice for this round."""
+        if self.domain.public_notional_base is not None:
+            return {}
+        self._capital_disclosed = True
+        return {"allowed_notionals": _domain_notionals(self.client, self.domain)}
 
     def _visible_check(self, check: CheckResult) -> CheckResult:
         """Return a condition-safe view of one deterministic check."""
@@ -2329,13 +2396,13 @@ class LongHorizonEnvironment:
         """Condition-aware quote payload used at every policy-facing boundary."""
         payload = quote.public_payload()
         payload["checks"] = [asdict(self._visible_check(check)) for check in quote.checks]
+        if not self.condition.full_information:
+            for key in _PRIVATE_QUOTE_FIELDS:
+                payload.pop(key, None)
         return payload
 
-    def request_quote(self, product: ProductSpec) -> dict:
-        if self.submitted:
-            raise BenchmarkError("the round is already submitted")
-        if self.quote_count >= self.max_quotes_per_round:
-            raise BenchmarkError("quote budget exhausted")
+    def _validate_new_quote_request(self, product: ProductSpec) -> None:
+        """Gate shared by request_quote and drafted consults (no pricing)."""
         if product.target_client != self.client.id:
             raise BenchmarkError(
                 "TARGET_CLIENT_MATCH: term-sheet target_client does not match "
@@ -2353,16 +2420,31 @@ class LongHorizonEnvironment:
             )
         domain_check = validate_domain(product, self.client, self.domain)[0]
         if not domain_check.passed:
-            raise BenchmarkError(f"DOMAIN: {domain_check.reason}")
-        self.quote_count += 1
+            schema = self.policy_action_schema()
+            allowed = json.dumps(
+                {key: schema[key] for key in _DOMAIN_ERROR_SCHEMA_KEYS},
+                ensure_ascii=False, sort_keys=True,
+            )
+            raise BenchmarkError(
+                f"DOMAIN: {domain_check.reason}; allowed lattice: {allowed}"
+            )
+
+    def request_quote(self, product: ProductSpec) -> dict:
+        if self.submitted:
+            raise BenchmarkError("the round is already submitted")
+        if self.quote_count >= self.max_quotes_per_round:
+            raise BenchmarkError("quote budget exhausted")
+        self._validate_new_quote_request(product)
         # ProductSpec is mutable for v2 compatibility.  Bind the quote to an
         # immutable-by-convention value snapshot so a caller cannot mutate the
         # original object between request_quote and submit_design (TOCTOU).
         quoted_product = replace(product)
+        # An unquotable request (QuoteNotConvergedError) consumes no budget.
         quote = self.desk.quote(
             quoted_product, self.snapshot, self.client, self.portfolio,
-            self.state_version, self.quote_count,
+            self.state_version, self.quote_count + 1,
         )
+        self.quote_count += 1
         self.quotes[quote.quote_id] = (quote, quoted_product)
         return self.public_quote_payload(quote)
 
@@ -2400,7 +2482,7 @@ class LongHorizonEnvironment:
                     knock_in_active=False,
                     elapsed_months=0,
                 )
-                self.portfolio.add(Position(
+                self.portfolio.add(self._make_position(
                     position_id=f"P-{quote.quote_id[2:]}",
                     product=issued_product,
                     remaining_months=product.maturity_months,
@@ -2458,13 +2540,7 @@ class LongHorizonEnvironment:
             "cash_outlay": quote.cash_outlay,
             "premium": quote.premium,
             "protected_amount": quote.protected_amount,
-            "client_account": (
-                self.portfolio.client_account.snapshot(
-                    active_fair_value=self.portfolio.totals()["fair_value"]
-                )
-                if self.portfolio.client_account is not None
-                else None
-            ),
+            "client_account": self._visible_client_account(),
             "dealer_account": (
                 self.portfolio.dealer_account.snapshot(
                     active_liability_fair_value=self.portfolio.totals()["fair_value"],
@@ -2476,6 +2552,19 @@ class LongHorizonEnvironment:
                 else None
             ),
             "explanation": explanation,
+        }
+
+    def _visible_client_account(self) -> dict | None:
+        """Client account snapshot without hidden capital in Partial information."""
+        account = self.portfolio.client_account
+        if account is None:
+            return None
+        snapshot = account.snapshot(active_fair_value=self.portfolio.totals()["fair_value"])
+        if self.condition.full_information:
+            return snapshot
+        return {
+            key: value for key, value in snapshot.items()
+            if key not in _PRIVATE_CLIENT_ACCOUNT_FIELDS
         }
 
     # ------------------------------------------------------------------
@@ -2505,12 +2594,15 @@ class LongHorizonEnvironment:
             product = parse_product_draft(draft)
             if product.target_client == DRAFT_TARGET:
                 product = replace(product, target_client=self.client.id)
+            # Same lattice/forged-state gate as request_quote: a consult is a
+            # grounded lattice quote, never an unrestricted pricing calculator.
+            self._validate_new_quote_request(product)
             quote = self.desk.quote(
                 product, self.snapshot, self.client, self.portfolio,
                 self.state_version, -(self.consult_count + 1),
             )
-        except (ProductError, BenchmarkError, ValueError, TypeError):
-            return None, FormalFacts(state_version=self.state_version)
+        except (ProductError, BenchmarkError, ValueError, TypeError) as exc:
+            return None, FormalFacts(state_version=self.state_version), str(exc)
 
         if role == "trading_desk":
             block = self.public_quote_payload(quote)
@@ -2534,7 +2626,7 @@ class LongHorizonEnvironment:
                 checks=visible_checks,
                 allowed_numeric_strings=_collect_numeric_strings(checks_block),
             )
-        return block, facts
+        return block, facts, None
 
     async def consult(self, role: str, message: str, draft: dict | None = None) -> dict:
         """Qualitative consult with an env role; never raises.
@@ -2555,9 +2647,10 @@ class LongHorizonEnvironment:
                     "reply": _consult_fallback(role), "degraded": True}
 
         block = None
+        draft_error = None
         facts: "FormalFacts" = FormalFacts(state_version=self.state_version)
         if draft is not None and role in ("trading_desk", "risk_control"):
-            block, facts = self._consult_deterministic(role, draft)
+            block, facts, draft_error = self._consult_deterministic(role, draft)
 
         self.consult_count += 1
         self._turn_id += 1
@@ -2574,8 +2667,13 @@ class LongHorizonEnvironment:
             state_version=self.state_version,
             recipient=role,
         )
-        resp = await self.env_agents[role].respond(request, facts=facts)
-        return {
+        agent = self.env_agents[role]
+        if role == "client":
+            # A client consult carries no hidden facts, so it must not share
+            # history with query/decision turns that contain the hidden profile.
+            agent = self._separate_client_agent("_client_consult_agent")
+        resp = await agent.respond(request, facts=facts)
+        result = {
             "role": role,
             "action": resp.action,
             "reply": _consult_fallback(role) if resp.degraded else resp.narrative,
@@ -2583,19 +2681,29 @@ class LongHorizonEnvironment:
             "cache_hit": resp.cache_hit,
             "degraded": resp.degraded,
         }
+        if draft_error is not None:
+            result["draft_error"] = draft_error
+        return result
+
+    def _separate_client_agent(self, attr: str) -> "FrozenEnvAgent":
+        """A client-role agent with its own conversation history (lazily built)."""
+        agent = getattr(self, attr)
+        if agent is None:
+            from .env_agents import FrozenEnvAgent
+
+            base = self.env_agents["client"]
+            agent = FrozenEnvAgent(
+                base.spec, base.client,
+                system_prompt=base.system_prompt, cache=base.cache,
+            )
+            setattr(self, attr, agent)
+        return agent
 
     def _client_profile_facts(self, fields: Iterable[str] | None = None):
         """Full hidden client profile injected to the client LLM as grounding facts."""
         from .env_agents import FormalFacts
 
-        profile = {
-            **self._full_client_payload(),
-            "accepting_new_products": self.client.accepting_new_products,
-            "min_hit_prob": self.client.min_hit_prob,
-            "min_return_pct": self.client.min_return_pct,
-            "risk_appetite": self.client.risk_appetite,
-            "current_focus": self.client.current_focus,
-        }
+        profile = dict(self._full_client_payload())
         if fields is not None:
             selected = tuple(fields)
             profile = {key: profile[key] for key in selected}
@@ -2638,7 +2746,7 @@ class LongHorizonEnvironment:
         if resp.degraded:
             return {"topic": topic, "reply": _consult_fallback("client"),
                     "degraded": True, "queries_left": queries_left}
-        return {
+        result = {
             "topic": topic,
             "action": resp.action,
             "reply": resp.narrative,
@@ -2647,6 +2755,9 @@ class LongHorizonEnvironment:
             "cache_hit": resp.cache_hit,
             "degraded": False,
         }
+        if "capital" in resp.cited_fact_ids:
+            result.update(self._disclose_lattice_notionals())
+        return result
 
     async def _role_review(self, role: str, quote: "Quote", product: ProductSpec, explanation: str):
         """One review request to an env role for a final submission; None if absent."""
@@ -2706,7 +2817,12 @@ class LongHorizonEnvironment:
             state_version=self.state_version,
             recipient=role,
         )
-        return await self.env_agents[role].respond(request, facts=facts)
+        agent = self.env_agents[role]
+        if role == "client":
+            # The decision carries the full hidden profile; keep it out of the
+            # history that later query_client_llm topic turns are answered from.
+            agent = self._separate_client_agent("_client_review_agent")
+        return await agent.respond(request, facts=facts)
 
     async def workflow_review(self, quote_id: str, explanation: str = "") -> "WorkflowOutcome | None":
         """Gather desk/risk/client decisions on a submission into a WorkflowOutcome.
@@ -2749,6 +2865,7 @@ class LongHorizonEnvironment:
         self.quote_count = 0
         self.query_count = 0
         self.consult_count = 0
+        self._capital_disclosed = False
         self.quotes.clear()
         self.submitted = False
         return matured
@@ -2814,17 +2931,6 @@ def constraint_ledger(quote: Quote, portfolio: PortfolioState, budget: RiskBudge
     }
 
 
-def oracle_candidate_grid(
-    client: ClientProfile, domain: ProductDomainSpec | None = None
-) -> list[ProductSpec]:
-    """Frozen finite oracle candidate list, materialised from the shared lattice.
-
-    This is exactly ``enumerate_domain``: the oracle and the agent share one
-    domain, so any quotable agent action is an oracle candidate.
-    """
-    return list(enumerate_domain(client, domain or ProductDomainSpec()))
-
-
 def oracle_best_quote(
     domain: ProductDomainSpec | Iterable[ProductSpec],
     snapshot: MarketSnapshot,
@@ -2834,8 +2940,13 @@ def oracle_best_quote(
     state_version: str = "oracle-frozen-state",
     *,
     policy: QuotePolicy | None = None,
+    nonconverged: list[ProductSpec] | None = None,
 ) -> tuple[ProductSpec, Quote] | None:
     """Deterministic one-step margin frontier after hard filtering, over the lattice.
+
+    Lattice points whose quote equilibrium does not converge are not quotable
+    (``TradingDesk.quote`` fails closed for the agent too); they are skipped and,
+    when ``nonconverged`` is given, appended to it.
 
     ``domain`` may be a ProductDomainSpec (enumerated internally) or, for
     backwards compatibility, an explicit iterable of ProductSpec candidates.
@@ -2852,7 +2963,12 @@ def oracle_best_quote(
     desk = TradingDesk(HardConstraintEngine(risk_budget), policy=policy, domain=spec_domain)
     feasible: list[tuple[ProductSpec, Quote]] = []
     for index, product in enumerate(products, start=1):
-        quote = desk.quote(product, snapshot, client, portfolio, state_version, index)
+        try:
+            quote = desk.quote(product, snapshot, client, portfolio, state_version, index)
+        except QuoteNotConvergedError:
+            if nonconverged is not None:
+                nonconverged.append(product)
+            continue
         if quote.hard_pass:
             feasible.append((product, quote))
     return max(feasible, key=lambda item: item[1].dealer_margin, default=None)
@@ -2891,6 +3007,7 @@ def calibrate_risk_budget(
         desk = TradingDesk(HardConstraintEngine(candidate_budget), policy=policy)
         passed = 0
         total = 0
+        skipped = 0
         for case_index, (snapshot, client, portfolio) in enumerate(development_cases):
             case_products: Iterable[ProductSpec] = (
                 enumerate_domain(client, products)
@@ -2898,14 +3015,23 @@ def calibrate_risk_budget(
                 else products
             )
             for product_index, product in enumerate(case_products):
-                quote = desk.quote(
-                    product, snapshot, client, portfolio,
-                    f"calibration-{case_index}", product_index + 1,
-                )
+                try:
+                    quote = desk.quote(
+                        product, snapshot, client, portfolio,
+                        f"calibration-{case_index}", product_index + 1,
+                    )
+                except QuoteNotConvergedError:
+                    skipped += 1
+                    continue
                 passed += int(quote.hard_pass)
                 total += 1
+        if not total:
+            raise BenchmarkError("no development candidate has a converged quote")
         rate = passed / total
-        rows.append({"factor": float(factor), "feasibility_rate": rate, "passed": passed, "total": total})
+        rows.append({
+            "factor": float(factor), "feasibility_rate": rate, "passed": passed,
+            "total": total, "skipped_nonconverged": skipped,
+        })
     in_band = [row for row in rows if target[0] <= row["feasibility_rate"] <= target[1]]
     pool = in_band or rows
     selected = min(pool, key=lambda row: (abs(row["feasibility_rate"] - midpoint), row["factor"]))
@@ -2917,32 +3043,4 @@ def calibrate_risk_budget(
         "within_target": selected in in_band,
         "grid": rows,
         "warning": "freeze this result before evaluating held-out episodes",
-    }
-
-
-def carry_sensitivity(
-    product: ProductSpec,
-    snapshot: MarketSnapshot,
-    client: ClientProfile,
-    portfolio: PortfolioState,
-    risk_budget: RiskBudget,
-    *,
-    shock_bp: float = 25.0,
-) -> dict:
-    """Requote after +/- carry shocks and report FV changes as notional fractions."""
-    shock = shock_bp / 10_000.0
-    desk = TradingDesk(HardConstraintEngine(risk_budget))
-    rows = []
-    for label, amount in (("down", -shock), ("base", 0.0), ("up", shock)):
-        shocked = replace(snapshot, carry_rate=snapshot.carry_rate + amount)
-        quote = desk.quote(product, shocked, client, portfolio, f"carry-{label}", len(rows) + 1)
-        rows.append({"scenario": label, "carry_rate": shocked.carry_rate, "fair_value": quote.fair_value})
-    base = rows[1]["fair_value"]
-    max_change = max(abs(row["fair_value"] - base) for row in rows)
-    return {
-        "shock_bp": shock_bp,
-        "rows": rows,
-        "max_fv_change": max_change,
-        "max_fv_change_pct_notional": max_change / product.notional,
-        "below_0_5pct_notional": max_change / product.notional < 0.005,
     }

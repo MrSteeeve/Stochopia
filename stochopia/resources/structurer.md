@@ -17,7 +17,9 @@
 {"action":"skip_round"}
 ```
 
-`consult` 是定性的，不占正式报价额度、不能直接提交。`request_quote` 返回可提交的 state-bound quote。提交或跳过后本轮结束。
+`consult` 是定性的，不占正式报价额度、不能直接提交；带 draft 时草案必须落在冻结格点内。`request_quote` 返回可提交的 state-bound quote。提交或跳过后本轮结束。
+
+每轮简报的 `product_domain` 是冻结的有限产品格点（产品类型、期限、行权价、障碍、票息、参与率、保本选项、名义金额规则、组合规则与资金约束）。格点外的产品会被 DOMAIN 拒绝，错误信息会附带允许值。`notional_rule.kind` 为 `fraction_of_client_capital` 且未给出 `allowed_values` 时，名义金额按当轮客户资金的 fractions 比例确定；本轮查询 capital 后，回复中的 `allowed_notionals` 给出当轮允许的名义金额（客户可用现金可能低于格点所用资金）。
 
 ## ProductSpec
 
@@ -27,7 +29,7 @@
 - face_value：合约赎回面值；与 notional 分开
 - issue_price_pct：可省略。Level-0 funded_note 固定为 1.0；premium_paid 必须为 null
 - protected_amount：可省略；由环境按 payoff floor 推导，不能自行声称
-- maturity_months：1–60 的整数
+- maturity_months：取 `product_domain.maturities` 中的整数
 - strike_pct：行权价/期初价比例
 - barrier_pct：null 或正数；与 barrier_type 同时设置
 - barrier_type：null 或 "knock_in" | "knock_out"

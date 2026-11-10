@@ -59,10 +59,9 @@ def _task() -> EpisodeTask:
 
 def _record_complete_trajectory(path):
     environment = StochopiaStructurerEnv(_task())
-    _, info = environment.reset(seed=23, options={"replicate": 2})
+    environment.reset(seed=23)
     recorder = TrajectoryRecorder(
         environment,
-        initial_state_hash=info["state_hash"],
         run_metadata={
             "policy_kind": "test",
             "policy_name": "skip-policy",
@@ -91,7 +90,7 @@ def _product() -> ProductSpec:
     )
 
 
-def test_task_suite_is_self_contained_and_tamper_evident(tmp_path):
+def test_task_suite_is_self_contained(tmp_path):
     suite = TaskSuite(
         name="unit",
         version="1",
@@ -106,11 +105,13 @@ def test_task_suite_is_self_contained_and_tamper_evident(tmp_path):
     assert loaded.tasks[0].task_hash == _task().task_hash
     assert loaded.to_dict()["tasks"][0]["client"]["id"] == "client-hidden"
 
+    # Edited suites load as edited: the suite hash is an identity, not a seal.
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["tasks"][0]["client"]["capital"] = 1.0
     path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="hash"):
-        TaskSuite.load(path)
+    edited = TaskSuite.load(path)
+    assert edited.tasks[0].client.capital == 1.0
+    assert edited.suite_hash != suite.suite_hash
 
 
 def test_trajectory_evaluator_replays_economics_and_emits_metrics(tmp_path):
@@ -120,23 +121,24 @@ def test_trajectory_evaluator_replays_economics_and_emits_metrics(tmp_path):
         trajectory,
         output_path=tmp_path / "evaluation.json",
         suite_hash="suite-a",
+        replay=True,
     )
 
     assert evaluation["replay_verified"] is True
+    assert replay_and_evaluate(trajectory, suite_hash="suite-a")["metrics"] == evaluation["metrics"]
     assert evaluation["suite_hash"] == "suite-a"
     assert evaluation["policy_name"] == "skip-policy"
     assert evaluation["metrics"]["completion_rate"] == pytest.approx(1.0)
     assert evaluation["metrics"]["steps"] == pytest.approx(2.0)
     assert evaluation["metrics"]["submission_rate"] == pytest.approx(0.0)
-    assert len(evaluation["evaluation_hash"]) == 64
+    assert len(evaluation["policy_config_hash"]) == 64
 
 
 def test_quote_checks_are_not_double_counted_as_submissions(tmp_path):
     environment = StochopiaStructurerEnv(_task())
-    _, info = environment.reset(seed=23)
+    environment.reset(seed=23)
     recorder = TrajectoryRecorder(
         environment,
-        initial_state_hash=info["state_hash"],
         run_metadata={
             "policy_kind": "test",
             "policy_name": "quote-policy",
@@ -160,12 +162,11 @@ def test_quote_checks_are_not_double_counted_as_submissions(tmp_path):
     ] == pytest.approx(1.0)
 
 
-def test_economic_replay_uses_top_level_run_seed_even_for_partial_run(tmp_path):
+def test_partial_run_without_steps_is_scored_from_recorded_outcome(tmp_path):
     environment = StochopiaStructurerEnv(_task())
-    _, info = environment.reset(seed=71)
+    environment.reset(seed=71)
     recorder = TrajectoryRecorder(
         environment,
-        initial_state_hash=info["state_hash"],
         run_metadata={
             "policy_kind": "test",
             "policy_name": "failed-policy",
@@ -179,7 +180,7 @@ def test_economic_replay_uses_top_level_run_seed_even_for_partial_run(tmp_path):
 
     evaluation = replay_and_evaluate(path, suite_hash="suite-a")
 
-    assert evaluation["replay_verified"] is True
+    assert evaluation["replay_verified"] is False
     assert evaluation["status"] == "partial"
     assert evaluation["metrics"]["steps"] == pytest.approx(0.0)
     assert evaluation["metrics"]["completion_rate"] == pytest.approx(0.0)
@@ -213,3 +214,55 @@ def test_aggregate_requires_one_frozen_suite_and_clusters_by_task(tmp_path):
             n_resamples=10,
             seed=3,
         )
+
+
+def test_contract_acceptance_rate_only_counts_hard_pass_submissions():
+    from stochopia.environment.evaluation import _metrics_from_transitions
+
+    transitions = [
+        {"constraint_signals": {"accepted": False, "hard_pass": False, "client_contract_pass": True}},
+        {"constraint_signals": {"accepted": True, "hard_pass": True, "client_contract_pass": True}},
+    ]
+    metrics = _metrics_from_transitions(transitions)[0]
+    assert metrics["contract_acceptance_rate_given_hard_pass"] == pytest.approx(1.0)
+
+
+def test_conditional_rates_are_none_without_denominator(tmp_path):
+    trajectory = _record_complete_trajectory(tmp_path / "trajectory.json")
+    evaluation = replay_and_evaluate(trajectory, suite_hash="suite-a")
+    metrics = evaluation["metrics"]
+    for name in (
+        "hard_execution_rate_given_submission",
+        "contract_acceptance_rate_given_hard_pass",
+        "settlement_acceptance_rate",
+    ):
+        assert metrics[name] is None
+
+    aggregate = aggregate_evaluations([evaluation], n_resamples=10, seed=0)
+    pooled = aggregate["policies"]["skip-policy"]["metrics"]
+    assert "settlement_acceptance_rate" not in pooled
+    assert "submission_rate" in pooled
+
+
+def test_aggregate_rejects_mixed_environment_or_pricing_versions(tmp_path):
+    trajectory = _record_complete_trajectory(tmp_path / "trajectory.json")
+    first = replay_and_evaluate(trajectory, suite_hash="suite-a")
+    for key in ("environment_version", "pricing_version"):
+        stale = dict(first)
+        stale[key] = "old-version"
+        with pytest.raises(ValueError, match=f"mixed {key}"):
+            aggregate_evaluations([first, stale], n_resamples=10, seed=0)
+
+
+def test_evaluator_scores_edited_manifest_without_hash_self_check(tmp_path):
+    trajectory = _record_complete_trajectory(tmp_path / "trajectory.json")
+    payload = json.loads(trajectory.read_text(encoding="utf-8"))
+    payload["task_manifest"]["client"]["capital"] = 9_000_000.0
+    edited = tmp_path / "edited.json"
+    edited.write_text(json.dumps(payload), encoding="utf-8")
+
+    evaluation = replay_and_evaluate(edited, suite_hash="suite-a")
+
+    # task_hash is a functional ID of the content actually scored.
+    assert evaluation["task_hash"] != payload["metadata"]["task_hash"]
+    assert evaluation["metrics"]["steps"] == pytest.approx(2.0)
