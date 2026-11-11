@@ -3,20 +3,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "stochopia-bench"
+name = "stochopia"
 version = "0.2.0"
-description = "A stateful environment for training trading-desk agents under uncertainty"
+description = "An order-flow market world model revised by an LLM research loop"
 requires-python = ">=3.10"
 dependencies = [
     "httpx",
     "pyyaml",
-    "rich",
-    "python-dotenv",
-    "tushare",
 ]
-
-[project.scripts]
-stochopia-benchmark = "stochopia.benchmark_cli:main"
 
 [project.optional-dependencies]
 research = [

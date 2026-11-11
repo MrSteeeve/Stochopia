@@ -1,8 +1,8 @@
 """Extract JSON objects from free-form LLM output.
 
 Fenced ```json blocks are tried first, then every balanced ``{...}`` span in
-order of appearance.  Shared by the environment-agent loader and the episode
-runner so both sides parse model replies identically.
+order of appearance.  Every caller parses model replies through this module so
+they are read identically.
 """
 
 from __future__ import annotations

@@ -15,7 +15,6 @@ import random
 
 import pytest
 
-from stochopia.experiment import SEED_NAMESPACE as EXPERIMENT_SEED_NAMESPACE
 from stochopia.stats import (
     StatsError,
     bootstrap_ci,
@@ -33,8 +32,8 @@ from stochopia.stats import (
 
 def test_derive_seed_deterministic_for_same_input():
     parts = ("E01", "gpt-5", "ledger_archive", "full_static", 0)
-    a = derive_seed(EXPERIMENT_SEED_NAMESPACE, *parts)
-    b = derive_seed(EXPERIMENT_SEED_NAMESPACE, *parts)
+    a = derive_seed("stochopia.seed.experiment.v1", *parts)
+    b = derive_seed("stochopia.seed.experiment.v1", *parts)
     assert a == b == 4_233_541_484
 
 

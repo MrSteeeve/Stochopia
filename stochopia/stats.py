@@ -1,9 +1,8 @@
-"""Dependency-free statistics for Stochopia v2: seeding, bootstrap CIs, paired
-significance tests, and multiple-comparison correction.
+"""Dependency-free statistics: seeding, bootstrap CIs, paired significance
+tests, and multiple-comparison correction.
 
 Every routine here is deterministic given an explicit seed and uses only the
-standard library (see judge.py for the precedent of self-written Spearman /
-weighted-kappa rather than adding scipy/numpy). Nothing in this module calls
+standard library. Nothing in this module calls
 Python's built-in ``hash()``, which is randomized per-process by default and
 therefore unsuitable for reproducible experiment seeding.
 """

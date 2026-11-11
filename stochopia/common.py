@@ -1,7 +1,7 @@
 """Shared low-level helpers: canonical JSON, SHA-256 digests, atomic writes.
 
-Hashes in Stochopia are identifiers and cache keys (task hash, suite hash,
-response-cache key, tushare request cache key), not tamper evidence.  The
+Hashes in Stochopia are identifiers, cache keys and seed sources, not tamper
+evidence.  The
 canonical encoding is ``sort_keys=True, separators=(",", ":"),
 ensure_ascii=False, allow_nan=False``; changing it would change every recorded
 identifier.
