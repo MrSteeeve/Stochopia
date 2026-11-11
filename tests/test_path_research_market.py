@@ -63,6 +63,7 @@ def test_event_condition_uses_observed_market_only_and_payments_never_see_event(
 
 
 def test_existing_dsl_can_pay_at_month_one_without_new_language():
+    pytest.importorskip("structurerdsl")
     from structurerdsl.program import Program
     from stochopia.research.dsl_cashflows import table_from_artifact
     tree=TreeMarket({'months':2,'rate':0.})

@@ -137,6 +137,7 @@ def test_horizon_must_be_whole_steps():
 
 
 def test_snowball_events_on_deterministic_paths():
+    pytest.importorskip("structurerdsl")
     up = np.linspace(1.0, 1.10, 64)[None, :]
     down = np.linspace(1.0, 0.80, 64)[None, :]
     events = snowball_events(np.vstack([up, down]), 63)

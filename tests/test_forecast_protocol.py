@@ -65,6 +65,7 @@ def test_crps_matches_brute_force_and_reduces_to_brier():
 
 
 def test_touch_probes_follow_the_path():
+    pytest.importorskip("structurerdsl")
     up = np.full((1, fp.HORIZON), np.log(1.04) / 3)
     up[0, 3:] = 0.0
     payoff = fp._probe_payoffs(np.vstack([up, -up]))
@@ -74,6 +75,7 @@ def test_touch_probes_follow_the_path():
 
 
 def test_reference_has_zero_skill_against_itself_and_overdispersion_loses():
+    pytest.importorskip("structurerdsl")
     panel = _panel()
     reference = fp.reference_forecasts(panel, "dev")
     assert fp.evaluate_forecasts(reference, panel, reference=reference)["score"] == pytest.approx(0.0)
@@ -111,6 +113,7 @@ def test_validate_rejects_wrong_shapes(returns_shape, q_shape, message):
 
 
 def test_extreme_q_cannot_remove_a_family_from_the_score():
+    pytest.importorskip("structurerdsl")
     panel = _panel()
 
     def abstain(history, query):

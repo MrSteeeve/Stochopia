@@ -5,6 +5,7 @@ import pytest
 
 
 def modules():
+    pytest.importorskip("structurerdsl")
     market = importlib.import_module('stochopia.research.liquidity_market')
     execution = importlib.import_module('stochopia.research.liquidity_execution')
     return market, execution
