@@ -945,6 +945,17 @@ Only abstract workflow, schemas and synthetic rules may be derived from private
 institutional material. No private document, client, institution, limit or
 identifying metadata may enter released data or prompts.
 
+## 2026-11-10（二）：删除无调用方的 RS-GBM 合成情景发生器
+
+删除 `stochopia/market_generator.py` 及其测试 `tests/test_market_generator.py`。它是 2026-08-31 的 V0 Regime-Switching
+GBM 合成情景发生器，按设计不接 CLI、TaskSuite、evaluator 或 `step()`，入库以来没有任何生产调用方，本仓库、OpenHyra
+与 StructurerDSL 都不 import 它；世界模型研究线用的是 `stochopia.research.world_model_generator`。需要时可从 git 历史取回。
+下文更早条目里提到 `stochopia.market_generator` 的修复随之成为历史记录。
+
+`stochopia/q_side_bundle.py` 与 `stochopia/trading_calendar.py` 原先唯一的生产调用方就是该发生器，本次未动，
+现在只被各自的测试和 `python -m` 构建入口使用。此项不涉及 Benchmark v3 的定价、结算、约束或指标，已有 episode
+结果不受影响。
+
 ## 2026-11-10：世界模型生成器门槛改为层级命名
 
 StructurerDSL `docs/SPEC.md` 11.2 的生成器门槛不再用 G5–G7 编号，改为四个累进层级：草稿层（`draft`）、
