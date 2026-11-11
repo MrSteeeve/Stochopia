@@ -202,3 +202,7 @@ CLAUDE.md
 # Codex 本地工作配置（个人工具链，不入库）
 .codex/
 AGENTS.md
+
+# 内部思考与运维笔记（不属于项目内容，不入库）
+docs/cloud-dev-setup.md
+docs/research/Stochopia-Research-Direction-*.md
