@@ -17,8 +17,6 @@ Stochopia是一个市场世界模型。它描述挂单、撤单、成交与价�
 | `stochopia/stats.py` | 种子派生、bootstrap置信区间、配对检验、Holm校正 |
 | `stochopia/common.py` | 规范化JSON、功能性哈希ID、原子写入 |
 
-研究笔记在`docs/research/`。
-
 ## 旧版：Benchmark v3
 
 此前本仓库是结构化产品设计基准Benchmark v3，已停止维护。它的最终状态保存在标签`benchmark-v3-final`：
@@ -27,7 +25,7 @@ Stochopia是一个市场世界模型。它描述挂单、撤单、成交与价�
 git checkout benchmark-v3-final
 ```
 
-`docs/research/`下2026年11月11日之前的笔记描述的是那一版代码，文中的文件路径只在该标签下存在。
+那一版的研究笔记也保存在该标签的`docs/research/`下，文中的文件路径只在该标签下存在。
 
 ## 开发
 

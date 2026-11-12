@@ -17,8 +17,6 @@ The new code is under construction. For now the repository only holds general-pu
 | `stochopia/stats.py` | Seed derivation, bootstrap confidence intervals, paired tests, Holm correction |
 | `stochopia/common.py` | Canonical JSON, functional hash IDs, atomic writes |
 
-Research notes are in `docs/research/` (in Chinese).
-
 ## Previous version: Benchmark v3
 
 This repository used to be Benchmark v3, a structured-product design benchmark. It is no longer maintained. Its final state is kept under the tag `benchmark-v3-final`:
@@ -27,7 +25,7 @@ This repository used to be Benchmark v3, a structured-product design benchmark. 
 git checkout benchmark-v3-final
 ```
 
-Notes in `docs/research/` dated before 2026-11-11 describe that version; the file paths they mention exist only under that tag.
+The research notes for that version (in Chinese) are kept under the same tag, in `docs/research/`; the file paths they mention exist only there.
 
 ## Development
 
