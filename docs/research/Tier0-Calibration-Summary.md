@@ -1,6 +1,8 @@
 # Tier 0 开发集校准（Step 4.1）
 
-**结论（2026-11-24，北京时间）**。增强信息漂移的配置在开发集上区分了两个诊断题。A 的背景流隔离使自由路径 RMSE 减少 6.593 tick，95% 区间为 [−6.958, −6.251]。B 在共用独立背景权重时加入自身标记价格分支，钳制路径 RMSE 减少 1.775 tick，95% 区间为 [−1.900, −1.643]。独立模拟日复跑确认了两项总体改善，B 有一个训练种子反向。建议沿用增强配置，正式阈值经人工确认后再登记。
+**Step 4.1c 定稿**。64 个训练日、32 个开发日、LR 0.001、200 步的纯 GRU 配置通过独立复跑。复跑中 A 的 `x01` 自由路径 RMSE 差为 −6.066 tick [−6.393, −5.772]，B 的 `x12` 钳制路径 RMSE 差为 −2.438 tick [−2.728, −2.131]。两题诊断均为 5/5 预期分类。定稿参数和完整读数见 Step 4.1c 的表 2 和表 3。
+
+**Step 4.1 历史筛选（2026-11-24，北京时间）**。增强信息漂移的配置在开发集上区分了两个诊断题。A 的背景流隔离使自由路径 RMSE 减少 6.593 tick，95% 区间为 [−6.958, −6.251]。B 在共用独立背景权重时加入自身标记价格分支，钳制路径 RMSE 减少 1.775 tick，95% 区间为 [−1.900, −1.643]。独立模拟日复跑确认了两项总体改善，B 有一个训练种子反向。建议沿用增强配置，正式阈值经人工确认后再登记。
 
 ## 数据、模型与配对口径
 
@@ -85,7 +87,7 @@ A 的 `self` 会重训共享 GRU 状态和方向头，因此是对准价格的�
 - B 的 `x12` 在增强样本五个种子都降低钳制 RMSE。复跑的总体区间也通过 −0.50 tick 线，种子 293 恶化 0.352 tick，其余四个改善。复跑的种子范围为 [−3.880, +0.352] tick，增加开发日只缩窄以这些拟合为条件的区间，种子差异仍需报告。
 - B 的 `x13` 钳制 RMSE 在两次增强运行都精确落在建议等效带 [−0.10, +0.10] 内。B 的联合改动与只改价格的钳制读数相同，主运行中改用 SSM 背景却令联合候选的自由 RMSE 相对 `x12` 高 0.500 tick。A 的联合改动有更低的自由 RMSE，单通道对照依然提供直接的归因证据。
 
-## 正式 P0 建议
+## Step 4.1 当时的参数建议
 
 建议 `train / dev / test = 16 / 32 / 64` 个模拟日、`K=5`、每训练 120 步、每模拟日 6 个窗口、2,000 次日重抽。根据下表的开发集精度，64 天可作为正式复验的精度余量，实际检验力尚未测量。现有 `AnalysisSpec` 在开发和冻结侧共用，建议登记 `min_pairs=32, min_train_repeats=5`，正式测试清单另登记 64 个计划日并报告完成数。开发与正式复验使用独立的模拟日命名空间。训练和模拟日使用分开的种子流。
 
@@ -113,101 +115,6 @@ A 的 `self` 会重训共享 GRU 状态和方向头，因此是对准价格的�
 达标以上侧区间端点判定，等效需要整个区间落在等效带内。训练重复的范围继续独立报告。A 的自由路径主阈值落在正例与价格导向对照的区间之间，B 的钳制阈值与两次增强运行的总体区间均有余量，复跑的反向种子仍计入报告。等效带优先用于有结构依据的预判，普通非零读数区间太宽时可以是不可判定。建议两题都允许联合候选在效果上达标，机制归因以保持另一通道的配对为依据。正式评分若另需一个唯一参考答案，需在 Step 4.2 启动前确定如何处理联合候选。
 
 把建议的主项和护栏代入现有 `assess_candidate()`，增强配置及其复跑中，A 的 `x01`、`a_joint` 与 B 的 `x12`、`b_joint` 均达标，`a_self`、`x13` 均被相应主项反驳。该结果来自阈值校准用的开发数据。
-
-## 复现与回归
-
-本机在 macOS arm64 上用 Python 3.12.6、PyTorch 2.14.0 运行。下列命令在 Stochopia 根目录执行，OpenHyra 保持相邻目录。默认复现增强配置。标准配置把 `STEP41_DRIFT`、`STEP41_FRACTION` 改为 `0.85`、`0.40`。增强复跑把 `STEP41_NAMESPACE` 改为 `p0-step41-replication-v1`。每次使用独立的 `STEP41_OUT`。
-
-<details>
-<summary>复现命令</summary>
-
-```bash
-env PYTHONPATH=.:../OpenHyra STEP41_OUT=outputs/phase4-step41/reproduced \
-  STEP41_NAMESPACE=p0-step41-calibration-v1 STEP41_DRIFT=1.8 STEP41_FRACTION=0.25 \
-  .venv/bin/python - <<'PY'
-from dataclasses import replace
-from os import environ
-from pathlib import Path
-
-import torch
-from tasks.stochopia_tier0 import calibrate
-from stochopia.common import atomic_write_json
-from stochopia.harness.contract import CandidateRef, EvaluationTask
-from stochopia.harness.report import summarize_candidate
-from stochopia.harness.runner import Runner
-from stochopia.stats import derive_seed
-
-torch.set_num_threads(1)
-output = Path(environ['STEP41_OUT'])
-output.mkdir(parents=True, exist_ok=False)
-namespace = environ['STEP41_NAMESPACE']
-manifest = calibrate.build_manifest(
-    namespace, steps=120, n_train_days=16, n_dev_days=32, train_seeds=(103, 137, 211, 293, 367),
-    n_resamples=2000, namespace=namespace, hidden=32, windows_per_day=6,
-    info_drift=float(environ['STEP41_DRIFT']), informed_fraction=float(environ['STEP41_FRACTION']),
-)
-a, b = manifest.scenarios
-scenes = (
-    replace(a, candidate_ids=('x00', 'x01', 'a_self', 'a_joint')),
-    replace(b, candidate_ids=('x11', 'x12', 'x13', 'b_joint')),
-)
-added = (
-    CandidateRef(candidate_id='a_self', backbone='gru', recipe='self', parent_id='x00', channels=('price',)),
-    CandidateRef(candidate_id='a_joint', backbone='gru', recipe='separate_flow_own_price',
-                 parent_id='x00', channels=('flow', 'price')),
-    CandidateRef(candidate_id='b_joint', backbone='gru', recipe='separate_flow_own_price',
-                 parent_id='x11', channels=('flow', 'price'), implementation={'background_candidate_id': 'x02'}),
-)
-analyses = list(manifest.analysis)
-extra_readouts = {'background_bias': ('background_bias', 'recovery'), 'end_response': ('free_end_response', 'end')}
-for spec in manifest.analysis:
-    if spec.readout in extra_readouts:
-        name, window = extra_readouts[spec.readout]
-        analyses.append(replace(spec, analysis_id=f'{spec.scenario_id}:{name}:{window}', readout=name, window=window,
-                                acceptance={'role': 'prediction'}, seed=derive_seed(
-                                    'stochopia-tier0-calibration-bootstrap', spec.scenario_id, name, window)))
-manifest = replace(manifest, scenarios=scenes, candidates=(*manifest.candidates, *added), analysis=tuple(analyses),
-                   prediction_candidate_set={scene.scenario_id: scene.candidate_ids[1:] for scene in scenes})
-runner = Runner(manifest)
-days = manifest.splits['dev'].unit_ids
-repeats = tuple(manifest.train_seeds)
-atomic_write_json(output / 'manifest.json', manifest.to_dict())
-for scene in scenes:
-    sid = scene.scenario_id
-    rows = {candidate: [] for candidate in scene.candidate_ids[1:]}
-    direct, diagnosis_rows = {}, []
-    for repeat in repeats:
-        parent = runner.fit_candidate(scene.parent_id, repeat, output / 'weights')
-        direct[repeat] = runner.diagnose(sid, parent)
-        for candidate_id in rows:
-            fit = runner.fit_candidate(candidate_id, repeat, output / 'weights')
-            task = EvaluationTask(task_id=f'{sid}-{candidate_id}-{repeat}', split='dev', scenario_id=sid,
-                                  parent_fit_id=parent.fit_id, candidate_fit_id=fit.fit_id, unit_ids=days,
-                                  action_ref=f'{sid}:action', random_inputs_ref=f'{sid}:dev:rollout')
-            pair = runner.run_paired_eval(task, parent, fit, train_seconds=fit.config['train_seconds'])
-            rows[candidate_id].append(pair)
-            atomic_write_json(output / 'measurements' / f'{task.task_id}.json', pair.to_dict())
-            if candidate_id == scene.candidate_ids[1]:
-                diagnosis_task = replace(task, task_id=f'diagnosis-{task.task_id}', random_inputs_ref='diagnosis')
-                diagnosis_rows.append(runner.run_paired_eval(diagnosis_task, parent, fit))
-    diagnose = calibrate._diagnostic_grid(scene, diagnosis_rows, direct, repeats, days, 2000)
-    for repeat in repeats:
-        for readout in ('flow_rmse', 'price_rmse'):
-            if abs(diagnose['diagnoses'][repeat][readout] - direct[repeat][readout]) > 2e-5:
-                raise ValueError(f'{sid}/{repeat}/{readout} differs from Runner.diagnose()')
-    effects = {}
-    for candidate_id, pairs in rows.items():
-        estimates = summarize_candidate(manifest.analysis, pairs, required_unit_ids=days)
-        effects[candidate_id] = {key: calibrate._delta_summary(delta) for key, delta in estimates.items()}
-    atomic_write_json(output / f'{sid}-summary.json', {'diagnosis': diagnose, 'direct': direct, 'effects': effects})
-PY
-```
-
-</details>
-
-模拟日日种子由 `calibrate._split()` 派生。世界标识为 `p0-tier0-common-rng`，命名空间在上表前缀后加 `-train` 或 `-dev`，索引从零开始。全局 rollout 和 delta 种子分别为 `45721`、`34913`。读数重抽种子由 `AnalysisSpec.seed` 登记，保存在复现命令输出的 `manifest.json`。样本量敏感性用同一次增强运行的前 8/16/24/32 个日 ID 重算，训练种子集合保持一致。权重、逐日读数和运行参数留在忽略目录 `outputs/phase4-step41/`。
-
-本地 `.venv/bin/python -m pytest -q tests --ignore=tests/test_harness_p0_acceptance.py` 通过 224 项，有 3 条上游 JAX-LOB 弃用提示。回归测试包含原有的进程内客户端固定响应夹具，校准的真实与替身 LLM 调用均为零。该轮只发布校准报告，正式 `test` 数据、冻结复验和三组对照留在阈值确认之后。
 
 ## Step 4.1b　B 题收敛网格与纯 GRU 对照
 
@@ -237,7 +144,7 @@ B 的纯 GRU 菜单使用同根训练日和种子另训两层匿名 GRU `x02`。
 | B | 64 | 0.001 | 200 | −1.107 | [−1.566, −0.630] | [−1.687, −0.496] | 5/5 | 0.015 | [−0.007, 0.040] |
 | B | 64 | 0.001 | 300 | −1.724 | [−2.116, −1.328] | [−2.506, −0.971] | 5/5 | 0.011 | [−0.001, 0.032] |
 
-### 硬指标筛查与停止点
+### Step 4.1b 当时的硬指标筛查
 
 所有四组（训练日、LR）在 200 步和 300 步的 B 钳制 RMSE 区间上界均低于 −0.50 tick。八个可选格点的 B 单改价格均为 5/5 种子改善。其中两个格点的 B 单改价格最差种子已经超过 +0.05 nats/event，余下六个全部重跑了 A/B 完整的纯 GRU 菜单。六个格点中，A/B 分类均为 5/5 且诊断下界超过 0.15 tick，A 隔离流的自由 RMSE 也通过 −2.00 tick 线。
 
@@ -254,10 +161,151 @@ B 的纯 GRU 菜单使用同根训练日和种子另训两层匿名 GRU `x02`。
 
 - **B 的步数反转在本轮网格中没有重现。** 以 64 天、LR 0.001 为例，`self` 在 200/300 步的 B 钳制差值为 −2.875/−2.616 tick，`self-exogenous` 为 −1.107/−1.723 tick。两种标记在较长预算下均保留改善。结果支持把旧反转视为训练设置敏感性，当前网格无法单独归因为知情标签。
 - **共同门槛卡在 A 联合候选的单种子 NLL。** 六个入围方案的 A 联合合并区间上界均低于 +0.05，种子 103 的点估计仍全部超限。对优先的 64 天、LR 0.001、200 步方案重算种子 103：父模型与联合候选的方向 NLL 均为 0.581125，收益项从 −0.454472 升到 −0.366327 nats/event，解释了 +0.088145 的总差值。这个核对定位到无注入时的收益条件分布。它无法辨认是标记训练、优化过程还是二者交互导致了该种子的收益估计退化。
-- **按异常分支结束。** 没有参数同时满足四条硬指标，独立命名空间 `p0-step41b-replication-v1` 暂未运行，也没有定稿参数可写入表 2、表 3 或 `calibrate.py` 默认值。
+- **Step 4.1b 在当时的门槛处停止。** 旧口径要求单种子 NLL 也通过 +0.05 护栏。Step 4.1c 的独立复跑与锁定口径见表 2 和表 3。
 
 ### 运行复核
 
 本轮沿用上节的世界、动作和七个读数定义，用旧版 `calibrate.build_manifest` 传入表中日数与步数，在内存中以 `replace(manifest, train_plan={**manifest.train_plan, "lr": lr})` 登记学习率。Grid B 额外登记 `CandidateRef(candidate_id="x12_exogenous", backbone="gru", recipe="self-exogenous", parent_id="x11", channels=("price",), implementation={"background_candidate_id": "x11"})`，与 `x12` 共用 `case-b:dev:rollout` 和 32 个开发日。完整菜单的两层 `x02` 使用第二份训练计划及独立权重目录，经实际拟合后保存在拟合引用中。诊断区间用 `random_inputs_ref="diagnosis"` 重播，逐种子复算并核对 `Runner.diagnose()`。
 
 本地运行脚本、参数、逐日读数与权重均保存在忽略目录 `outputs/phase4-step41b/`。执行入口为 `env PYTHONPATH=.:../OpenHyra .venv/bin/python outputs/phase4-step41b/launch_grid.py` 和同目录的 `launch_full.py`。两种标签配方的代表格点均与原生 `estimate_delta` 的 2,000 次重抽结果逐项核对。所有运算使用模拟 train/dev，校准的 LLM 调用为零。
+
+## Step 4.1c　正式参数与独立复跑
+
+在 `p0-step41b-calibration-v1` 和 `p0-step41b-replication-v1` 上核对同一套定稿参数。两个命名空间的训练与开发日种子互不重合，五个模型初始化种子不变并全部重新训练。每个样本包括两题、两父模、六个候选对比及 30 次逐种子配对。A 题在 `plain` 上评估，训练世界与 B 题均为增强型 `informed`。B 题 `x13` 与 `b_joint` 共用单独训练的两层匿名 GRU `x02`，分别保留 `x11` 与 `x12` 的价格权重。
+
+两次运行中，A 的 `x01`、`a_joint` 和 B 的 `x12`、`b_joint` 均为 `SUPPORTED`。A 的 `a_self` 和 B 的 `x13` 均为 `REFUTED`。独立复跑中 `a_self` 的自由路径 RMSE 达标，但执行期背景偏移区间仍完整位于 −0.10 上方。两次运行中 `x13` 的钳制 RMSE 差值均精确为零，高于 B 的 −0.50 改善线。
+
+A 题 `a_joint` 的种子 103 无注入 NLL 差值在主校准和独立复跑分别为 +0.0881、+0.0634 nats/event，五种子合并区间上端分别为 +0.0291、+0.0246，均通过 +0.06 护栏。此前的主校准分解显示，父模与联合候选的方向 NLL 一致，该差值来自无注入收益项。单种子差异保留在报告中，归因仅限这一分解。
+
+### 表 2　主校准与独立复跑的全菜单配对效应
+
+父模型列为绝对读数。各候选列为 **配对点估计 [95% 日区间] / [五种子最小值, 最大值] / 改善种子数**。RMSE 和 NLL 以降低计为改善，背景偏移以更接近零计为改善，末点响应以更接近同日模拟器真值计为改善。配对差值仍保留有符号原尺度。RMSE 和末点响应单位为 tick，NLL 单位为 nats/event，背景偏移为方向均值。
+
+#### 主校准 · A 题
+
+| 指标 | 父模型 `x00` | `x01` | `a_self` | `a_joint` |
+|---|---:|---:|---:|---:|
+| 下一事件 NLL | 0.163 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | 0.027 [0.024, 0.029] / [−0.014, 0.087] / 2/5 | 0.027 [0.026, 0.029] / [−0.018, 0.088] / 2/5 |
+| 自由路径 RMSE | 9.611 | −5.856 [−6.147, −5.586] / [−6.267, −5.398] / 5/5 | −1.873 [−2.014, −1.739] / [−2.795, −1.436] / 5/5 | −8.591 [−8.837, −8.343] / [−9.277, −8.026] / 5/5 |
+| 钳制路径 RMSE | 3.306 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | −2.338 [−2.528, −2.137] / [−2.916, −2.036] / 5/5 | −2.338 [−2.528, −2.137] / [−2.916, −2.036] / 5/5 |
+| 执行期背景偏移 | 0.384 | −0.384 [−0.401, −0.367] / [−0.404, −0.358] / 5/5 | −0.023 [−0.029, −0.017] / [−0.076, 0.025] / 4/5 | −0.384 [−0.401, −0.367] / [−0.404, −0.358] / 5/5 |
+| 停手后背景偏移 | 0.270 | −0.270 [−0.299, −0.240] / [−0.327, −0.221] / 5/5 | −0.016 [−0.025, −0.009] / [−0.079, 0.049] / 3/5 | −0.270 [−0.299, −0.240] / [−0.327, −0.221] / 5/5 |
+| 钳制末点响应 | 5.671 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | −4.181 [−4.388, −3.980] / [−6.675, −2.740] / 5/5 | −4.181 [−4.388, −3.980] / [−6.675, −2.740] / 5/5 |
+| 自由末点响应 | 15.485 | −9.057 [−9.633, −8.498] / [−10.056, −8.045] / 5/5 | −2.151 [−2.353, −1.956] / [−3.455, −1.045] / 5/5 | −13.590 [−14.119, −13.093] / [−16.213, −11.403] / 5/5 |
+| 门控结论 | — | `SUPPORTED` | `REFUTED` | `SUPPORTED` |
+
+#### 主校准 · B 题
+
+| 指标 | 父模型 `x11` | `x12` | `x13` | `b_joint` |
+|---|---:|---:|---:|---:|
+| 下一事件 NLL | 0.429 | 0.015 [0.012, 0.018] / [−0.009, 0.040] / 1/5 | 0.003 [0.001, 0.004] / [0.000, 0.005] / 1/5 | 0.017 [0.013, 0.022] / [−0.007, 0.045] / 1/5 |
+| 自由路径 RMSE | 4.086 | −3.101 [−3.243, −2.954] / [−3.564, −2.750] / 5/5 | −0.096 [−0.147, −0.046] / [−0.306, 0.001] / 4/5 | −3.082 [−3.226, −2.933] / [−3.475, −2.749] / 5/5 |
+| 钳制路径 RMSE | 3.856 | −2.875 [−3.123, −2.627] / [−2.999, −2.653] / 5/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | −2.875 [−3.123, −2.627] / [−2.999, −2.653] / 5/5 |
+| 执行期背景偏移 | 0.000 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 |
+| 停手后背景偏移 | 0.000 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 |
+| 钳制末点响应 | 6.340 | −4.822 [−5.076, −4.584] / [−7.790, −3.528] / 5/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | −4.822 [−5.076, −4.584] / [−7.790, −3.528] / 5/5 |
+| 自由末点响应 | 6.711 | −4.907 [−5.064, −4.741] / [−8.439, −3.671] / 5/5 | −0.174 [−0.263, −0.089] / [−0.543, −0.011] / 5/5 | −4.986 [−5.138, −4.827] / [−8.623, −3.764] / 5/5 |
+| 门控结论 | — | `SUPPORTED` | `REFUTED` | `SUPPORTED` |
+
+#### 独立复跑 · A 题
+
+| 指标 | 父模型 `x00` | `x01` | `a_self` | `a_joint` |
+|---|---:|---:|---:|---:|
+| 下一事件 NLL | 0.193 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | 0.022 [0.020, 0.024] / [−0.021, 0.061] / 2/5 | 0.023 [0.021, 0.025] / [−0.022, 0.063] / 2/5 |
+| 自由路径 RMSE | 9.457 | −6.066 [−6.393, −5.772] / [−6.354, −5.726] / 5/5 | −2.443 [−2.578, −2.305] / [−3.762, −0.702] / 5/5 | −8.333 [−8.752, −7.887] / [−9.024, −7.105] / 5/5 |
+| 钳制路径 RMSE | 3.263 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | −2.079 [−2.406, −1.685] / [−2.835, −1.034] / 5/5 | −2.079 [−2.406, −1.685] / [−2.835, −1.034] / 5/5 |
+| 执行期背景偏移 | 0.411 | −0.411 [−0.431, −0.391] / [−0.424, −0.385] / 5/5 | −0.025 [−0.030, −0.019] / [−0.066, 0.017] / 4/5 | −0.411 [−0.431, −0.391] / [−0.424, −0.385] / 5/5 |
+| 停手后背景偏移 | 0.303 | −0.303 [−0.334, −0.272] / [−0.351, −0.245] / 5/5 | −0.003 [−0.011, 0.004] / [−0.091, 0.073] / 2/5 | −0.303 [−0.334, −0.272] / [−0.351, −0.245] / 5/5 |
+| 钳制末点响应 | 5.655 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | −5.533 [−5.691, −5.377] / [−7.714, −3.497] / 5/5 | −5.533 [−5.691, −5.377] / [−7.714, −3.497] / 5/5 |
+| 自由末点响应 | 15.386 | −9.447 [−10.041, −8.872] / [−10.277, −8.828] / 5/5 | −3.002 [−3.209, −2.775] / [−4.408, −0.242] / 5/5 | −15.109 [−15.736, −14.529] / [−16.883, −13.101] / 5/5 |
+| 门控结论 | — | `SUPPORTED` | `REFUTED` | `SUPPORTED` |
+
+#### 独立复跑 · B 题
+
+| 指标 | 父模型 `x11` | `x12` | `x13` | `b_joint` |
+|---|---:|---:|---:|---:|
+| 下一事件 NLL | 0.491 | 0.012 [0.009, 0.016] / [−0.009, 0.035] / 2/5 | 0.003 [0.002, 0.004] / [0.001, 0.005] / 0/5 | 0.015 [0.012, 0.019] / [−0.005, 0.038] / 2/5 |
+| 自由路径 RMSE | 3.593 | −2.360 [−2.554, −2.138] / [−3.003, −1.503] / 5/5 | −0.024 [−0.054, 0.009] / [−0.204, 0.046] / 1/5 | −2.332 [−2.539, −2.098] / [−3.005, −1.484] / 5/5 |
+| 钳制路径 RMSE | 3.681 | −2.438 [−2.728, −2.131] / [−3.217, −1.636] / 5/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | −2.438 [−2.728, −2.131] / [−3.217, −1.636] / 5/5 |
+| 执行期背景偏移 | 0.000 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 |
+| 停手后背景偏移 | 0.000 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 |
+| 钳制末点响应 | 6.199 | −5.922 [−6.097, −5.744] / [−8.577, −3.488] / 5/5 | 0.000 [0.000, 0.000] / [0.000, 0.000] / 0/5 | −5.922 [−6.097, −5.744] / [−8.577, −3.488] / 5/5 |
+| 自由末点响应 | 6.044 | −5.955 [−6.112, −5.795] / [−8.764, −3.709] / 5/5 | −0.050 [−0.103, 0.002] / [−0.375, 0.081] / 3/5 | −5.973 [−6.143, −5.803] / [−8.876, −3.737] / 5/5 |
+| 门控结论 | — | `SUPPORTED` | `REFUTED` | `SUPPORTED` |
+
+#### 父模 `Runner.diagnose()` 读数
+
+诊断区间从与 `Runner.diagnose()` 共用随机输入的逐日路径重抽，优势取主通道减另一通道，单位为 tick。
+
+| 开发样本 | 题 | 预期分类与重复数 | 平均优势 [95% 日区间] |
+|---|---|---|---:|
+| 主校准 | A | `flow` 5/5 | 2.775 [2.137, 3.435] |
+| 主校准 | B | `price` 5/5 | 3.574 [2.948, 4.066] |
+| 独立复跑 | A | `flow` 5/5 | 2.873 [2.303, 3.453] |
+| 独立复跑 | B | `price` 5/5 | 3.616 [3.152, 3.789] |
+
+下表各单元格依次为流残差 / 价格残差，单位为 tick。
+
+| 初始化种子 | 主校准 A | 主校准 B | 独立复跑 A | 独立复跑 B |
+|---:|---:|---:|---:|---:|
+| 103 | 6.526 / 3.537 | 0.105 / 4.409 | 6.445 / 3.253 | 0.042 / 3.894 |
+| 137 | 6.120 / 3.676 | 0.394 / 4.289 | 5.949 / 3.230 | 0.150 / 3.920 |
+| 211 | 5.686 / 3.162 | 0.491 / 3.622 | 6.058 / 3.271 | 0.083 / 3.746 |
+| 293 | 6.665 / 3.530 | 0.257 / 3.715 | 5.880 / 2.991 | 0.064 / 3.215 |
+| 367 | 5.790 / 3.004 | 0.169 / 3.249 | 6.229 / 3.450 | 0.016 / 3.661 |
+
+### 表 3　Step 4.2 冻结参数与门控
+
+| 参数 | 冻结值 |
+|---|---|
+| 模拟日数 | train 64，dev 32，计划 test 64 |
+| 世界 | train 和 B 为 `informed`，`info_drift=1.80`、`informed_fraction=0.25`。A 为 `plain`，两项均为 0 |
+| 模型菜单 | A `x00 / x01 / a_self / a_joint`。B `x11 / x12 / x13 / b_joint`。价格与主背景为单层 GRU，替代背景 `x02` 为两层匿名 GRU |
+| 训练 | `steps=200`，`lr=0.001`，`hidden=32`，`batch=16`，`window=64`，`own_start=inside` |
+| 初始化种子 | 103、137、211、293、367 |
+| 每日路径 | `windows_per_day=6`，`children=12`，`spacing=2`，`relax=18`，`context=48` |
+| 配对统计 | 五种子等权合并，2,000 次成组日重抽，95% 区间，`min_pairs=32`，`min_train_repeats=5` |
+| 诊断 | 主通道最小残差 0.20 tick，优势门槛 0.15 tick |
+
+| 分析项 | 题 | 最小效应 | 近零等效带 | 达标门控 |
+|---|---|---:|---:|---|
+| 自由路径 RMSE（tick） | A | 2.00 | [−0.25, +0.25] | 主项 `max_delta = −2.00` |
+| 自由路径 RMSE（tick） | B | 0.50 | [−0.25, +0.25] | — |
+| 钳制路径 RMSE（tick） | A | 0.50 | [−0.10, +0.10] | — |
+| 钳制路径 RMSE（tick） | B | 0.50 | [−0.10, +0.10] | 主项 `max_delta = −0.50` |
+| 执行期背景偏移（方向均值） | A | 0.10 | [−0.025, +0.025] | 主项 `max_delta = −0.10` |
+| 执行期背景偏移（方向均值） | B | 0.10 | [−0.025, +0.025] | — |
+| 停手后背景偏移（方向均值） | A、B | 0.10 | [−0.025, +0.025] | — |
+| 自由末点响应（tick） | A、B | 0.75 | [−0.25, +0.25] | — |
+| 钳制末点响应（tick） | A、B | 0.75 | [−0.25, +0.25] | — |
+| 下一事件 NLL（nats/event） | A、B | 0.03 | [−0.02, +0.02] | 护栏 `max_delta = +0.06` |
+
+按 `assess_candidate()` 对五种子合并区间判定。单项门控要求区间上端不高于 `max_delta`，区间整体高于阈值判为 `REFUTED`，跨越阈值判为 `INCONCLUSIVE`。等效要求整个合并区间落在等效带内。单种子极值及改善数用于描述训练重复。64 个正式测试日目前只登记计划数，正式复验留待 Step 4.2 启动。
+
+### 复现定稿校准
+
+在 Stochopia 根目录执行，OpenHyra 保持相邻目录。命令拟合两套模拟 train/dev、写入候选与诊断的逐日读数，并将七项配对效应及判定写入各自的 `summary.json`。拟合记录保存在各命名空间的 `DevelopmentStore`，后续 `Entry` 须使用该拟合存储或导入对应的 `FitRecord`。替代背景 `x02` 的层数仅在其单独拟合时生效。
+
+```bash
+env PYTHONPATH=.:../OpenHyra .venv/bin/python - <<'PY'
+from pathlib import Path
+import torch
+from stochopia.common import atomic_write_json
+from tasks.stochopia_tier0 import calibrate
+
+torch.set_num_threads(1)
+for namespace in ('p0-step41b-calibration-v1', 'p0-step41b-replication-v1'):
+    manifest = calibrate.build_manifest(namespace=namespace)
+    output = Path('outputs/phase4-step41c/reproduced') / namespace
+    output.mkdir(parents=True, exist_ok=False)
+    direct, measured, diagnostic_pairs = calibrate._measure(manifest, output)
+    summaries = {}
+    for scene in manifest.scenarios:
+        sid = scene.scenario_id
+        summaries[sid] = calibrate._calibrate_case(
+            scene, manifest.analysis, direct[sid], measured[sid], diagnostic_pairs[sid],
+            tuple(manifest.train_seeds), manifest.splits['dev'].unit_ids, manifest.analysis[0].n_resamples,
+        )
+    atomic_write_json(output / 'summary.json', summaries)
+PY
+```
