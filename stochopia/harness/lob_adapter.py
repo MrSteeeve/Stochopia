@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib import import_module as _import_module
 from importlib.metadata import PackageNotFoundError, version
+from numbers import Integral
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
@@ -18,7 +19,7 @@ from stochopia.harness.contract import ReportStatus
 
 @dataclass(frozen=True)
 class OrderEvent:
-    time_ns: int  # nanoseconds since local midnight
+    time_ns: int  # nanoseconds on the input clock
     kind: Literal["limit", "cancel", "market"]
     order_id: int
     size: int
@@ -52,9 +53,9 @@ class LobComparison:
     reason: str | None = None
 
 
-def _clock(time_ns: int) -> tuple[int, int, str]:
+def _clock(time_ns: int) -> str:
     seconds, fractional = divmod(time_ns, 10**9)
-    return seconds, fractional, f"{seconds}.{fractional:09d}"
+    return f"{seconds}.{fractional:09d}"
 
 
 def _book_row(engine: ModuleType, asks: Any, bids: Any, depth: int) -> tuple[int, ...]:
@@ -80,28 +81,39 @@ def _replay(engine: ModuleType, jnp: ModuleType, events: Sequence[OrderEvent], d
         emitted.append((event_time, event_type, order_id, size, price, direction))
         snapshots.append(_book_row(engine, asks, bids, depth))
 
-    previous_time = -1
-    for event in events:
-        if (not previous_time <= event.time_ns < 86400 * 10**9 or event.time_ns < 0
+    previous_time = 0
+    for position, event in enumerate(events):
+        if (not 0 <= previous_time <= event.time_ns
                 or not 0 < event.order_id < 2**31 or not 0 < event.size < 2**31
                 or event.direction not in (-1, 1)):
             raise ValueError("invalid order identity, size, side or chronological time")
         previous_time = event.time_ns
-        sec, ns, clock = _clock(event.time_ns)
+        clock = _clock(event.time_ns)
+        # The matcher stores times in int32 and only needs their ordering.
+        # Preserve exchange times for export and use event order for price-time priority.
+        sec, ns = divmod(position, 10**9)
+        remaining = event.size
         if event.kind == "market":
-            if event.price != 0 or event.order_id in identifiers:
-                raise ValueError("market orders require an unused ID and zero input price")
+            if event.price != 0:
+                raise ValueError("market orders require zero input price")
+        elif not 0 < event.price < 999999999:
+            raise ValueError("resting prices must use positive LOBSTER integer units")
+
+        if event.kind in ("limit", "market"):
+            if event.order_id in identifiers:
+                raise ValueError("a new order ID must be unique within the replay")
             identifiers.add(event.order_id)
             opposite = asks if event.direction == 1 else bids
-            remaining = event.size
             while remaining and bool((opposite[:, 1] > 0).any()):
                 # Execute one resting fill through JAX-LOB and snapshot immediately.
                 # This also handles sweeps without writing the terminal state on every row.
                 top = engine.get_next_executable_order(0 if event.direction == 1 else 1, opposite)
+                if event.kind == "limit" and (event.price - int(top[0])) * event.direction < 0:
+                    break
                 index = jnp.where(opposite[:, 2] == top[2], size=1)[0]
                 trades = jnp.full((1, 6), -1, dtype=jnp.int32)
                 opposite, unfilled, _, trades, *_ = engine.match_order(
-                    (index, opposite, remaining, 0, trades, event.order_id, sec, ns)
+                    (index, opposite, remaining, event.price, trades, event.order_id, sec, ns)
                 )
                 price, filled, order_id, aggressor, _, _ = map(int, trades[0].tolist())
                 if not 0 < filled <= remaining or max(int(unfilled), 0) != remaining - filled:
@@ -114,23 +126,15 @@ def _replay(engine: ModuleType, jnp: ModuleType, events: Sequence[OrderEvent], d
                     bids = opposite
                 fills.append(Fill(order_id, filled, price, side, aggressor))
                 emit(clock, 4, order_id, filled, price, side)
-            continue
+            if event.kind == "market" or remaining == 0:
+                continue
 
-        if not 0 < event.price < 999999999:
-            raise ValueError("resting prices must use positive LOBSTER integer units")
         resting = bids if event.direction == 1 else asks
         payload = {
-            "price": event.price, "quantity": event.size, "orderid": event.order_id,
+            "price": event.price, "quantity": remaining, "orderid": event.order_id,
             "traderid": event.order_id, "time": sec, "time_ns": ns,
         }
         if event.kind == "limit":
-            if event.order_id in identifiers:
-                raise ValueError("a new order ID must be unique within the replay")
-            best_ask, _, best_bid, _ = _book_row(engine, asks, bids, 1)
-            if ((event.direction == 1 and event.price >= best_ask)
-                    or (event.direction == -1 and event.price <= best_bid)):
-                raise ValueError("short replay expects passive limits and explicit market orders")
-            identifiers.add(event.order_id)
             changed = engine.add_order(resting, payload)
             event_type = 1
         elif event.kind == "cancel":
@@ -145,15 +149,16 @@ def _replay(engine: ModuleType, jnp: ModuleType, events: Sequence[OrderEvent], d
             bids = changed
         else:
             asks = changed
-        emit(clock, event_type, event.order_id, event.size, event.price, event.direction)
+        emit(clock, event_type, event.order_id, remaining, event.price, event.direction)
 
     return LobTrace(tuple(emitted), tuple(snapshots), tuple(fills))
 
 
 def run_short_lob(*, depth: int = 2, import_module: Callable[[str], ModuleType] = _import_module) -> LobComparison:
     """Replay a deterministic injection and its no-injection control using JAX-LOB."""
-    if type(depth) is not int or depth < 1:
+    if not isinstance(depth, Integral) or isinstance(depth, bool) or depth < 1:
         raise ValueError("depth must be a positive integer")
+    depth = int(depth)
     try:
         jnp = import_module("jax.numpy")
         engine = import_module("jaxlob.gymnax_exchange.jaxob.JaxOrderBookArrays")

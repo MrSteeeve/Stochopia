@@ -7,7 +7,8 @@ import os
 from argparse import Namespace
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, replace
-from math import isfinite, sqrt
+from math import isclose, isfinite, sqrt
+from numbers import Integral, Real
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import perf_counter
@@ -83,8 +84,9 @@ def _simulate_units(split: DataSplit, world: WorldSpec, unit_ids: Sequence[str])
     indices = []
     for unit_id in unit_ids:
         index = registered_indices.get(unit_id)
-        if unit_id not in split.unit_ids or type(index) is not int or index < 0:
+        if unit_id not in split.unit_ids or not isinstance(index, Integral) or isinstance(index, bool) or index < 0:
             raise ValueError(f"unregistered simulated day index for {unit_id}")
+        index = int(index)
         expected = derive_seed("stochopia.sim.world", seed_world, namespace, index)
         if split.unit_seeds.get(unit_id) != expected:
             raise ValueError(f"registered seed does not match simulator identity for {unit_id}")
@@ -111,8 +113,9 @@ def _action_args(scenario: ScenarioSpec) -> dict[str, int]:
     args.update(plan)
     for key, value in args.items():
         minimum = 0 if key in ("spacing", "relax") else 1
-        if type(value) is not int or value < minimum:
+        if not isinstance(value, Integral) or isinstance(value, bool) or value < minimum:
             raise ValueError(f"{key} requires an integer at least {minimum}")
+        args[key] = int(value)
     return args
 
 
@@ -120,16 +123,29 @@ def _action_args(scenario: ScenarioSpec) -> dict[str, int]:
 
 
 def _fit_args(plan: Mapping[str, Any], candidate: CandidateRef, price_recipe: str) -> Namespace:
-    args = dict(_TRAIN_DEFAULTS)
-    if "learning_rate" in plan:
-        args["lr"] = plan["learning_rate"]
-    for key in args.keys() & plan.keys():
-        args[key] = plan[key]
+    settings = dict(plan)
+    settings.pop("world", None)
+    settings.pop("world_overrides", None)
+    if "learning_rate" in settings:
+        if "lr" in settings:
+            raise ValueError("training plan must specify one of lr and learning_rate")
+        settings["lr"] = settings.pop("learning_rate")
+    unknown = settings.keys() - _TRAIN_DEFAULTS.keys()
+    if unknown:
+        raise ValueError(f"unrecognized Tier 0 training plan keys: {sorted(unknown)}")
+    args = _TRAIN_DEFAULTS | settings
     for key in ("hidden", "layers", "steps", "batch", "window"):
-        if type(args[key]) is not int or args[key] < 1:
+        value = args[key]
+        if not isinstance(value, Integral) or isinstance(value, bool) or value < 1:
             raise ValueError(f"{key} requires a positive integer")
-    if not isfinite(args["lr"]) or args["lr"] <= 0:
-        raise ValueError("lr must be finite and positive")
+        args[key] = int(value)
+    for key in ("lr", "label_miss", "label_false"):
+        value = args[key]
+        if not isinstance(value, Real) or isinstance(value, bool) or not isfinite(value):
+            raise ValueError(f"{key} requires a finite real number")
+        args[key] = float(value)
+    if args["lr"] <= 0:
+        raise ValueError("lr must be positive")
     if candidate.backbone not in ("gru", "ssm", "lru"):
         raise ValueError(f"unsupported Tier 0 backbone: {candidate.backbone}")
     return Namespace(**args, cell=candidate.backbone, recipe=price_recipe)
@@ -185,6 +201,27 @@ class Runner:
         self.experiment = manifest if self.frozen is None else self.frozen.experiment
         self.candidates = {item.candidate_id: item for item in self.experiment.candidates}
         self.seeds = manifest.seeds
+        self._scenes_by_candidate = self._bind_candidate_scenes()
+
+    def _bind_candidate_scenes(self) -> dict[str, list[ScenarioSpec]]:
+        """Bind visible candidates and their recipe dependencies to each scene."""
+        bindings: dict[str, list[ScenarioSpec]] = {key: [] for key in self.candidates}
+        for scene in self.scenarios.values():
+            pending = list(scene.candidate_ids)
+            visited = set()
+            while pending:
+                key = pending.pop()
+                if key in visited:
+                    continue
+                visited.add(key)
+                bindings[key].append(scene)
+                candidate = self.candidates[key]
+                if candidate.parent_id is not None:
+                    pending.append(candidate.parent_id)
+                background = candidate.implementation.get("background_candidate_id")
+                if isinstance(background, str) and background in self.candidates:
+                    pending.append(background)
+        return bindings
 
     def fit_candidate(self, candidate_id: str, train_repeat_id: str, output_dir: str | Path) -> FitRecord:
         """Fit against train only and atomically publish its resolved weight references.
@@ -206,12 +243,19 @@ class Runner:
         candidate = self.candidates[candidate_id]
         seed = self.experiment.train_seeds[repeat_id]
         split = self.experiment.splits["train"]
-        related = [scene for scene in self.scenarios.values() if candidate_id in scene.candidate_ids]
-        scenes = [scene for scene in related if scene.environment_kind == "tier0_sim"]
-        is_lob_replay = not scenes and bool(related)
+        related = self._scenes_by_candidate[candidate_id]
+        if not related:
+            raise ValueError(f"candidate {candidate_id} is not bound to a scenario")
+        environment_kind = related[0].environment_kind
+        if any(scene.environment_kind != environment_kind for scene in related[1:]):
+            raise ValueError(f"candidate {candidate_id} is shared across incompatible environment types")
+        is_lob_replay = environment_kind == "lob"
         plan = self.experiment.train_plan
-        world = None if is_lob_replay else self._training_world(scenes)
+        world = None if is_lob_replay else self._training_world(related)
         price_recipe, separated = ("lob_replay", False) if is_lob_replay else _resolve_recipe(candidate.recipe)
+        if not is_lob_replay:
+            args = _fit_args(plan, candidate, price_recipe)
+            separated = separated or "background_candidate_id" in candidate.implementation
         parent = None
         background_ref = None
         inherited_price_ref = None
@@ -229,8 +273,8 @@ class Runner:
                 if candidate.backbone != parent.config["cell"]:
                     raise ValueError("separate_flow must preserve the parent price backbone")
                 inherited_price_ref = parent.price_weights_ref or parent.model_ref
-        if candidate.channels == ("price",) and not is_lob_replay:
-            if parent is None or parent.background_weights_ref is None or parent.background_weights_ref != background_ref:
+        if separated and candidate.channels == ("price",):
+            if parent.background_weights_ref is None or parent.background_weights_ref != background_ref:
                 raise ValueError("a price-only change requires the same separated background as its parent")
 
         registered = canonical_json({
@@ -246,7 +290,7 @@ class Runner:
             fit = FitRecord.from_dict(json.loads(record_path.read_text(encoding="utf-8")))
             if fit.config.get("registered") != registered:
                 raise ValueError("existing fit has a different registered training configuration")
-            for ref in (fit.model_ref, fit.background_weights_ref):
+            for ref in dict.fromkeys((fit.model_ref, fit.price_weights_ref, fit.background_weights_ref)):
                 if ref is not None and not Path(ref).is_file():
                     raise FileNotFoundError(f"registered fit artifact is missing: {ref}")
             return fit
@@ -265,7 +309,6 @@ class Runner:
             atomic_write_json(record_path, fit.to_dict())
             return fit
 
-        args = _fit_args(plan, candidate, price_recipe)
         train_seconds = 0.0
         price_ref = inherited_price_ref
         model_spec = None if parent is None else parent.config.get("model_spec")
@@ -299,8 +342,6 @@ class Runner:
         plan = self.experiment.train_plan
         if "world" in plan or "world_overrides" in plan:
             return _world(plan)
-        if not scenes:
-            return WORLDS["plain"]
         world = _world(scenes[0].environment)
         for scene in scenes[1:]:
             if _world(scene.environment) != world:
@@ -359,8 +400,10 @@ class Runner:
                 background = model
             else:
                 background = _load_model(fit.background_weights_ref, device)
-        if background is not None and (background.spec.own_flag or background.spec.return_scale != model.spec.return_scale):
-            raise ValueError("separated background must be anonymous and use the same training scale")
+        if background is not None:
+            same_scale = isclose(background.spec.return_scale, model.spec.return_scale, rel_tol=1e-9, abs_tol=1e-12)
+            if background.spec.own_flag or not same_scale:
+                raise ValueError("separated background must be anonymous and use the same training scale")
         return evaluate_model(
             model, args, world, days, rollout_seed=self.seeds["rollout"], seed_ci=self.seeds["delta_ci"],
             background_model=background, return_observations=True, rollout_unit_seeds=unit_seeds,

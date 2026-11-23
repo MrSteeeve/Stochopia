@@ -221,11 +221,25 @@ def test_development_manifest_rejects_mismatched_llm_groups(manifest, key, value
         ExperimentManifest.from_dict(payload).validate()
 
 
-def test_development_manifest_requires_one_of_each_group(manifest):
+def test_development_manifest_requires_a_no_llm_control(manifest):
     payload = manifest.to_dict()
     payload["groups"][2] = {**payload["groups"][1], "group_id": "second-metrics"}
     with pytest.raises(ValueError):
         ExperimentManifest.from_dict(payload).validate()
+
+
+def test_mixed_environment_still_requires_tier0_day_seeds(manifest: ExperimentManifest) -> None:
+    tier0 = manifest.scenarios[0]
+    lob = replace(tier0, scenario_id="lob", environment_kind="lob", matching_version="jaxlob==0.19")
+    mixed = replace(
+        manifest,
+        scenarios=(tier0, lob),
+        analysis=(*manifest.analysis, replace(manifest.analysis[0], analysis_id="lob-rmse", scenario_id="lob")),
+        prediction_candidate_set={**manifest.prediction_candidate_set, "lob": ("flow", "price")},
+    )
+    mixed.validate()
+    with pytest.raises(ValueError, match="resolved seeds"):
+        replace(mixed, splits={**mixed.splits, "dev": replace(mixed.splits["dev"], unit_seeds={})}).validate()
 
 
 def test_scenario_menu_requires_its_registered_parent(manifest):
@@ -460,6 +474,61 @@ def test_frozen_initial_prediction_matches_the_shared_snapshot(frozen):
     wrong_snapshot = replace(first, dev_snapshot_id="other-snapshot")
     with pytest.raises(ValueError, match="snapshot"):
         replace(frozen, predictions=(wrong_snapshot, *others)).validate()
+
+
+def test_frozen_later_prediction_matches_its_round_snapshot(frozen: FrozenManifest) -> None:
+    later = next(row for row in frozen.selections if row.round_index == 2 and row.group_id == "metrics")
+    first = next(row for row in frozen.predictions if row.group_id == "metrics")
+    forecast = replace(
+        first, prediction_id="later-forecast", round_index=later.round_index,
+        dev_snapshot_id=later.dev_snapshot_id,
+    )
+    replace(frozen, predictions=(*frozen.predictions, forecast)).validate()
+    for incorrect in (replace(forecast, dev_snapshot_id="old-snapshot"), replace(forecast, round_index=3)):
+        with pytest.raises(ValueError, match="snapshot"):
+            replace(frozen, predictions=(*frozen.predictions, incorrect)).validate()
+
+
+def test_frozen_accepts_a_single_llm_group(frozen: FrozenManifest) -> None:
+    without_metrics = replace(
+        frozen,
+        experiment=replace(frozen.experiment, groups=tuple(
+            row for row in frozen.experiment.groups if row.group_id != "metrics"
+        )),
+        selections=tuple(row for row in frozen.selections if row.group_id != "metrics"),
+        predictions=tuple(row for row in frozen.predictions if row.group_id != "metrics"),
+        search_trials=tuple(row for row in frozen.search_trials if row.group_id != "metrics"),
+        final_choices=tuple(row for row in frozen.final_choices if row.group_id != "metrics"),
+    )
+    assert FrozenManifest.from_dict(without_metrics.to_dict()) == without_metrics
+
+
+def test_frozen_three_llm_groups_require_the_same_common_analyses(frozen: FrozenManifest) -> None:
+    existing = next(row for row in frozen.experiment.groups if row.group_id == "metrics")
+    experiment = replace(frozen.experiment, groups=(*frozen.experiment.groups, replace(existing, group_id="extra")))
+    choice = next(row for row in frozen.selections if row.group_id == "metrics" and row.round_index == 1)
+    extra_choice = replace(choice, group_id="extra", selection_id="extra-r1")
+    forecasts = tuple(
+        replace(row, group_id="extra", prediction_id=f"extra-{row.candidate_id}")
+        for row in frozen.predictions if row.group_id == "metrics"
+    )
+    extra_final = FinalChoice(
+        group_id="extra", scenario_id=choice.scenario_id, candidate_id="flow",
+        selection_id=extra_choice.selection_id, stopping_reason="A recorded decision",
+    )
+    three = replace(
+        frozen, experiment=experiment, selections=(*frozen.selections, extra_choice),
+        predictions=(*frozen.predictions, *forecasts), final_choices=(*frozen.final_choices, extra_final),
+    )
+    assert FrozenManifest.from_dict(three.to_dict()) == three
+
+    additional = replace(experiment.analysis[0], analysis_id="other", window="recovery")
+    mismatched = replace(forecasts[0], prediction_id="other-extra", analysis_id="other", window="recovery")
+    with pytest.raises(ValueError, match="shared analysis"):
+        replace(
+            three, experiment=replace(experiment, analysis=(*experiment.analysis, additional)),
+            predictions=(*three.predictions, mismatched),
+        ).validate()
 
 
 def test_common_predictions_require_a_shared_analysis(frozen):

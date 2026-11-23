@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from math import inf, isfinite
+from numbers import Real
 from statistics import mean
 from typing import Any
 
@@ -11,7 +12,7 @@ from .contract import (
     AnalysisSpec, Direction, EvaluationTask, FitRecord, FrozenManifest, PairedDelta, PairedEvalResult,
     PredictionVerdict, ReportStatus, SelectionRecord, StructuredPrediction,
 )
-from .paired_stats import align_observations, estimate_delta, has_readout
+from .paired_stats import align_observations, estimate_delta, has_readout, is_unavailable_readout
 
 _ReportRow = dict[str, Any]
 _ScenarioCandidate = tuple[str, str]
@@ -64,10 +65,11 @@ def judge_prediction(
         )
     if (prediction.readout, prediction.window, prediction.unit) != (analysis.readout, analysis.window, analysis.unit):
         raise ValueError("prediction readout, window or unit does not match the analysis")
-    if measured is None:
+    if measured is None or is_unavailable_readout(measured):
+        reason = measured.reason if measured is not None else None
         return PredictionVerdict(
             **common, status=ReportStatus.UNAVAILABLE,
-            reason="the frozen evaluation did not provide this readout", result_id=result_id,
+            reason=reason or "the frozen evaluation did not provide this readout", result_id=result_id,
         )
     if result_id is None:
         raise ValueError("measured verdict must reference the paired result")
@@ -114,7 +116,7 @@ def _gate(spec: AnalysisSpec) -> tuple[float, float] | None:
     for key in ("min_delta", "max_delta"):
         if key in acceptance:
             value = acceptance[key]
-            if type(value) not in (int, float) or not isfinite(value):
+            if not isinstance(value, Real) or isinstance(value, bool) or not isfinite(value):
                 raise ValueError(f"{spec.analysis_id}: {key} requires a finite limit")
     low, high = acceptance.get("min_delta", -inf), acceptance.get("max_delta", inf)
     if low > high:
@@ -139,7 +141,7 @@ def assess_candidate(analyses: Iterable[AnalysisSpec], paired_diffs: Mapping[str
         if bounds is None:
             continue
         delta = paired_diffs.get(spec.analysis_id)
-        if delta is None:
+        if delta is None or is_unavailable_readout(delta):
             statuses.append(ReportStatus.UNAVAILABLE)
         else:
             _validate_delta(delta, spec)
@@ -203,14 +205,21 @@ def summarize_candidate(
                 deltas[spec.analysis_id] = delta
         else:
             # A task may have excluded every duplicate row before storing raw observations.
-            documented = [_registered_delta(result, spec) for result in usable]
-            reasons = sorted({
-                delta.reason for delta in documented
-                if delta is not None and delta.n_pairs == 0 and delta.reason is not None
-            })
+            reasons = set()
+            unavailable = None
+            for result in usable:
+                delta = _registered_delta(result, spec)
+                if delta is None:
+                    continue
+                if is_unavailable_readout(delta):
+                    unavailable = delta
+                elif delta.n_pairs == 0 and delta.reason is not None:
+                    reasons.add(delta.reason)
             if reasons:
                 empty = estimate_delta(spec, (), parent_id=parent_id, candidate_id=candidate_id)
-                deltas[spec.analysis_id] = replace(empty, reason="; ".join(reasons))
+                deltas[spec.analysis_id] = replace(empty, reason="; ".join(sorted(reasons)))
+            elif unavailable is not None:
+                deltas[spec.analysis_id] = unavailable
     return deltas
 
 
@@ -420,6 +429,9 @@ def _choice_rows(frozen: FrozenManifest, measurements: _FrozenMeasurements) -> I
                     and trial.status == "completed" and trial.development_status is ReportStatus.SUPPORTED):
                 first_pass_cost = used
         best = _common_menu_best(frozen, measurements, final_selection, final_perf)
+        # These gains already use the primary analysis's better-direction sign.
+        # A choice outside the shared menu can beat its best member and has zero shortfall.
+        gap = max(0.0, best - final_gain) if best is not None and final_gain is not None else None
         first_id = first.candidate_id or (first.parent_id if first.action == "keep_parent" else None)
         yield {
             "group_id": group, "scenario_id": scene, "first_selection_id": first.selection_id,
@@ -433,13 +445,14 @@ def _choice_rows(frozen: FrozenManifest, measurements: _FrozenMeasurements) -> I
             "final_result_ids": list(final_perf.result_ids) if final_perf is not None else [],
             "stopping_reason": final.stopping_reason,
             "common_menu_best_gain": best,
-            "common_menu_effect_gap": best - final_gain if best is not None and final_gain is not None else None,
+            "common_menu_effect_gap": gap,
         }
 
 
 def _prediction_rows(frozen: FrozenManifest, measurements: _FrozenMeasurements) -> Iterator[_ReportRow]:
     analysis = {spec.analysis_id: spec for spec in frozen.experiment.analysis}
     common = frozen.experiment.prediction_candidate_set
+    llm_groups = {group.group_id for group in frozen.experiment.groups if group.kind != "no_llm"}
     first_round_by_scene: dict[str, int] = {}
     for selection in frozen.selections:
         scene = selection.scenario_id
@@ -452,7 +465,7 @@ def _prediction_rows(frozen: FrozenManifest, measurements: _FrozenMeasurements) 
             keys[key].setdefault(forecast.group_id, forecast.prediction_id)
     comparison_ids: set[str] = set()
     for group_rows in keys.values():
-        if len(group_rows) == 2:
+        if group_rows.keys() == llm_groups:
             comparison_ids.update(group_rows.values())
     for forecast in sorted(frozen.predictions, key=lambda row: row.prediction_id):
         spec = analysis[forecast.analysis_id]

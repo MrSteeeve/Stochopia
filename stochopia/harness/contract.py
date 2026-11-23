@@ -249,7 +249,7 @@ def _disjoint_splits(splits):
 
 
 def _require_simulated_seeds(scenarios, splits):
-    if all(scene.environment_kind == "tier0_sim" for scene in scenarios):
+    if any(scene.environment_kind == "tier0_sim" for scene in scenarios):
         for name, split in splits.items():
             if split.unit_seeds.keys() != set(split.unit_ids):
                 raise ValueError(f"splits.{name}: simulated days require resolved seeds")
@@ -396,13 +396,15 @@ class ExperimentManifest(_Record):
             _nonnegative(budget.values(), f"budget.{name}")
 
         groups = _index(self.groups, "group_id")
-        by_kind = _index(tuple(groups.values()), "kind")
-        if by_kind.keys() != {"evidence_llm", "metrics_llm", "no_llm"}:
-            raise ValueError("exactly one group of each P0 kind is required")
-        evidence, metrics = by_kind["evidence_llm"], by_kind["metrics_llm"]
-        for name in ("model", "model_version", "prompt_template_id", "llm_budget"):
-            if getattr(evidence, name) != getattr(metrics, name):
-                raise ValueError(f"LLM groups must match {name}")
+        llm_groups = [group for group in groups.values() if group.kind != "no_llm"]
+        if not llm_groups or len(groups) - len(llm_groups) != 1:
+            raise ValueError("expected at least one LLM group and exactly one no_llm group")
+        policies = {
+            (group.model, group.model_version, group.prompt_template_id, tuple(sorted(group.llm_budget.items())))
+            for group in llm_groups
+        }
+        if len(policies) != 1:
+            raise ValueError("LLM groups must match model, model version, prompt template and budget")
 
         scenarios = _index(self.scenarios, "scenario_id")
         candidates = _index(self.candidates, "candidate_id")
@@ -831,9 +833,16 @@ class FrozenManifest(_Record):
                 raise ValueError("initial choices must share a development snapshot within a scenario")
         return first_choices
 
-    def _check_predictions(self, refs, first_choices):
+    def _check_predictions(
+        self, refs: _FrozenReferences, first_choices: Mapping[tuple[str, str], SelectionRecord],
+    ) -> None:
         _index(self.predictions, "prediction_id")
-        covered = {}
+        snapshots: dict[tuple[str, int], str] = {}
+        for row in refs.selections.values():
+            key = (row.group_id, row.round_index)
+            if snapshots.setdefault(key, row.dev_snapshot_id) != row.dev_snapshot_id:
+                raise ValueError("selections in the same group and round must share a development snapshot")
+        covered: dict[tuple[str, str, str], set[str]] = {}
         for prediction in self.predictions:
             scene = refs.subject(prediction, self.exp_id)
             group = refs.groups[prediction.group_id]
@@ -845,24 +854,23 @@ class FrozenManifest(_Record):
             if prediction.parent_id != scene.parent_id or prediction.candidate_id not in scene.candidate_ids:
                 raise ValueError("prediction baseline or candidate does not match the scenario")
             first_choice = first_choices[(prediction.group_id, prediction.scenario_id)]
-            if prediction.round_index < first_choice.round_index or (
-                prediction.round_index == first_choice.round_index
-                and prediction.dev_snapshot_id != first_choice.dev_snapshot_id
-            ):
-                raise ValueError("first-round prediction must match the registered development snapshot")
+            snapshot = snapshots.get((prediction.group_id, prediction.round_index))
+            if prediction.round_index < first_choice.round_index or prediction.dev_snapshot_id != snapshot:
+                raise ValueError("prediction must match the registered group and round development snapshot")
             if not prediction.abstained and (prediction.readout, prediction.window, prediction.unit) != (
                 analysis.readout, analysis.window, analysis.unit
             ):
                 raise ValueError("prediction readout, window and unit must match the analysis")
-            key = (prediction.group_id, prediction.scenario_id, prediction.candidate_id)
-            covered.setdefault(key, set()).add(prediction.analysis_id)
+            if prediction.round_index == first_choice.round_index:
+                key = (prediction.group_id, prediction.scenario_id, prediction.candidate_id)
+                covered.setdefault(key, set()).add(prediction.analysis_id)
 
         llm_groups = [group.group_id for group in refs.groups.values() if group.kind != "no_llm"]
         for scene, common in self.experiment.prediction_candidate_set.items():
             for candidate in common:
-                left, right = (covered.get((group, scene, candidate), set()) for group in llm_groups)
-                if not left & right:
-                    raise ValueError("LLM groups must cover the common candidates on a shared analysis")
+                expected = covered.get((llm_groups[0], scene, candidate))
+                if not expected or any(covered.get((group, scene, candidate)) != expected for group in llm_groups):
+                    raise ValueError("LLM groups must cover each common candidate on the same shared analysis set")
 
     def _check_trials(self, refs):
         _index(self.search_trials, "trial_id")

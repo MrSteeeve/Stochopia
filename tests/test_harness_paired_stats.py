@@ -4,7 +4,7 @@ from math import sqrt
 import pytest
 
 from stochopia.harness.contract import (
-    AnalysisSpec, ArmKind, Direction, EvaluationTask, FitRecord, ReportStatus, ScenarioSpec,
+    AnalysisSpec, ArmKind, Direction, EvaluationTask, FitRecord, PairedEvalResult, ReportStatus, ScenarioSpec,
     StructuredPrediction, UnitObservation,
 )
 from stochopia.harness.paired_stats import align_observations, estimate_delta, evaluate_pairs
@@ -97,9 +97,8 @@ def test_day_draw_is_shared_by_repeats(analysis: AnalysisSpec, paths: tuple[Unit
     assert result.interval == (0.0, 0.0)
 
 
-def test_task_report_distinguishes_unsupported_readout_from_incomplete_pair(
-    analysis: AnalysisSpec, paths: tuple[UnitObservation, ...],
-) -> None:
+@pytest.fixture
+def task_setup() -> tuple[EvaluationTask, ScenarioSpec, FitRecord, FitRecord]:
     scenario = ScenarioSpec(
         scenario_id="shock", diagnostic_question="Why did price jump?", environment_kind="tier0_sim",
         environment={"world": "plain"}, action_plan={"size": 2}, window="after", parent_id="base",
@@ -114,11 +113,66 @@ def test_task_report_distinguishes_unsupported_readout_from_incomplete_pair(
         task_id="task", split="test", scenario_id="shock", parent_fit_id=parent.fit_id,
         candidate_fit_id=candidate.fit_id, unit_ids=("A", "B"), action_ref="schedule", random_inputs_ref="seed",
     )
+    return task, scenario, parent, candidate
+
+
+def test_task_report_distinguishes_unsupported_readout_from_incomplete_pair(
+    analysis: AnalysisSpec, paths: tuple[UnitObservation, ...],
+    task_setup: tuple[EvaluationTask, ScenarioSpec, FitRecord, FitRecord],
+) -> None:
+    task, scenario, parent, candidate = task_setup
     absent = replace(analysis, analysis_id="flow", readout="flow")
     incomplete = evaluate_pairs(task, scenario, parent, candidate, (paths[0],), (analysis, absent))
+    unavailable = incomplete.paired_diffs[absent.analysis_id]
+    assert (unavailable.n_pairs, unavailable.estimate, unavailable.interval) == (0, None, None)
+    assert "no model observation" in unavailable.reason
+
+    incomplete = PairedEvalResult.from_dict(incomplete.to_dict())
     delta = summarize_candidate((analysis, absent), (incomplete,), required_unit_ids=task.unit_ids)
-    assert absent.analysis_id not in delta
+    assert delta[absent.analysis_id] == unavailable
     assert delta[analysis.analysis_id].n_pairs == 0
     assert delta[analysis.analysis_id].interval is None
     assert assess_candidate((analysis,), delta) is ReportStatus.INCONCLUSIVE
     assert assess_candidate((absent,), delta) is ReportStatus.UNAVAILABLE
+
+    forecast = StructuredPrediction(
+        prediction_id="p", exp_id="e", round_index=1, group_id="evidence", scenario_id=scenario.scenario_id,
+        explanation_id="reason", candidate_id=candidate.candidate_id, parent_id=parent.candidate_id,
+        analysis_id=absent.analysis_id, dev_snapshot_id="before", readout=absent.readout, unit=absent.unit,
+        window=absent.window, direction=Direction.UNCHANGED, conditions="shock", falsifier="misses",
+    )
+    verdict = judge_prediction(forecast, absent, unavailable, result_id=incomplete.result_id)
+    assert verdict.status is ReportStatus.UNAVAILABLE
+    assert verdict.reason == unavailable.reason
+
+
+def test_task_estimates_only_clean_observations_and_audits_duplicate_arm(
+    analysis: AnalysisSpec, paths: tuple[UnitObservation, ...],
+    task_setup: tuple[EvaluationTask, ScenarioSpec, FitRecord, FitRecord],
+) -> None:
+    task, scenario, parent, candidate = task_setup
+    extra_parent = replace(paths[0], arm=ArmKind.FREE)
+    extra_candidate = replace(paths[1], arm=ArmKind.FREE)
+    result = evaluate_pairs(
+        task, scenario, parent, candidate, (*paths, extra_parent, extra_candidate, extra_candidate), (analysis,),
+    )
+    delta = result.paired_diffs[analysis.analysis_id]
+    assert result.observations == paths
+    assert delta.n_pairs == 2
+    assert delta.estimate == pytest.approx(sqrt(13 / 8) - 3 / sqrt(2))
+    assert "fit-1/A: duplicate observation keys" in delta.reason
+    assert "free" in delta.reason
+
+
+def test_duplicate_reference_is_excluded_from_all_model_arms(
+    analysis: AnalysisSpec, paths: tuple[UnitObservation, ...],
+    task_setup: tuple[EvaluationTask, ScenarioSpec, FitRecord, FitRecord],
+) -> None:
+    task, scenario, parent, candidate = task_setup
+    duplicate = replace(paths[0], arm=ArmKind.TRUTH, candidate_id=None, response_path=())
+    result = evaluate_pairs(task, scenario, parent, candidate, (*paths, duplicate, duplicate), (analysis,))
+    delta = result.paired_diffs[analysis.analysis_id]
+    assert {row.unit_id for row in result.observations} == {"B"}
+    assert delta.n_pairs == 1
+    assert delta.interval is None
+    assert "fit-1/A: duplicate observation keys" in delta.reason

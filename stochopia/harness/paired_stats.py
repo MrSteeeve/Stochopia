@@ -2,9 +2,10 @@
 
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import product
 from math import isfinite, sqrt
+from numbers import Real
 from random import Random
 from statistics import mean
 
@@ -15,6 +16,7 @@ from .contract import (
 _MEAN_ESTIMATORS = {"mean", "daily_mean"}
 _CURVE_ESTIMATOR = "mean_path_rmse"
 _RATIO_ESTIMATOR = "ratio_of_sums"
+_UNAVAILABLE_READOUT_REASON = "no model observation for the registered readout"
 
 # --- Observation alignment ---
 
@@ -41,7 +43,7 @@ def _observation_key(row: UnitObservation) -> tuple[str, str, str | None, ArmKin
 
 
 def _is_scalar(value: object) -> bool:
-    return type(value) in (int, float) and isfinite(value)
+    return isinstance(value, Real) and not isinstance(value, bool) and isfinite(value)
 
 
 def _make_pair(
@@ -273,6 +275,12 @@ def _draws(
     return (rng.choices(days, k=len(days)) for _ in range(analysis.n_resamples))
 
 
+def _bootstrap_method(analysis: AnalysisSpec) -> str:
+    if analysis.pairing == "day_exhaustive":
+        return "exhaustive_percentile_bootstrap"
+    return "percentile_bootstrap"
+
+
 def estimate_delta(
     analysis: AnalysisSpec,
     observations: Iterable[UnitObservation],
@@ -336,13 +344,30 @@ def estimate_delta(
     return PairedDelta(
         readout=analysis.readout, estimator=analysis.estimator, unit=analysis.unit,
         estimate=estimate, interval=interval, n_pairs=n_pairs,
-        method="exhaustive_percentile_bootstrap" if analysis.pairing == "day_exhaustive" else "percentile_bootstrap",
+        method=_bootstrap_method(analysis),
         seed=analysis.seed, confidence_level=1 - analysis.alpha, train_repeat_estimates=repeat_estimates,
         reason="; ".join([*reasons, *paired.excluded]) or None,
     )
 
 
 # --- Per-task results ---
+
+
+def is_unavailable_readout(delta: PairedDelta) -> bool:
+    """Recognize the placeholder for an absent readout after serialization."""
+    return delta.estimate is None and delta.reason == _UNAVAILABLE_READOUT_REASON
+
+
+def _unavailable_readout(analysis: AnalysisSpec) -> PairedDelta:
+    return PairedDelta(
+        readout=analysis.readout, estimator=analysis.estimator, unit=analysis.unit, estimate=None, interval=None,
+        n_pairs=0, method=_bootstrap_method(analysis), seed=analysis.seed,
+        confidence_level=1 - analysis.alpha, reason=_UNAVAILABLE_READOUT_REASON,
+    )
+
+
+def _day_readout_key(row: UnitObservation) -> tuple[str, str, str, str]:
+    return row.unit_id, row.readout, row.window, row.unit
 
 
 def evaluate_pairs(
@@ -371,22 +396,32 @@ def evaluate_pairs(
         if row.candidate_id not in (None, parent_id, candidate_id):
             raise ValueError("task received observations from an unrelated model")
     counts = Counter(_observation_key(row) for row in rows)
-    contaminated = {
-        (row.unit_id, row.arm, row.readout, row.window, row.unit)
-        for row in rows if counts[_observation_key(row)] > 1
-    }
-    clean = tuple(
-        row for row in rows if row.unit_id in units
-        and (row.unit_id, row.arm, row.readout, row.window, row.unit) not in contaminated
-    )
+    duplicate_arms: dict[tuple[str, str, str, str], set[ArmKind]] = defaultdict(set)
+    for row in rows:
+        if counts[_observation_key(row)] > 1:
+            duplicate_arms[_day_readout_key(row)].add(row.arm)
+    clean = []
+    for row in rows:
+        arms = duplicate_arms.get(_day_readout_key(row), ())
+        if row.unit_id in units and row.arm not in arms and ArmKind.TRUTH not in arms:
+            clean.append(row)
+
     paired_diffs = {}
     for analysis in analyses:
-        if analysis.scenario_id != scenario.scenario_id or not has_readout(analysis, rows):
+        if analysis.scenario_id != scenario.scenario_id:
             continue
-        paired_diffs[analysis.analysis_id] = estimate_delta(
-            analysis, rows, parent_id=parent_id, candidate_id=candidate_id, required_unit_ids=task.unit_ids,
+        if not has_readout(analysis, rows):
+            paired_diffs[analysis.analysis_id] = _unavailable_readout(analysis)
+            continue
+        delta = estimate_delta(
+            analysis, clean, parent_id=parent_id, candidate_id=candidate_id, required_unit_ids=task.unit_ids,
         )
-    completed = bool(clean and paired_diffs)
+        notes = _dropped_observation_notes(analysis, rows, units, duplicate_arms)
+        if notes:
+            reasons = [delta.reason] if delta.reason else []
+            delta = replace(delta, reason="; ".join([*reasons, *notes]))
+        paired_diffs[analysis.analysis_id] = delta
+    completed = bool(clean) and any(not is_unavailable_readout(delta) for delta in paired_diffs.values())
     result = PairedEvalResult(
         result_id=f"{task.task_id}-result", task_id=task.task_id, split=task.split, scenario_id=task.scenario_id,
         candidate_id=candidate_id, parent_id=parent_id, parent_fit_id=parent_fit.fit_id,
@@ -394,8 +429,29 @@ def evaluate_pairs(
         arms=tuple(sorted({row.arm for row in clean}, key=lambda arm: arm.value)),
         status="completed" if completed else "degraded",
         cost={"train_seconds": 0.0, "eval_seconds": 0.0} if cost is None else cost,
-        observations=clean, paired_diffs=paired_diffs,
+        observations=tuple(clean), paired_diffs=paired_diffs,
         failure_reason=None if completed else "no eligible observations or registered paired readouts",
     )
     result.validate()
     return result
+
+
+def _dropped_observation_notes(
+    analysis: AnalysisSpec,
+    rows: tuple[UnitObservation, ...],
+    units: set[str],
+    duplicate_arms: Mapping[tuple[str, str, str, str], set[ArmKind]],
+) -> list[str]:
+    notes = set()
+    registered_arm = analysis.acceptance.get("arm")
+    for row in rows:
+        if (row.readout, row.window, row.unit) != (analysis.readout, analysis.window, analysis.unit):
+            continue
+        if registered_arm is not None and row.arm is not ArmKind.TRUTH and row.arm.value != registered_arm:
+            continue
+        location = f"{row.train_repeat_id}/{row.unit_id}"
+        if row.unit_id not in units:
+            notes.add(f"{location}: outside registered unit IDs")
+        if row.arm in duplicate_arms.get(_day_readout_key(row), ()):
+            notes.add(f"{location}: duplicate observation keys ({row.arm.value})")
+    return sorted(notes)
