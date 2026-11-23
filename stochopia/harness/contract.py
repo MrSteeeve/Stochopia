@@ -15,6 +15,9 @@ from ._serde import (
     _Record, boolean, enum, integer, json_value, literal, mapping, optional, real, record, sequence, text,
 )
 
+LLMPolicyDimension = Literal["model", "model_version", "prompt_template_id", "llm_budget"]
+LLM_POLICY_DIMENSIONS = ("model", "model_version", "prompt_template_id", "llm_budget")
+
 
 class ReportStatus(str, Enum):
     SUPPORTED = "supported"
@@ -186,11 +189,13 @@ class ExperimentManifest(_Record):
     prediction_candidate_set: Mapping[str, tuple[str, ...]]
     unselected_sample_rule: str
     schema: str = MANIFEST_SCHEMA
+    llm_ablation_dimensions: tuple[LLMPolicyDimension, ...] = field(default=(), metadata={"omit_empty_tuple": True})
 
     _field_rules = {
         "scenarios": sequence(record(ScenarioSpec)),
         "candidates": sequence(record(CandidateRef)),
         "groups": sequence(record(GroupSpec)),
+        "llm_ablation_dimensions": sequence(literal(*LLM_POLICY_DIMENSIONS)),
         "splits": mapping(record(DataSplit)),
         "train_seeds": _integers,
         "train_plan": _payload,

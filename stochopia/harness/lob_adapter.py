@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib import import_module as _import_module
 from importlib.metadata import PackageNotFoundError, version
@@ -15,6 +15,16 @@ from typing import Any, Literal
 
 from stochopia.common import atomic_write_text
 from stochopia.harness.contract import ReportStatus
+
+
+# --- Input and trace records ---
+
+
+_NS_PER_SECOND = 10**9
+_INT32_MAX = 2**31 - 1
+# JAX-LOB 0.19 masks non-priority time entries with this value in both columns.
+_TIME_MASK = 999_999_999
+_MAX_REPLAY_SECONDS = min(_INT32_MAX, _TIME_MASK - 1)
 
 
 @dataclass(frozen=True)
@@ -53,9 +63,29 @@ class LobComparison:
     reason: str | None = None
 
 
+# --- Physical clock and price-time priority ---
+
+
 def _clock(time_ns: int) -> str:
-    seconds, fractional = divmod(time_ns, 10**9)
+    seconds, fractional = divmod(time_ns, _NS_PER_SECOND)
     return f"{seconds}.{fractional:09d}"
+
+
+def _relative_clocks(events: Sequence[OrderEvent]) -> list[tuple[int, int]]:
+    """Check the entire tape before matching and split physical elapsed nanoseconds."""
+    origin = events[0].time_ns if events else 0
+    previous = 0
+    clocks = []
+    for event in events:
+        stamp = event.time_ns
+        if not isinstance(stamp, Integral) or isinstance(stamp, bool) or stamp < previous:
+            raise ValueError("order time must be nonnegative integer nanoseconds in chronological order")
+        previous = int(stamp)
+        seconds, nanos = divmod(previous - int(origin), _NS_PER_SECOND)
+        if seconds > _MAX_REPLAY_SECONDS:
+            raise ValueError("relative replay timestamp exceeds JAX-LOB clock capacity")
+        clocks.append((seconds, nanos))
+    return clocks
 
 
 def _book_row(engine: ModuleType, asks: Any, bids: Any, depth: int) -> tuple[int, ...]:
@@ -68,30 +98,47 @@ def _book_row(engine: ModuleType, asks: Any, bids: Any, depth: int) -> tuple[int
     return tuple(row)
 
 
+def _best_resting_order(
+    engine: ModuleType, book: Any, aggressor_side: int, arrivals: Mapping[int, int],
+) -> tuple[int, int]:
+    """Find price-time priority, with exchange order breaking exact clock ties."""
+    if bool((book[:, 5] == _TIME_MASK).any()):
+        # A real fractional nanosecond can equal the mask used by the engine's selector.
+        def priority(row: list[int]) -> tuple[int, int, int, int]:
+            return aggressor_side * row[0], row[4], row[5], arrivals[row[2]]
+
+        chosen = min((row for row in book.tolist() if row[1] > 0), key=priority)
+        return chosen[0], chosen[2]
+
+    top = engine.get_next_executable_order(0 if aggressor_side == 1 else 1, book)
+    same_priority = (book[:, 0] == top[0]) & (book[:, 4] == top[4]) & (book[:, 5] == top[5])
+    order_ids = book[same_priority, 2].tolist()
+    # The engine chooses the first array slot on ties. Cancelled slots may be reused.
+    return int(top[0]), min(order_ids, key=arrivals.__getitem__)
+
+
+# --- Matching, short fixture and export ---
+
+
 def _replay(engine: ModuleType, jnp: ModuleType, events: Sequence[OrderEvent], depth: int) -> LobTrace:
+    clocks = _relative_clocks(events)
     capacity = max(len(events) + 1, depth + 1)
     asks = engine.init_orderside(capacity)
     bids = engine.init_orderside(capacity)
     emitted = []
     snapshots = []
     fills = []
-    identifiers = set()
+    arrivals: dict[int, int] = {}
 
     def emit(event_time: str, event_type: int, order_id: int, size: int, price: int, direction: int) -> None:
         emitted.append((event_time, event_type, order_id, size, price, direction))
         snapshots.append(_book_row(engine, asks, bids, depth))
 
-    previous_time = 0
-    for position, event in enumerate(events):
-        if (not 0 <= previous_time <= event.time_ns
-                or not 0 < event.order_id < 2**31 or not 0 < event.size < 2**31
+    for position, (event, (sec, ns)) in enumerate(zip(events, clocks, strict=True)):
+        if (not 0 < event.order_id <= _INT32_MAX or not 0 < event.size <= _INT32_MAX
                 or event.direction not in (-1, 1)):
-            raise ValueError("invalid order identity, size, side or chronological time")
-        previous_time = event.time_ns
-        clock = _clock(event.time_ns)
-        # The matcher stores times in int32 and only needs their ordering.
-        # Preserve exchange times for export and use event order for price-time priority.
-        sec, ns = divmod(position, 10**9)
+            raise ValueError("invalid order identity, size or side")
+        clock = _clock(int(event.time_ns))
         remaining = event.size
         if event.kind == "market":
             if event.price != 0:
@@ -100,17 +147,17 @@ def _replay(engine: ModuleType, jnp: ModuleType, events: Sequence[OrderEvent], d
             raise ValueError("resting prices must use positive LOBSTER integer units")
 
         if event.kind in ("limit", "market"):
-            if event.order_id in identifiers:
+            if event.order_id in arrivals:
                 raise ValueError("a new order ID must be unique within the replay")
-            identifiers.add(event.order_id)
+            arrivals[event.order_id] = position
             opposite = asks if event.direction == 1 else bids
             while remaining and bool((opposite[:, 1] > 0).any()):
                 # Execute one resting fill through JAX-LOB and snapshot immediately.
                 # This also handles sweeps without writing the terminal state on every row.
-                top = engine.get_next_executable_order(0 if event.direction == 1 else 1, opposite)
-                if event.kind == "limit" and (event.price - int(top[0])) * event.direction < 0:
+                top_price, top_id = _best_resting_order(engine, opposite, event.direction, arrivals)
+                if event.kind == "limit" and (event.price - top_price) * event.direction < 0:
                     break
-                index = jnp.where(opposite[:, 2] == top[2], size=1)[0]
+                index = jnp.where(opposite[:, 2] == top_id, size=1)[0]
                 trades = jnp.full((1, 6), -1, dtype=jnp.int32)
                 opposite, unfilled, _, trades, *_ = engine.match_order(
                     (index, opposite, remaining, event.price, trades, event.order_id, sec, ns)

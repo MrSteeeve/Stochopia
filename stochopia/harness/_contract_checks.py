@@ -121,7 +121,7 @@ def check_analysis(analysis: AnalysisSpec) -> None:
 
 
 def check_experiment(manifest: ExperimentManifest) -> None:
-    from .contract import MANIFEST_SCHEMA
+    from .contract import LLM_POLICY_DIMENSIONS, MANIFEST_SCHEMA
 
     _schema(manifest.schema, MANIFEST_SCHEMA)
     if manifest.splits.keys() != {"train", "dev"}:
@@ -143,14 +143,14 @@ def check_experiment(manifest: ExperimentManifest) -> None:
 
     groups = _index(manifest.groups, "group_id")
     llm_groups = [group for group in groups.values() if group.kind != "no_llm"]
-    if not llm_groups or len(groups) - len(llm_groups) != 1:
-        raise ValueError("expected at least one LLM group and exactly one no_llm group")
-    policies = {
-        (group.model, group.model_version, group.prompt_template_id, tuple(sorted(group.llm_budget.items())))
-        for group in llm_groups
-    }
-    if len(policies) != 1:
-        raise ValueError("LLM groups must match model, model version, prompt template and budget")
+    if not llm_groups or len(groups) == len(llm_groups):
+        raise ValueError("expected at least one LLM group and at least one no_llm group")
+    _unique(manifest.llm_ablation_dimensions, "llm_ablation_dimensions")
+    for dimension in LLM_POLICY_DIMENSIONS:
+        if dimension not in manifest.llm_ablation_dimensions:
+            expected = getattr(llm_groups[0], dimension)
+            if any(getattr(group, dimension) != expected for group in llm_groups[1:]):
+                raise ValueError(f"LLM groups must match {dimension} unless it is registered in llm_ablation_dimensions")
 
     scenarios = _index(manifest.scenarios, "scenario_id")
     candidates = _index(manifest.candidates, "candidate_id")

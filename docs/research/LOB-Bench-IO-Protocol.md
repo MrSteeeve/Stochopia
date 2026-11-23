@@ -86,5 +86,6 @@ Python 评分接口返回 `(scores, score_dfs, plot_fns)`。CLI 将前两项写�
 ## 4. Stochopia 接入时要确认的口径
 
 - **行情和逐笔的对齐。** 深市的 `行情` 是周期性十档快照。可以用它核对逐笔回放，再导出每条消息处理后的盘口。连续事件即使有相同毫秒时间也要保留已经校验过的交易所消息顺序。导出 `time` 时把 `HHMMSSmmm` 转为午夜以来的秒数。 [A 股 Level 2 数据说明](https://huggingface.co/datasets/venvoo/china-a-share-l2-level2-limit-order-book-tick-data)
+- **撮合时钟。** 回放发送给 JAX-LOB 的秒、纳秒以首事件为零点，保留真实时间间隔。CSV 保留输入时钟。同价同刻的挂单按原始消息顺序成交。JAX-LOB 0.19 在优先级选择中将 `999999999` 用作掩码值。适配器在撮合前拒绝相对秒数到达该值的轨迹，并在纳秒分量等于该值时，用当前挂单的实际价格、时间和入队顺序选择订单，再交给 JAX-LOB 撮合。 [JAX-LOB 撮合实现](https://github.com/KangOxford/AlphaTrade/blob/jaxV3/gymnax_exchange/jaxob/JaxOrderBookArrays.py)
 - **成交和撤单语义。** 深市档案在逐笔成交流里编码撤单，导出时按剩余量区分部分撤单和整单删除。可见成交的 `order_id` 和 `direction` 采用受影响的挂单口径。应明确回放层与生成器中谁产生撮合成交，确保同一次成交只扣一次盘口量。价格单位在同一轮评估中一致，并让使用最小价格单位的指标采用对应市场的报价尺度。 [A 股 Level 2 数据说明](https://huggingface.co/datasets/venvoo/china-a-share-l2-level2-limit-order-book-tick-data) · [LOBSTER 官方格式](https://php.lobsterdata.com/info/DataStructure.php)
 - **大单是独立的干预实验。** 复用同样的事件和盘口输出，在固定历史与初始盘口上分别生成注单和无注单轨迹，测执行期间和停手后的响应。LOB‑Bench 的事件级统计用于历史与生成轨迹的对照。主动注入大单的流程可参考后续的 LOB‑Impact。 [LOB‑Impact 注单协议](https://arxiv.org/html/2610.27100v1#S2.SS1)

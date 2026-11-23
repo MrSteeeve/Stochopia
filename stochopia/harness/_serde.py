@@ -81,7 +81,14 @@ def _view(value: Any) -> Any:
 
 def _encode(value: Any) -> Any:
     if isinstance(value, _Record):
-        return {item.name: _encode(getattr(value, item.name)) for item in fields(value)}
+        encoded = {}
+        for item in fields(value):
+            member = getattr(value, item.name)
+            # Optional additions can preserve the JSON shape of already-registered manifests.
+            if item.metadata.get("omit_empty_tuple") and member == ():
+                continue
+            encoded[item.name] = _encode(member)
+        return encoded
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, Mapping):

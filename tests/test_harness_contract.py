@@ -269,6 +269,7 @@ def test_development_manifest_rejects_overlap(manifest, overlap):
 @pytest.mark.parametrize(
     ("key", "value"),
     [
+        ("model", "other-model"),
         ("model_version", "other-version"),
         ("prompt_template_id", "other-prompt"),
         ("llm_budget", {"max_calls": 3, "max_tokens": 2000}),
@@ -287,6 +288,55 @@ def test_development_manifest_requires_a_no_llm_control(manifest):
     payload["groups"][2] = {**payload["groups"][1], "group_id": "second-metrics"}
     with pytest.raises(ValueError):
         ExperimentManifest.from_dict(payload).validate()
+
+
+@pytest.mark.parametrize(("axis", "value"), (
+    ("model", "alternate-model"),
+    ("model_version", "alternate-version"),
+    ("prompt_template_id", "alternate-prompt"),
+    ("llm_budget", {"max_calls": 3, "max_tokens": 2500}),
+))
+def test_only_registered_llm_ablation_dimensions_can_vary(
+    manifest: ExperimentManifest, axis: str, value: str | dict[str, int],
+) -> None:
+    payload = manifest.to_dict()
+    payload["groups"][1][axis] = value
+    payload["llm_ablation_dimensions"] = [axis]
+    ExperimentManifest.from_dict(payload).validate()
+    payload["groups"][1]["allowed_evidence"] = ["extra-evidence"]
+    with pytest.raises(ValueError):
+        ExperimentManifest.from_dict(payload).validate()
+
+
+def test_llm_ablation_records_are_backward_compatible_and_selective(manifest: ExperimentManifest) -> None:
+    legacy_payload = manifest.to_dict()
+    assert "llm_ablation_dimensions" not in legacy_payload
+    assert ExperimentManifest.from_dict(legacy_payload).to_dict() == legacy_payload
+    payload = manifest.to_dict()
+    payload["groups"][1]["model"] = "larger-model"
+    payload["groups"][1]["prompt_template_id"] = "alternate-prompt"
+    payload["llm_ablation_dimensions"] = ["model"]
+    with pytest.raises(ValueError, match="prompt_template_id"):
+        ExperimentManifest.from_dict(payload).validate()
+    payload["llm_ablation_dimensions"].append("prompt_template_id")
+    experiment = ExperimentManifest.from_dict(payload)
+    experiment.validate()
+    assert experiment.to_dict() == payload
+
+
+@pytest.mark.parametrize("axes", (["allowed_evidence"], ["model", "model"]))
+def test_llm_ablation_dimensions_must_be_known_and_unique(
+    manifest: ExperimentManifest, axes: list[str],
+) -> None:
+    payload = manifest.to_dict()
+    payload["llm_ablation_dimensions"] = axes
+    with pytest.raises(ValueError, match="llm_ablation_dimensions"):
+        ExperimentManifest.from_dict(payload).validate()
+
+
+def test_development_manifest_accepts_two_registered_no_llm_controls(manifest: ExperimentManifest) -> None:
+    random = GroupSpec(group_id="random", kind="no_llm", selection_rule="seeded-random")
+    replace(manifest, groups=(*manifest.groups, random)).validate()
 
 
 def test_mixed_environment_still_requires_tier0_day_seeds(manifest: ExperimentManifest) -> None:
