@@ -117,7 +117,6 @@ def align_observations(
     required_unit_ids: Iterable[str] | None = None,
 ) -> PairAlignment:
     """Exclude unpaired, duplicate, or incompatible rows with a day-level explanation."""
-    analysis.validate()
     if parent_id == candidate_id:
         raise ValueError("pairing requires distinct parent and candidate IDs")
     if analysis.estimator not in _MEAN_ESTIMATORS | {_CURVE_ESTIMATOR, _RATIO_ESTIMATOR}:
@@ -135,7 +134,6 @@ def align_observations(
             continue
         if row.candidate_id not in (None, parent_id, candidate_id):
             continue
-        row.validate()
         location = f"{row.train_repeat_id}/{row.unit_id}"
         if (row.window, row.unit) != (analysis.window, analysis.unit):
             other_context.add((row.train_repeat_id, row.unit_id))
@@ -422,7 +420,7 @@ def evaluate_pairs(
             delta = replace(delta, reason="; ".join([*reasons, *notes]))
         paired_diffs[analysis.analysis_id] = delta
     completed = bool(clean) and any(not is_unavailable_readout(delta) for delta in paired_diffs.values())
-    result = PairedEvalResult(
+    return PairedEvalResult(
         result_id=f"{task.task_id}-result", task_id=task.task_id, split=task.split, scenario_id=task.scenario_id,
         candidate_id=candidate_id, parent_id=parent_id, parent_fit_id=parent_fit.fit_id,
         candidate_fit_id=candidate_fit.fit_id, action_ref=task.action_ref, random_inputs_ref=task.random_inputs_ref,
@@ -432,8 +430,6 @@ def evaluate_pairs(
         observations=tuple(clean), paired_diffs=paired_diffs,
         failure_reason=None if completed else "no eligible observations or registered paired readouts",
     )
-    result.validate()
-    return result
 
 
 def _dropped_observation_notes(

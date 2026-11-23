@@ -54,8 +54,6 @@ def judge_prediction(
     or asymmetric equivalence interval, with the same containment rule.
     A point estimate alone is insufficient for any of those comparisons.
     """
-    prediction.validate()
-    analysis.validate()
     if (prediction.scenario_id, prediction.analysis_id) != (analysis.scenario_id, analysis.analysis_id):
         raise ValueError("prediction does not match the registered analysis")
     common = {"prediction_id": prediction.prediction_id, "model_score_delta": model_score_delta}
@@ -78,7 +76,6 @@ def judge_prediction(
     if measured.n_pairs < analysis.min_pairs or len(measured.train_repeat_estimates) < analysis.min_train_repeats:
         if measured.interval is not None:
             measured = replace(measured, interval=None, reason="fewer paired days or training repeats than registered")
-    measured.validate()
     interval = measured.interval
     common.update(result_id=result_id, measured=measured,
                   interval_width=interval[1] - interval[0] if interval is not None else None)
@@ -144,7 +141,7 @@ def assess_candidate(analyses: Iterable[AnalysisSpec], paired_diffs: Mapping[str
         if delta is None or is_unavailable_readout(delta):
             statuses.append(ReportStatus.UNAVAILABLE)
         else:
-            _validate_delta(delta, spec)
+            _check_delta_readout(delta, spec)
             if (delta.interval is None or delta.n_pairs < spec.min_pairs
                     or len(delta.train_repeat_estimates) < spec.min_train_repeats):
                 statuses.append(ReportStatus.INCONCLUSIVE)
@@ -153,10 +150,9 @@ def assess_candidate(analyses: Iterable[AnalysisSpec], paired_diffs: Mapping[str
     return _combine_gates(statuses)
 
 
-def _validate_delta(delta: PairedDelta, spec: AnalysisSpec) -> None:
+def _check_delta_readout(delta: PairedDelta, spec: AnalysisSpec) -> None:
     if (delta.readout, delta.estimator, delta.unit) != (spec.readout, spec.estimator, spec.unit):
         raise ValueError(f"{spec.analysis_id}: result reported a different readout, estimator, or unit")
-    delta.validate()
 
 
 # --- Recompute frozen measurements ---
@@ -166,7 +162,7 @@ def _registered_delta(result: PairedEvalResult, spec: AnalysisSpec) -> PairedDel
     delta = result.paired_diffs.get(spec.analysis_id, result.paired_diffs.get(spec.readout))
     if delta is None:
         return None
-    _validate_delta(delta, spec)
+    _check_delta_readout(delta, spec)
     return delta
 
 
@@ -224,7 +220,6 @@ def summarize_candidate(
 
 
 def _verify_result(result: PairedEvalResult, task: EvaluationTask, fits: Mapping[str, FitRecord]) -> None:
-    result.validate()
     parent = fits[task.parent_fit_id]
     candidate = fits[task.candidate_fit_id]
     expected = (
@@ -242,7 +237,8 @@ def _verify_result(result: PairedEvalResult, task: EvaluationTask, fits: Mapping
         raise ValueError(f"{task.task_id}: result includes observations outside the frozen task")
 
 
-def _primary(analyses: Iterable[AnalysisSpec]) -> AnalysisSpec | None:
+def primary_analysis(analyses: Iterable[AnalysisSpec]) -> AnalysisSpec | None:
+    """Return the declared primary readout, or the first acceptance gate."""
     analyses = tuple(analyses)
     declared = [spec for spec in analyses if spec.acceptance.get("role") == "primary"]
     if len(declared) > 1:
@@ -263,9 +259,15 @@ def _better_sign(spec: AnalysisSpec | None) -> int | None:
     return -1 if isfinite(bounds[1]) else 1
 
 
-def _gain(spec: AnalysisSpec | None, delta: PairedDelta | None) -> float | None:
+def model_score_gain(spec: AnalysisSpec | None, delta: PairedDelta | None) -> float | None:
+    """Orient a measured delta so positive gain means better performance."""
     sign = _better_sign(spec)
     return None if sign is None or delta is None or delta.estimate is None else sign * delta.estimate
+
+
+# Compatibility for OpenHyra scoring bridges from before the public API.
+_primary = primary_analysis
+_gain = model_score_gain
 
 
 @dataclass(frozen=True)
@@ -315,7 +317,7 @@ def _performance_for(frozen: FrozenManifest, results: tuple[PairedEvalResult, ..
             raw.extend(result.observations)
         analyses = scenarios[scene]
         deltas = summarize_candidate(analyses, compared, required_unit_ids=required)
-        primary = _primary(analyses)
+        primary = primary_analysis(analyses)
         primary_delta = deltas.get(primary.analysis_id) if primary else None
         comparability = None
         if primary is not None and primary_delta is not None and primary_delta.estimate is not None and raw:
@@ -332,7 +334,7 @@ def _performance_for(frozen: FrozenManifest, results: tuple[PairedEvalResult, ..
             result_ids=tuple(result.result_id for result in compared), task_ids=tuple(result.task_id for result in compared),
             qualification=assess_candidate(analyses, deltas),
             primary_analysis_id=primary.analysis_id if primary else None,
-            model_gain=_gain(primary, primary_delta), paired_diffs=deltas, comparable=comparability,
+            model_gain=model_score_gain(primary, primary_delta), paired_diffs=deltas, comparable=comparability,
         )
     return _FrozenMeasurements(scenarios, performance)
 
@@ -412,7 +414,7 @@ def _choice_rows(frozen: FrozenManifest, measurements: _FrozenMeasurements) -> I
     for (group, scene), final in sorted(choices.items()):
         first = min(by_group[group, scene], key=lambda row: row.sequence)
         final_selection = by_selection[final.selection_id]
-        primary = _primary(scenarios[scene])
+        primary = primary_analysis(scenarios[scene])
         final_perf = performance.get((scene, final.candidate_id))
         final_gain = final_perf.model_gain if final_perf is not None else None
         if final_selection.action == "keep_parent" and _better_sign(primary) is not None:
@@ -567,7 +569,6 @@ def _task_row(result: PairedEvalResult) -> _ReportRow:
 
 def build_report(frozen: FrozenManifest, results: Iterable[PairedEvalResult]) -> dict[str, Any]:
     """Publish a JSON-ready report based on the sealed manifest and task results."""
-    frozen.validate()
     results = tuple(sorted(results, key=lambda row: row.task_id))
     measurements = _performance_for(frozen, results)
     choices = list(_choice_rows(frozen, measurements))

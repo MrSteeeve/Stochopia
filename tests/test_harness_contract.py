@@ -174,6 +174,67 @@ def test_nested_data_is_frozen_and_json_export_is_detached(manifest):
     assert candidate.to_dict()["implementation"]["parameters"]["lags"] == [1, 2]
 
 
+@pytest.mark.parametrize("backend", ("numpy", "jax.numpy"))
+def test_numeric_scalars_normalize_in_fields_and_nested_payloads(
+    manifest: ExperimentManifest, backend: str,
+) -> None:
+    arrays = pytest.importorskip(backend)
+    count = arrays.asarray(9, dtype=arrays.int32)
+    rate = arrays.float32(0.125)
+    spec = replace(manifest.analysis[0], min_pairs=count, min_effect=rate)
+    train = replace(manifest, train_plan={"steps": count, "labels": [{"rate": rate, "enabled": arrays.bool_(True)}]})
+    assert type(spec.min_pairs) is int
+    assert type(spec.min_effect) is float
+    assert AnalysisSpec.from_dict(spec.to_dict() | {"min_pairs": count, "min_effect": rate}) == spec
+    assert type(train.train_plan["labels"][0]["enabled"]) is bool
+    wire = train.to_dict()
+    assert wire["train_plan"] == {"steps": 9, "labels": [{"rate": 0.125, "enabled": True}]}
+    assert type(wire["budget"]["search"]["trials"]) is int
+    encoded = json.loads(json.dumps(wire, allow_nan=False))
+    assert ExperimentManifest.from_dict(encoded) == train
+
+
+@pytest.mark.parametrize("backend", ("numpy", "jax.numpy"))
+def test_numeric_field_rejects_boolean_nonfinite_and_vector_values(
+    manifest: ExperimentManifest, backend: str,
+) -> None:
+    arrays = pytest.importorskip(backend)
+    for value in (arrays.bool_(True), arrays.float32(float("nan")), arrays.asarray([1])):
+        invalid = replace(manifest.analysis[0], min_effect=value)
+        with pytest.raises(ValueError, match="min_effect"):
+            invalid.validate()
+
+
+def test_replace_defers_semantic_checks_to_validation_and_wire_boundary(
+    prediction: StructuredPrediction,
+) -> None:
+    invalid = replace(prediction, direction=Direction.INCREASE)
+    assert invalid.direction is Direction.INCREASE
+    with pytest.raises(ValueError, match="prediction direction"):
+        invalid.validate()
+    with pytest.raises(ValueError, match="prediction direction"):
+        invalid.to_dict()
+
+
+def test_wire_boundaries_validate_each_nested_record_once(
+    manifest: ExperimentManifest, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = manifest.to_dict()
+    original_check = DataSplit._check
+    checked = []
+
+    def check_split(split: DataSplit) -> None:
+        checked.append(split.source["namespace"])
+        original_check(split)
+
+    monkeypatch.setattr(DataSplit, "_check", check_split)
+    restored = ExperimentManifest.from_dict(payload)
+    assert checked == ["train", "dev"]
+    checked.clear()
+    assert restored.to_dict() == payload
+    assert checked == ["train", "dev"]
+
+
 def test_json_record_rejects_unknown_nested_fields(manifest):
     payload = manifest.to_dict()
     payload["candidates"][1]["unexpected_field"] = True
