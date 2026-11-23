@@ -187,6 +187,29 @@ def test_fit_binds_ancestors_but_rejects_orphans(small_manifest: ExperimentManif
         assert registration["training_world"]["name"] == WORLDS["informed"].name
 
 
+def test_candidate_plan_overrides_fit_background_from_empty_cache(
+    small_manifest: ExperimentManifest, tmp_path: Path,
+) -> None:
+    base, flow, price = small_manifest.candidates
+    flow = replace(flow, implementation={"background_candidate_id": "x02"})
+    alternate = replace(base, candidate_id="x02", implementation={"train_plan_overrides": {"layers": 2}})
+    manifest = replace(small_manifest, candidates=(base, flow, price, alternate))
+    fit_runner = Runner(manifest)
+    separated = fit_runner.fit_candidate("flow", "repeat-1", tmp_path)
+    base_fit = fit_runner.fit_candidate("base", "repeat-1", tmp_path)
+    alternate_fit = fit_runner.fit_candidate("x02", "repeat-1", tmp_path)
+    assert separated.price_weights_ref == base_fit.model_ref
+    assert separated.background_weights_ref == alternate_fit.model_ref
+    assert runner._load_model(base_fit.model_ref, "cpu").spec.layers == 1
+    assert runner._load_model(alternate_fit.model_ref, "cpu").spec.layers == 2
+    base_registration = json.loads(base_fit.config["registered"])
+    alternate_registration = json.loads(alternate_fit.config["registered"])
+    assert base_registration["plan"] == small_manifest.to_dict()["train_plan"]
+    assert alternate_registration["plan"] == {**base_registration["plan"], "layers": 2}
+    assert base_registration["train_split"] == alternate_registration["train_split"]
+    assert base_registration["seed"] == alternate_registration["seed"]
+
+
 def test_fit_rejects_candidate_shared_across_lob_and_tier0(
     small_manifest: ExperimentManifest, tmp_path: Path,
 ) -> None:

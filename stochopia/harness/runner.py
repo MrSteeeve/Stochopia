@@ -250,10 +250,13 @@ class Runner:
         if any(scene.environment_kind != environment_kind for scene in related[1:]):
             raise ValueError(f"candidate {candidate_id} is shared across incompatible environment types")
         is_lob_replay = environment_kind == "lob"
-        plan = self.experiment.train_plan
-        world = None if is_lob_replay else self._training_world(related)
+        candidate_spec = candidate.to_dict()
+        overrides = candidate_spec["implementation"].get("train_plan_overrides", {})
+        plan = {**self.experiment.to_dict()["train_plan"], **overrides}
+        world = None
         price_recipe, separated = ("lob_replay", False) if is_lob_replay else _resolve_recipe(candidate.recipe)
         if not is_lob_replay:
+            world = _world(plan) if {"world", "world_overrides"} & overrides.keys() else self._training_world(related)
             args = _fit_args(plan, candidate, price_recipe)
             separated = separated or "background_candidate_id" in candidate.implementation
         parent = None
@@ -279,8 +282,8 @@ class Runner:
 
         registered = canonical_json({
             "experiment": self.experiment.exp_id, "fit_version": self.experiment.fit_version,
-            "candidate": candidate.to_dict(), "train_split": split.to_dict(), "seed": seed,
-            "plan": self.experiment.to_dict()["train_plan"],
+            "candidate": candidate_spec, "train_split": split.to_dict(), "seed": seed,
+            "plan": plan,
             "training_world": None if world is None else world.manifest(),
             "background_ref": background_ref, "inherited_price_ref": inherited_price_ref,
         })
