@@ -22,6 +22,7 @@ from stochopia.harness.contract import (
     Direction,
     EvaluationTask,
     ExperimentManifest,
+    FinalChoice,
     FitRecord,
     FrozenManifest,
     PairedEvalResult,
@@ -39,6 +40,7 @@ from test_harness_golden_example import _PATHS
 if TYPE_CHECKING:
     from tasks.stochopia_tier0.entry import CheckRequest, Entry
     from tasks.stochopia_tier0.store import DevelopmentExport, DevelopmentStore
+    from tasks.stochopia_tier0.verifier import VerifierConfig
 
 
 # --- Shared fixtures ---
@@ -524,9 +526,9 @@ def _tiny_experiment(golden: FrozenManifest, backbone: str) -> ExperimentManifes
     )
 
 
-def _verify_trained_gru(
-    verifier_module: ModuleType, exported: DevelopmentExport, golden: FrozenManifest, root: Path,
-) -> None:
+def _heldout_config(
+    verifier_module: ModuleType, experiment: ExperimentManifest, golden: FrozenManifest,
+) -> VerifierConfig:
     from stochopia.stats import derive_seed
 
     namespace = "harness-continuity-test"
@@ -539,9 +541,15 @@ def _verify_trained_gru(
             for index, unit in enumerate(units)
         },
     )
-    config = verifier_module.VerifierConfig(
-        exp_id=exported.experiment.exp_id, batch_id=golden.batch_id, test_split=test_split, seeds=golden.seeds,
+    return verifier_module.VerifierConfig(
+        exp_id=experiment.exp_id, batch_id=golden.batch_id, test_split=test_split, seeds=golden.seeds,
     )
+
+
+def _verify_trained_model(
+    verifier_module: ModuleType, exported: DevelopmentExport, golden: FrozenManifest,
+    root: Path, config: VerifierConfig,
+) -> dict[str, Any]:
     fits = {fit.candidate_id: fit for fit in exported.fits}
     assert set(fits) == {"base", "flow", "price"}
     tasks = []
@@ -556,8 +564,10 @@ def _verify_trained_gru(
     assert all(row["status"] == "completed" for row in report["measurement"])
     for task in tasks:
         measured = verifier.result(task.task_id)
-        assert {observation.unit_id for observation in measured.observations} == set(units)
+        assert {observation.unit_id for observation in measured.observations} == set(config.test_split.unit_ids)
     assert {path: path.stat().st_mtime_ns for path in timestamps} == timestamps
+    assert json.loads((root / "report.json").read_text()) == report
+    return report
 
 
 def test_continuity_switch_backbone_and_resume_development(
@@ -567,6 +577,10 @@ def test_continuity_switch_backbone_and_resume_development(
 
     for backbone in ("gru", "ssm", "lru"):
         experiment = _tiny_experiment(golden, backbone)
+        verifier_module = openhyra["verifier"]
+        verification = tmp_path / "verification" / backbone
+        config = _heldout_config(verifier_module, experiment, golden)
+        verifier_module.Verifier(verification).register_config(config)
         entry, store = _entry(openhyra, tmp_path, experiment)
         choices = replace(
             golden,
@@ -609,23 +623,69 @@ def test_continuity_switch_backbone_and_resume_development(
         assert diagnosis["status"] in (ReportStatus.SUPPORTED, ReportStatus.INCONCLUSIVE)
         assert diagnosis["flow_rmse"] >= 0 and diagnosis["price_rmse"] >= 0
 
-        if backbone == "gru":
-            next_selectors = _selectors(choices, 2)
-            del next_selectors["fixed"]
-            reopened.run_round(2, selectors=next_selectors, baseline_metrics={})
-            later = reopened.snapshot("metrics", 3, baseline_metrics={})["feedback"]
-            assert [row["trial"]["candidate_id"] for row in later] == ["flow", "price"]
-            fixed = reopened.snapshot("fixed", 3, baseline_metrics={})["feedback"]
-            assert [row["trial"]["candidate_id"] for row in fixed] == ["flow", "price"]
-            final_choices = tuple(
-                replace(choice, selection_id=fixed[-1]["trial"]["selection_id"])
-                if choice.group_id == "fixed" else choice
-                for choice in choices.final_choices
-            )
-            _verify_trained_gru(
-                openhyra["verifier"], reopened.export(final_choices), golden, tmp_path / "verification",
-            )
+        next_selectors = _selectors(choices, 2)
+        del next_selectors["fixed"]
+        reopened.run_round(2, selectors=next_selectors, baseline_metrics={})
+        later = reopened.snapshot("metrics", 3, baseline_metrics={})["feedback"]
+        assert [row["trial"]["candidate_id"] for row in later] == ["flow", "price"]
+        fixed = reopened.snapshot("fixed", 3, baseline_metrics={})["feedback"]
+        assert [row["trial"]["candidate_id"] for row in fixed] == ["flow", "price"]
+        final_choices = tuple(
+            replace(choice, selection_id=fixed[-1]["trial"]["selection_id"])
+            if choice.group_id == "fixed" else choice
+            for choice in choices.final_choices
+        )
+        _verify_trained_model(verifier_module, reopened.export(final_choices), golden, verification, config)
         assert store.path.is_dir()
+
+
+def test_real_entry_selector_verifier_end_to_end(
+    openhyra: dict[str, ModuleType], tmp_path: Path, golden: FrozenManifest,
+) -> None:
+    from tasks.stochopia_tier0.llm_selector import build_selectors
+
+    def choose_anonymous_option(payload: dict[str, Any]) -> dict[str, Any]:
+        options = payload["options"]
+        selected = options[-1] if payload["evidence"] else options[0]
+        forecasts = [
+            {"option": target["option"], "target": target["target"],
+             "direction": "unchanged", "effect_interval": None}
+            for target in payload["targets"]
+        ]
+        return {"action": "select", "option": selected["option"], "reason": "Fixed offline policy",
+                "predictions": forecasts}
+
+    experiment = _tiny_experiment(golden, "gru")
+    scene = experiment.scenarios[0]
+    verifier_module = openhyra["verifier"]
+    verification = tmp_path / "verification"
+    config = _heldout_config(verifier_module, experiment, golden)
+    verifier_module.Verifier(verification).register_config(config)
+    entry, store = _entry(openhyra, tmp_path, experiment)
+    selectors = build_selectors(experiment, mode="offline", offline_responder=choose_anonymous_option)
+    entry.run_round(
+        1, selectors=selectors, baseline_metrics={scene.scenario_id: {"end_response": 0.0}},
+        evidence={"day-level-flow": {scene.scenario_id: {"flow_rmse": 1.0}}},
+    )
+    preregistered = store.preregistered(1)
+    assert preregistered is not None and len(preregistered["predictions"]) == 4
+    decisions = [SelectionRecord.from_dict(row) for row in preregistered["selections"]]
+    assert {row.group_id: row.candidate_id for row in decisions} == {
+        "evidence": "price", "metrics": "flow", "fixed": "flow",
+    }
+    final_choices = [
+        FinalChoice(
+            group_id=row.group_id, scenario_id=row.scenario_id, candidate_id=row.candidate_id,
+            selection_id=row.selection_id, stopping_reason="One predeclared offline round",
+        )
+        for row in decisions
+    ]
+    report = _verify_trained_model(
+        verifier_module, entry.export(final_choices), golden, verification, config,
+    )
+    assert set(report["z_to_x"]) == {"evidence", "metrics", "fixed"}
+    assert {row["group_id"] for row in report["predictions"]} == {"evidence", "metrics"}
+    assert all(row["common_comparison"] for row in report["predictions"])
 
 
 def _short_lob_frozen(golden: FrozenManifest) -> FrozenManifest:
