@@ -108,6 +108,52 @@ async def test_truncation_error_is_llm_error(fake_http):
     assert await _client().chat([{"role": "user", "content": "hi"}]) == "ok"
 
 
+@pytest.mark.parametrize(
+    ("model", "options"),
+    [
+        ("gpt-6.2-sol", {"max_completion_tokens": 128, "reasoning_effort": "low"}),
+        ("deepseek-flash", {"max_tokens": 128, "thinking": {"type": "disabled"}}),
+    ],
+)
+async def test_formal_json_omits_temperature_and_sends_native_model_options(fake_http, model, options):
+    client = _client()
+    client.config.model = model
+    client.config.temperature = None
+    client.config.formal_json = True
+    fake_http.scripted = [_FakeResponse({**_response('{"ok":true}', "stop").json(), "model": model})]
+    messages = [{"role": "user", "content": "Return JSON."}]
+
+    assert await client.chat(messages, max_tokens=128) == '{"ok":true}'
+    assert fake_http.payloads == [
+        {"model": model, "messages": messages, "response_format": {"type": "json_object"}, **options}
+    ]
+    assert client.total_usage["api_attempts"] == 1
+    assert client.total_usage["api_seconds"] >= 0
+    assert client.total_usage["prompt_tokens"] == 10
+    assert client.total_usage["completion_tokens"] == 5
+
+
+@pytest.mark.parametrize("model_field", [{"model": "unexpected-model"}, {}])
+async def test_formal_json_model_mismatch_latches_after_recording_usage(fake_http, model_field):
+    client = _client()
+    client.config.model = "gpt-6.2-sol"
+    client.config.temperature = None
+    client.config.formal_json = True
+    fake_http.scripted = [_FakeResponse({**_response('{"ok":true}', "stop").json(), **model_field})]
+    messages = [{"role": "user", "content": "Return JSON."}]
+
+    with pytest.raises(LLMError, match="不匹配"):
+        await client.chat(messages)
+    with pytest.raises(LLMError, match="已停止"):
+        await client.chat(messages)
+
+    assert client.unexpected_model == model_field.get("model", "")
+    assert len(fake_http.payloads) == 1
+    assert client.total_usage["api_attempts"] == client.total_usage["calls"] == 1
+    assert client.total_usage["prompt_tokens"] == 10
+    assert client.total_usage["completion_tokens"] == 5
+
+
 class _FlakyThenOkClient(_FakeAsyncClient):
     """前 N 次 post 抛出瞬时网络异常，之后按脚本返回。"""
 

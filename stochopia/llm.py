@@ -7,6 +7,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 import httpx
 import yaml
@@ -29,9 +30,10 @@ class ModelConfig:
     base_url: str = ""
     model: str = ""
     api_key_env: str = ""
-    temperature: float = 0.7
+    temperature: float | None = 0.7
     max_tokens: int = 2000
     timeout: float = 60.0
+    formal_json: bool = False
 
 
 class ModelRegistry(dict):
@@ -53,7 +55,7 @@ def load_model_registry(path: str | Path) -> ModelRegistry:
     for name, cfg in data["models"].items():
         if not isinstance(cfg, dict) or "provider" not in cfg:
             raise LLMError(f"模型 {name} 配置格式错误（{p}）：需要 provider 字段")
-        allowed = {"provider", "base_url", "model", "api_key_env", "temperature", "max_tokens", "timeout"}
+        allowed = {"provider", "base_url", "model", "api_key_env", "temperature", "max_tokens", "timeout", "formal_json"}
         unknown = set(cfg) - allowed
         if unknown:
             raise LLMError(f"模型 {name} 配置含未知字段（{p}）：{sorted(unknown)}")
@@ -99,6 +101,7 @@ class OpenAICompatClient(BaseLLMClient):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
+        self.unexpected_model: str | None = None
 
     async def chat(
         self,
@@ -108,6 +111,8 @@ class OpenAICompatClient(BaseLLMClient):
         seed: int | None = None,
     ) -> str:
         cfg = self.config
+        if self.unexpected_model is not None:
+            raise LLMError(f"已停止模型 {cfg.name} 的请求：供应商返回了不匹配的 model")
         api_key = os.environ.get(cfg.api_key_env, "").strip()
         if not api_key:
             raise LLMError(
@@ -115,22 +120,34 @@ class OpenAICompatClient(BaseLLMClient):
                 "（可复制 .env.example 为 .env 并填入）。"
             )
         url = cfg.base_url.rstrip("/") + "/chat/completions"
+        token_cap = "max_completion_tokens" if cfg.formal_json and cfg.model == "gpt-6.2-sol" else "max_tokens"
         payload = {
             "model": cfg.model,
             "messages": messages,
-            "temperature": cfg.temperature if temperature is None else temperature,
-            "max_tokens": cfg.max_tokens if max_tokens is None else max_tokens,
+            token_cap: cfg.max_tokens if max_tokens is None else max_tokens,
         }
+        temperature = cfg.temperature if temperature is None else temperature
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if cfg.formal_json:
+            payload["response_format"] = {"type": "json_object"}
+            if cfg.model == "gpt-6.2-sol":
+                payload["reasoning_effort"] = "low"
+            elif cfg.model == "deepseek-flash":
+                payload["thinking"] = {"type": "disabled"}
         if seed is not None:
             # OpenAI 兼容端点的尽力复现参数；不支持该字段的供应商会静默忽略。
             payload["seed"] = seed
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-        requested_max_tokens = payload["max_tokens"]
+        requested_max_tokens = payload[token_cap]
         last_error = ""
         net_attempt = 0
         trunc_attempt = 0
         while True:
+            started = perf_counter()
+            if cfg.formal_json:
+                self.total_usage["api_attempts"] = self.total_usage.get("api_attempts", 0) + 1
             try:
                 async with httpx.AsyncClient(timeout=cfg.timeout) as client:
                     resp = await client.post(url, json=payload, headers=headers)
@@ -160,17 +177,20 @@ class OpenAICompatClient(BaseLLMClient):
                         # 截断：升额重试（独立计数，不占用网络重试次数、不退避等待）
                         if (
                             trunc_attempt >= self.TRUNCATION_RETRIES
-                            or payload["max_tokens"] >= self.TRUNCATION_MAX_TOKENS_CEILING
+                            or payload[token_cap] >= self.TRUNCATION_MAX_TOKENS_CEILING
                         ):
                             raise
                         trunc_attempt += 1
-                        payload["max_tokens"] = min(
-                            payload["max_tokens"] * 2, self.TRUNCATION_MAX_TOKENS_CEILING
+                        payload[token_cap] = min(
+                            payload[token_cap] * 2, self.TRUNCATION_MAX_TOKENS_CEILING
                         )
                         continue
                     if trunc_attempt:
-                        self._record_max_tokens_escalation(requested_max_tokens, payload["max_tokens"])
+                        self._record_max_tokens_escalation(requested_max_tokens, payload[token_cap])
                     return text
+            finally:
+                if cfg.formal_json:
+                    self.total_usage["api_seconds"] = self.total_usage.get("api_seconds", 0) + perf_counter() - started
             if net_attempt < len(self.RETRY_DELAYS):
                 await asyncio.sleep(self.RETRY_DELAYS[net_attempt])
                 net_attempt += 1
@@ -196,6 +216,9 @@ class OpenAICompatClient(BaseLLMClient):
             self.total_usage["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
             self.total_usage["completion_tokens"] += int(usage.get("completion_tokens") or 0)
         self.total_usage["calls"] += 1
+        if cfg.formal_json and data.get("model") != cfg.model:
+            self.unexpected_model = str(data.get("model") or "")
+            raise LLMError(f"模型 {cfg.name} 的响应 model 与已登记的 {cfg.model} 不匹配")
         if isinstance(choice, dict) and choice.get("finish_reason") == "length":
             raise LLMTruncationError(
                 f"模型 {cfg.name} 输出因 max_tokens 上限被截断（finish_reason=length），"
