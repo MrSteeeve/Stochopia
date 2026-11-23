@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
+from typing import Any
 
 import httpx
 import yaml
@@ -33,7 +35,10 @@ class ModelConfig:
     temperature: float | None = 0.7
     max_tokens: int = 2000
     timeout: float = 60.0
-    formal_json: bool = False
+    response_json: bool = False
+    use_max_completion_tokens: bool = False
+    extra_body: Mapping[str, Any] | None = None
+    strict_model_match: bool = False
 
 
 class ModelRegistry(dict):
@@ -55,7 +60,8 @@ def load_model_registry(path: str | Path) -> ModelRegistry:
     for name, cfg in data["models"].items():
         if not isinstance(cfg, dict) or "provider" not in cfg:
             raise LLMError(f"模型 {name} 配置格式错误（{p}）：需要 provider 字段")
-        allowed = {"provider", "base_url", "model", "api_key_env", "temperature", "max_tokens", "timeout", "formal_json"}
+        allowed = {"provider", "base_url", "model", "api_key_env", "temperature", "max_tokens", "timeout",
+                   "response_json", "use_max_completion_tokens", "extra_body", "strict_model_match"}
         unknown = set(cfg) - allowed
         if unknown:
             raise LLMError(f"模型 {name} 配置含未知字段（{p}）：{sorted(unknown)}")
@@ -120,8 +126,9 @@ class OpenAICompatClient(BaseLLMClient):
                 "（可复制 .env.example 为 .env 并填入）。"
             )
         url = cfg.base_url.rstrip("/") + "/chat/completions"
-        token_cap = "max_completion_tokens" if cfg.formal_json and cfg.model == "gpt-6.2-sol" else "max_tokens"
+        token_cap = "max_completion_tokens" if cfg.use_max_completion_tokens else "max_tokens"
         payload = {
+            **(cfg.extra_body or {}),
             "model": cfg.model,
             "messages": messages,
             token_cap: cfg.max_tokens if max_tokens is None else max_tokens,
@@ -129,12 +136,8 @@ class OpenAICompatClient(BaseLLMClient):
         temperature = cfg.temperature if temperature is None else temperature
         if temperature is not None:
             payload["temperature"] = temperature
-        if cfg.formal_json:
+        if cfg.response_json:
             payload["response_format"] = {"type": "json_object"}
-            if cfg.model == "gpt-6.2-sol":
-                payload["reasoning_effort"] = "low"
-            elif cfg.model == "deepseek-flash":
-                payload["thinking"] = {"type": "disabled"}
         if seed is not None:
             # OpenAI 兼容端点的尽力复现参数；不支持该字段的供应商会静默忽略。
             payload["seed"] = seed
@@ -146,8 +149,7 @@ class OpenAICompatClient(BaseLLMClient):
         trunc_attempt = 0
         while True:
             started = perf_counter()
-            if cfg.formal_json:
-                self.total_usage["api_attempts"] = self.total_usage.get("api_attempts", 0) + 1
+            self.total_usage["api_attempts"] = self.total_usage.get("api_attempts", 0) + 1
             try:
                 async with httpx.AsyncClient(timeout=cfg.timeout) as client:
                     resp = await client.post(url, json=payload, headers=headers)
@@ -189,8 +191,7 @@ class OpenAICompatClient(BaseLLMClient):
                         self._record_max_tokens_escalation(requested_max_tokens, payload[token_cap])
                     return text
             finally:
-                if cfg.formal_json:
-                    self.total_usage["api_seconds"] = self.total_usage.get("api_seconds", 0) + perf_counter() - started
+                self.total_usage["api_seconds"] = self.total_usage.get("api_seconds", 0) + perf_counter() - started
             if net_attempt < len(self.RETRY_DELAYS):
                 await asyncio.sleep(self.RETRY_DELAYS[net_attempt])
                 net_attempt += 1
@@ -216,7 +217,7 @@ class OpenAICompatClient(BaseLLMClient):
             self.total_usage["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
             self.total_usage["completion_tokens"] += int(usage.get("completion_tokens") or 0)
         self.total_usage["calls"] += 1
-        if cfg.formal_json and data.get("model") != cfg.model:
+        if cfg.strict_model_match and data.get("model") != cfg.model:
             self.unexpected_model = str(data.get("model") or "")
             raise LLMError(f"模型 {cfg.name} 的响应 model 与已登记的 {cfg.model} 不匹配")
         if isinstance(choice, dict) and choice.get("finish_reason") == "length":

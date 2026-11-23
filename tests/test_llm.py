@@ -72,13 +72,15 @@ def _client(max_tokens: int = 2000) -> OpenAICompatClient:
     )
 
 
-async def test_truncation_retries_with_doubled_max_tokens(fake_http):
+@pytest.mark.parametrize("token_cap", ["max_tokens", "max_completion_tokens"])
+async def test_truncation_retries_with_doubled_max_tokens(fake_http: type[_FakeAsyncClient], token_cap: str) -> None:
     """首次截断后自动把 max_tokens 翻倍重试，第二次成功返回内容。"""
     fake_http.scripted = [_response("被截断的内", "length"), _response("完整回复", "stop")]
     client = _client()
+    client.config.use_max_completion_tokens = token_cap == "max_completion_tokens"
     result = await client.chat([{"role": "user", "content": "hi"}])
     assert result == "完整回复"
-    assert [p["max_tokens"] for p in fake_http.payloads] == [2000, 4000]
+    assert [p[token_cap] for p in fake_http.payloads] == [2000, 4000]
     # The effective (escalated) max_tokens is recorded with the usage/trace.
     assert client.total_usage["max_tokens_escalations"] == [
         {"requested_max_tokens": 2000, "effective_max_tokens": 4000}
@@ -109,23 +111,25 @@ async def test_truncation_error_is_llm_error(fake_http):
 
 
 @pytest.mark.parametrize(
-    ("model", "options"),
+    ("token_cap", "extra_body"),
     [
-        ("gpt-6.2-sol", {"max_completion_tokens": 128, "reasoning_effort": "low"}),
-        ("deepseek-flash", {"max_tokens": 128, "thinking": {"type": "disabled"}}),
+        ("max_completion_tokens", {"reasoning_effort": "low"}),
+        ("max_tokens", {"thinking": {"type": "disabled"}}),
     ],
 )
-async def test_formal_json_omits_temperature_and_sends_native_model_options(fake_http, model, options):
+async def test_json_request_options(fake_http: type[_FakeAsyncClient], token_cap: str, extra_body: dict[str, object]) -> None:
     client = _client()
-    client.config.model = model
     client.config.temperature = None
-    client.config.formal_json = True
-    fake_http.scripted = [_FakeResponse({**_response('{"ok":true}', "stop").json(), "model": model})]
+    client.config.response_json = True
+    client.config.use_max_completion_tokens = token_cap == "max_completion_tokens"
+    client.config.extra_body = extra_body
+    fake_http.scripted = [_response('{"ok":true}', "stop")]
     messages = [{"role": "user", "content": "Return JSON."}]
 
     assert await client.chat(messages, max_tokens=128) == '{"ok":true}'
     assert fake_http.payloads == [
-        {"model": model, "messages": messages, "response_format": {"type": "json_object"}, **options}
+        {"model": client.config.model, "messages": messages, "response_format": {"type": "json_object"},
+         token_cap: 128, **extra_body}
     ]
     assert client.total_usage["api_attempts"] == 1
     assert client.total_usage["api_seconds"] >= 0
@@ -134,11 +138,9 @@ async def test_formal_json_omits_temperature_and_sends_native_model_options(fake
 
 
 @pytest.mark.parametrize("model_field", [{"model": "unexpected-model"}, {}])
-async def test_formal_json_model_mismatch_latches_after_recording_usage(fake_http, model_field):
+async def test_strict_model_mismatch_latches(fake_http: type[_FakeAsyncClient], model_field: dict[str, str]) -> None:
     client = _client()
-    client.config.model = "gpt-6.2-sol"
-    client.config.temperature = None
-    client.config.formal_json = True
+    client.config.strict_model_match = True
     fake_http.scripted = [_FakeResponse({**_response('{"ok":true}', "stop").json(), **model_field})]
     messages = [{"role": "user", "content": "Return JSON."}]
 
