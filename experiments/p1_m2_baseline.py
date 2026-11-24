@@ -19,8 +19,11 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
-from experiments.p1_m2_metrics import TapeStats, aggregate_tapes, summarize_impact, tape_statistics
+from experiments.p1_m2_metrics import (
+    TapeStats, aggregate_tapes, day_paired_paths, market_bootstrap_payload, summarize_impact, tape_statistics,
+)
 from experiments.p1_m3_evidence import compact_evidence
+from experiments.p1_m4_market_stats import market_metric_estimates
 from stochopia.common import atomic_write_json
 from stochopia.data import load_day_slice, validate_chronological_splits
 from stochopia.harness.lob_rollout import ResidualProfile, RolloutArm, RolloutTrace, rollout_paired_window
@@ -38,6 +41,7 @@ from stochopia.neural.lob_training import (
     P1_FIT_PROTOCOL,
     P1_TRAIN_SEEDS,
     EncodedDay,
+    NonfiniteModelLoss,
     encode_day,
     fit_lob_world_model,
 )
@@ -120,11 +124,17 @@ def _windows(days: list[EncodedDay], horizon: int) -> list[Window]:
     return windows
 
 
-def _replay_stats(window: Window, grid: np.ndarray) -> TapeStats:
+def _replay_marks(window: Window, grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     day = window.data.day
     times = day.time_ms[window.start:window.end] - day.time_ms[window.start]
     marks = np.searchsorted(times, grid, side="right") + window.start
     marks[0] = window.start  # both the model and replay start at the pre-event book
+    return times, marks
+
+
+def _replay_stats(window: Window, grid: np.ndarray) -> TapeStats:
+    day = window.data.day
+    times, marks = _replay_marks(window, grid)
     return tape_statistics(np.column_stack((times, day.action_type[window.start:window.end])),
                            day.mid_ticks_x2[marks] / 2, day.spread_ticks[marks], day.pre_book_shares[marks, :, 0])
 
@@ -140,7 +150,7 @@ def _validation(model: LOBWorldModel, window: Window, marginal: list[np.ndarray]
     observed = tokens[0, CONTEXT:].numpy()
     predicted = np.array([float(getattr(loss, name)[:, CONTEXT:].mean()) for name in HEADS])
     if not np.isfinite(predicted).all():
-        raise ValueError(f"Nonfinite dev likelihood for {data.day.wind_code} {data.day.trading_date}")
+        raise NonfiniteModelLoss(f"Nonfinite evaluation likelihood for {data.day.wind_code} {data.day.trading_date}")
     empirical = np.array([values[observed[:, axis]].mean() for axis, values in enumerate(marginal)])
     return predicted, empirical, len(observed)
 
@@ -157,7 +167,8 @@ def _json_value(value: object) -> object:
 
 
 def _save_traces(path: Path, traces: dict[RolloutArm, RolloutTrace]) -> None:
-    fields = ("grid_ms", "mid_ticks", "spread_ticks", "touch_shares", "events", "after_child_mid_ticks", "child_fill_shares")
+    fields = ("grid_ms", "mid_ticks", "spread_ticks", "touch_shares", "events",
+              "after_child_mid_ticks", "child_fill_shares", "exhausted")
     arrays = {f"{arm.value}_{field}": getattr(trace, field) for arm, trace in traces.items() for field in fields}
     np.savez_compressed(path, **arrays)
 
@@ -171,7 +182,7 @@ def _likelihood(rows: list[tuple[np.ndarray, np.ndarray, int]]) -> list[dict[str
 def evaluate_symbol(
     root: Path, symbol: str, train_dates: list[int], dev_dates: list[int], directory: Path,
     *, factory: Callable[[], LOBWorldModel] = SeedGRULOBModel, rollout_seed: int = 12300,
-    checkpoints: dict[int, Path] | None = None,
+    checkpoints: dict[int, Path] | None = None, save_traces: bool = True,
 ) -> dict[str, object]:
     """Apply the same train/validation and injection protocol to any model factory."""
     torch.set_num_threads(1)
@@ -184,6 +195,10 @@ def evaluate_symbol(
     grid = np.arange(2 * CHILDREN * 4 + 1) * spacing // 4
     windows = _windows(dev, int(grid[-1]))
     replay = [_replay_stats(window, grid) for window in windows]
+    replay_depth = []
+    for window in windows:
+        _, marks = _replay_marks(window, grid)
+        replay_depth.append(window.data.day.pre_book_shares[marks, :, 0])
     directory.mkdir(parents=True, exist_ok=True)
     atomic_write_json(directory / "protocol.json", {**cfg, "fit_protocol": asdict(P1_FIT_PROTOCOL),
                       "context": CONTEXT, "train_seeds": list(P1_TRAIN_SEEDS), "rollout_seed": rollout_seed,
@@ -218,7 +233,8 @@ def evaluate_symbol(
             traces = rollout_paired_window(model, window.data.day, window.start, child_times_ms=child_times,
                                            child_shares=int(cfg["child_shares"]), grid_ms=grid, seed=rollout_seed + number,
                                            context_len=CONTEXT, max_events=4096)
-            _save_traces(directory / f"seed-{seed}-{window.data.day.trading_date}-{window.session}.npz", traces)
+            if save_traces:
+                _save_traces(directory / f"seed-{seed}-{window.data.day.trading_date}-{window.session}.npz", traces)
             seed_paths.append(traces)
             trace = traces[RolloutArm.NO_INJECTION]
             generated.append(tape_statistics(trace.events, trace.mid_ticks, trace.spread_ticks, trace.touch_shares))
@@ -232,7 +248,14 @@ def evaluate_symbol(
     result = asdict(profile)
     parameters = max(row["params"] for row in fit)
     state_dim = max(row["state_dim"] for row in fit)
-    result["evidence"] = compact_evidence(profile, parameters, state_dim)
+    bootstrap = market_bootstrap_payload(paths, generated, replay, cfg=cfg, grid=grid,
+                                         children=child_times, replay_touch_shares=np.stack(replay_depth))
+    estimates = market_metric_estimates(bootstrap)
+    result["market_bootstrap"] = bootstrap
+    seed_nll = {row["seed"]: row["dev_nll"]["total"] for row in fit}
+    exhausted = sum(pair[RolloutArm.NO_INJECTION].exhausted for seed in paths for pair in seed)
+    result["evidence"] = compact_evidence(profile, parameters, state_dim, exhausted_windows=exhausted,
+                                          train_seed_nll=seed_nll, l1_depth_mae=estimates["l1_depth_mae"])
     daily_metrics = {}
     for day_number, date in enumerate(dev_dates):
         indices = slice(2 * day_number, 2 * day_number + 2)
@@ -242,7 +265,9 @@ def evaluate_symbol(
             [trial[indices] for trial in paths], [generated[i] for i in flat_indices], replay[indices],
             cfg, grid, child_times, _likelihood([nll[i] for i in flat_indices]),
         )
-        daily_metrics[str(date)] = compact_evidence(daily_profile, parameters, state_dim)
+        daily_exhausted = sum(pair[RolloutArm.NO_INJECTION].exhausted for seed in paths for pair in seed[indices])
+        daily_metrics[str(date)] = compact_evidence(daily_profile, parameters, state_dim,
+                                                   exhausted_windows=daily_exhausted)
     result["day_metrics"] = daily_metrics
     result.update(dev_targets=sum(entry[2] for entry in nll), fit=fit, seconds=perf_counter() - start_all)
     atomic_write_json(directory / "residuals.json", _json_value(result))
@@ -255,20 +280,14 @@ def _summarize_paths(paths: list[list[dict[RolloutArm, RolloutTrace]]], generate
     visible = (RolloutArm.BUY_VISIBLE, RolloutArm.SELL_VISIBLE)
     blind = (RolloutArm.BUY_BLIND, RolloutArm.SELL_BLIND)
 
-    def paired(arms: tuple[RolloutArm, RolloutArm], field: str, *, relative: bool = False) -> np.ndarray:
-        data = np.array([[[getattr(pair[arm], field) - (pair[arm].mid_ticks[0] if relative else 0)
-                           for arm in arms] for pair in seed] for seed in paths])
-        # [seed, window, side, time] -> [day, side, time] with two sessions per day.
-        by_day = data.reshape(len(paths), -1, 2, *data.shape[2:])
-        return by_day.mean(axis=(0, 2))
-
     actual = aggregate_tapes(replay)
     simulated = aggregate_tapes(generated)
     impact = summarize_impact(
-        visible_mid=paired(visible, "mid_ticks", relative=True), blind_mid=paired(blind, "mid_ticks", relative=True),
-        child_visible=paired(visible, "after_child_mid_ticks", relative=True),
-        child_blind=paired(blind, "after_child_mid_ticks", relative=True),
-        child_filled=paired(visible, "child_fill_shares"), sigma_ticks=float(cfg["sigma_ticks"]),
+        visible_mid=day_paired_paths(paths, visible, "mid_ticks", relative=True),
+        blind_mid=day_paired_paths(paths, blind, "mid_ticks", relative=True),
+        child_visible=day_paired_paths(paths, visible, "after_child_mid_ticks", relative=True),
+        child_blind=day_paired_paths(paths, blind, "after_child_mid_ticks", relative=True),
+        child_filled=day_paired_paths(paths, visible, "child_fill_shares"), sigma_ticks=float(cfg["sigma_ticks"]),
         daily_shares=float(cfg["daily_shares"]), schedule=np.isin(grid, children), generated=simulated, replay=actual,
         paths_per_day=2 * len(paths),
     )

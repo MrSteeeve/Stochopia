@@ -32,6 +32,8 @@ class RolloutTrace:
     Events are [N, 4]: elapsed ms, action, relative ticks or cancel rank, and
     requested shares. Child submissions are separate. Mid and spread are NaN
     when either side is empty. Touch shares [G, 2] are in bid, ask order.
+    ``exhausted`` records an empty side after any message, including between
+    grid marks and before same-timestamp replenishment.
     """
 
     grid_ms: np.ndarray
@@ -41,6 +43,7 @@ class RolloutTrace:
     events: np.ndarray
     after_child_mid_ticks: np.ndarray
     child_fill_shares: np.ndarray
+    exhausted: bool = False
 
 
 @dataclass(frozen=True)
@@ -146,6 +149,7 @@ class _Path:
         self._touch: list[tuple[float, float, int, int]] = []
         self._child_mids: list[float] = []
         self._child_fills: list[int] = []
+        self._exhausted = False
         self._record(0)
 
     def _record(self, time_ms: int) -> None:
@@ -157,6 +161,7 @@ class _Path:
         mid = (bid + ask) / 2 if bid and ask else np.nan
         spread = ask - bid if bid and ask else np.nan
         best_bid, best_ask = map(int, self.shares[:, 0])
+        self._exhausted = self._exhausted or best_bid == 0 or best_ask == 0
         self._times.append(time_ms)
         self._touch.append((mid, spread, best_bid, best_ask))
 
@@ -203,6 +208,7 @@ class _Path:
             grid, touch[:, 0], touch[:, 1], touch[:, 2:].astype(np.int64),
             np.array(events, dtype=np.int64).reshape(-1, 4),
             np.array(self._child_mids), np.array(self._child_fills, dtype=np.int64),
+            self._exhausted,
         )
 
 

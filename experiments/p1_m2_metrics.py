@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 
 import numpy as np
 
+from stochopia.harness.lob_rollout import RolloutArm, RolloutTrace
 from stochopia.measure.impact import (
+    ImpactLaw,
     ImpactMetrics,
     ImpactReference,
     antisymmetrise,
+    fit_power_law,
     identify_law,
     relaxation,
     score_impact,
@@ -18,6 +22,9 @@ from stochopia.measure.impact import (
 
 FLOW_LAGS = np.arange(1, 9)
 PRICE_LAGS = np.array([1, 2, 4, 8])
+
+
+# --- Tick and tape measurements ---
 
 
 @dataclass(frozen=True)
@@ -35,7 +42,7 @@ class TapeStats:
     two_sided_share: float
 
 
-def _finite_mean(values: np.ndarray, axis: int | None = None) -> np.ndarray:
+def _finite_mean(values: np.ndarray, axis: int | tuple[int, ...] | None = None) -> np.ndarray:
     """Average over finite observations. An empty support remains NaN."""
     valid = np.isfinite(values)
     counts = valid.sum(axis=axis)
@@ -88,16 +95,41 @@ def aggregate_tapes(rows: list[TapeStats]) -> dict[str, object]:
     return result
 
 
+# --- Pooled injection metrics ---
+
+
+def _impact_law(paths: np.ndarray, law_admitted: bool | None) -> ImpactLaw | None:
+    """Fit complete [day, child] responses after determining eligibility.
+
+    The original panel applies the existing C2 test. Bootstrap resamples
+    condition on that model's original result. Once admitted, the exponent
+    refits on the same grid for each resampled mean, including grid boundaries.
+    A draw still needs at least one complete day to fit a response.
+    """
+    if law_admitted is None:
+        return identify_law(paths) if len(paths) >= 2 else None
+    if not law_admitted or not len(paths):
+        return None
+    mean_path = paths.mean(axis=0)
+    delta, amplitude = fit_power_law(np.arange(1, len(mean_path) + 1), mean_path)
+    peak_se = float(paths[:, -1].std(ddof=1) / np.sqrt(len(paths))) if len(paths) >= 2 else float("nan")
+    return ImpactLaw(True, "C2 admitted on original panel", delta, amplitude, float(mean_path[-1]), peak_se)
+
+
 def summarize_impact(
     *, visible_mid: np.ndarray, blind_mid: np.ndarray, child_visible: np.ndarray,
     child_blind: np.ndarray, child_filled: np.ndarray, sigma_ticks: float, daily_shares: float,
     schedule: np.ndarray, generated: dict[str, object], replay: dict[str, object], paths_per_day: int = 1,
+    include_peak_interval: bool = True, law_admitted: bool | None = None,
 ) -> dict[str, object]:
     """Re-use the LOB-Impact scorer on day-clustered buy/sell paths.
 
     Mid paths are [day, side, grid], children and fills [day, side, child].
     Side order is buy then sell. Seeds and matched sessions are averaged within
     each day before calling; midday or seed replicates do not inflate n.
+    During outer bootstrap, C2 admission is fixed at the original-panel
+    result and the peak diagnostic interval is omitted. Each draw still
+    refits the admissible exponent and re-estimates the raw measurements.
     """
     n_days = len(visible_mid)
     visible = antisymmetrise(visible_mid[:, 0], visible_mid[:, 1])
@@ -106,7 +138,7 @@ def summarize_impact(
     execution_blind = antisymmetrise(child_blind[:, 0], child_blind[:, 1])
     whole_days = np.isfinite(execution_visible).all(axis=1)
     valid_execution = execution_visible[whole_days]
-    law = identify_law(valid_execution) if len(valid_execution) >= 2 else None
+    law = _impact_law(valid_execution, law_admitted)
 
     peak_days = np.isfinite(execution_visible[:, -1])
     paired_days = peak_days & np.isfinite(execution_blind[:, -1])
@@ -134,7 +166,7 @@ def summarize_impact(
         rec = relaxation(recovery_mean, schedule, tail=1)
 
     ci = None
-    if len(valid_execution) >= 2:
+    if include_peak_interval and len(valid_execution) >= 2:
         peaks = valid_execution[:, -1]
         rng = np.random.default_rng(9127)
         draws = peaks[rng.integers(len(peaks), size=(2000, len(peaks)))].mean(axis=1)
@@ -163,4 +195,99 @@ def summarize_impact(
         "blind_child_ticks": _finite_mean(execution_blind, axis=0).tolist(),
         "average_filled_shares": traded, "law": asdict(law) if law is not None else None,
         "measurements": asdict(metrics), "reference": asdict(reference), "score": asdict(score),
+    }
+
+
+# --- Compact day-cluster observations ---
+
+
+def day_paired_paths(
+    paths: Sequence[Sequence[Mapping[RolloutArm, RolloutTrace]]],
+    arms: tuple[RolloutArm, RolloutArm], field: str, *, relative: bool = False,
+) -> np.ndarray:
+    """Pool [seed, session, side, time] into [day, side, time].
+
+    Runs contain the same two sessions per trading day and seed. Relative
+    prices subtract each path's initial mid. If a paired mark is missing
+    from any seed/session it remains missing at the day level, as in M3.
+    """
+    by_seed = []
+    for trial in paths:
+        by_window = []
+        for window in trial:
+            sides = []
+            for arm in arms:
+                trace = window[arm]
+                marks = getattr(trace, field)
+                if relative:
+                    marks = marks - trace.mid_ticks[0]
+                sides.append(marks)
+            by_window.append(sides)
+        by_seed.append(by_window)
+    data = np.asarray(by_seed)
+    return data.reshape(len(paths), -1, 2, *data.shape[2:]).mean(axis=(0, 2))
+
+
+def _cluster_tapes(rows: Sequence[TapeStats], replicates: int) -> dict[str, list]:
+    """Store only the per-window terms entering these pooled statistics."""
+    values = {}
+    for field in ("events", "flow_acf", "price_msd", "drift_ticks"):
+        ordered = np.array([getattr(row, field) for row in rows])
+        values[field] = ordered.reshape(-1, replicates, *ordered.shape[1:]).tolist()
+    return values
+
+
+def market_bootstrap_payload(
+    paths: Sequence[Sequence[Mapping[RolloutArm, RolloutTrace]]],
+    generated: Sequence[TapeStats], replay: Sequence[TapeStats], *,
+    cfg: Mapping[str, int | float], grid: np.ndarray, children: np.ndarray,
+    replay_touch_shares: np.ndarray | None = None,
+) -> dict[str, object]:
+    """Serialize chronological day clusters for exact repooling on each draw.
+
+    Generated tapes arrive in seed-major, session-minor order. Historical
+    touch shares is [window, grid, side]. The intra-day absolute touch error
+    averages the absolute difference over all same-clock bid/ask cells and
+    seeds, including zero usable depth. A missing historical panel leaves
+    this optional readout unavailable. No event tape leaves the evaluator.
+    """
+    windows = len(replay)
+    if not paths or not windows or windows % 2:
+        raise ValueError("market clusters need seeds and two sessions per day")
+    if any(len(trial) != windows for trial in paths) or len(generated) != windows * len(paths):
+        raise ValueError("generated and historical tapes must align by seed and window")
+
+    ordered = []
+    for window in range(0, windows, 2):
+        for seed in range(len(paths)):
+            first = seed * windows + window
+            ordered.extend(generated[first:first + 2])
+
+    depth_errors = None
+    if replay_touch_shares is not None:
+        observed = np.asarray(replay_touch_shares)
+        if observed.shape != (windows, len(grid), 2):
+            raise ValueError("historical touch shares must align by window, grid mark and side")
+        free_depth = np.asarray([
+            [window[RolloutArm.NO_INJECTION].touch_shares for window in trial]
+            for trial in paths
+        ], dtype=float)
+        errors = np.abs(free_depth - observed[None]).reshape(len(paths), -1, 2, len(grid), 2)
+        depth_errors = errors.mean(axis=(0, 2, 3, 4)).tolist()
+
+    visible = (RolloutArm.BUY_VISIBLE, RolloutArm.SELL_VISIBLE)
+    blind = (RolloutArm.BUY_BLIND, RolloutArm.SELL_BLIND)
+    return {
+        "visible_mid": day_paired_paths(paths, visible, "mid_ticks", relative=True).tolist(),
+        "blind_mid": day_paired_paths(paths, blind, "mid_ticks", relative=True).tolist(),
+        "child_visible": day_paired_paths(paths, visible, "after_child_mid_ticks", relative=True).tolist(),
+        "child_blind": day_paired_paths(paths, blind, "after_child_mid_ticks", relative=True).tolist(),
+        "child_filled": day_paired_paths(paths, visible, "child_fill_shares").tolist(),
+        "paths_per_day": len(paths) * 2,
+        "sigma_ticks": float(cfg["sigma_ticks"]),
+        "daily_shares": float(cfg["daily_shares"]),
+        "schedule": np.isin(grid, children).tolist(),
+        "generated_tapes": _cluster_tapes(ordered, len(paths) * 2),
+        "historical_tapes": _cluster_tapes(replay, 2),
+        "l1_depth_errors": depth_errors,
     }

@@ -23,6 +23,15 @@ class LLMTruncationError(LLMError):
     """输出因 max_tokens 上限被截断；chat 内部会自动升额重试，重试耗尽才抛出。"""
 
 
+class LLMRequestError(LLMError):
+    """Request failure whose HTTP or transport cause is available to a caller."""
+
+    def __init__(self, message: str, *, status_code: int | None = None, transport: bool = False) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.transport = transport
+
+
 @dataclass
 class ModelConfig:
     """模型注册表中的一条配置。"""
@@ -149,28 +158,33 @@ class OpenAICompatClient(BaseLLMClient):
         trunc_attempt = 0
         while True:
             started = perf_counter()
+            status_code = None
+            failed_transport = False
             self.total_usage["api_attempts"] = self.total_usage.get("api_attempts", 0) + 1
             try:
                 async with httpx.AsyncClient(timeout=cfg.timeout) as client:
                     resp = await client.post(url, json=payload, headers=headers)
             except httpx.TimeoutException as exc:
                 # 超时：可重试
+                failed_transport = True
                 last_error = f"请求超时：{exc!r}"
             except httpx.TransportError as exc:
                 # 瞬时传输层故障（连接被掐断、协议错误、代理抖动等）：可重试
+                failed_transport = True
                 last_error = f"网络传输错误：{exc!r}"
             except httpx.HTTPError as exc:
                 # 其他请求错误（非法 URL、重定向过多等）：不重试，直接抛出
                 raise LLMError(f"模型 {cfg.name} 请求失败（{url}）：{exc!r}") from exc
             else:
+                status_code = resp.status_code
                 if resp.status_code == 429 or resp.status_code >= 500:
                     # 限流或服务端错误：可重试
                     last_error = f"HTTP {resp.status_code}：{resp.text[:200]}"
                 elif resp.status_code >= 400:
                     # 其余 4xx：不重试，带响应体摘要直接抛出
-                    raise LLMError(
+                    raise LLMRequestError(
                         f"模型 {cfg.name} 调用失败（HTTP {resp.status_code}，不可重试）："
-                        f"{resp.text[:300]}"
+                        f"{resp.text[:300]}", status_code=status_code,
                     )
                 else:
                     try:
@@ -196,8 +210,9 @@ class OpenAICompatClient(BaseLLMClient):
                 await asyncio.sleep(self.RETRY_DELAYS[net_attempt])
                 net_attempt += 1
                 continue
-            raise LLMError(
-                f"模型 {cfg.name} 重试 {len(self.RETRY_DELAYS)} 次后仍失败：{last_error}"
+            raise LLMRequestError(
+                f"模型 {cfg.name} 重试 {len(self.RETRY_DELAYS)} 次后仍失败：{last_error}",
+                status_code=status_code, transport=failed_transport,
             )
 
     def _parse_response(self, resp: httpx.Response) -> str:

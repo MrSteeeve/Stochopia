@@ -166,6 +166,20 @@ def test_warmup_cannot_cross_a_session_boundary() -> None:
                               grid_ms=(0, 10, 20), seed=1, context_len=2)
 
 
+def test_exhaustion_retains_a_same_timestamp_replenishment() -> None:
+    day = _day()
+    if version_info >= (3, 13) and find_spec("jaxlob") is None:
+        with pytest.raises(ImportError, match="requires the harness-lob extra"):
+            _Path(day.pre_book_ticks[0], day.pre_book_shares[0], 12)
+        return
+    path = _Path(day.pre_book_ticks[0], day.pre_book_shares[0], 12)
+    path.apply(_Order(10, 2, 2, 225, 106))
+    path.apply(_Order(10, 1, 0, 50, 104))
+    trace = path.trace(np.array([0, 20]))
+    assert np.isfinite(trace.mid_ticks).all()
+    assert trace.exhausted
+
+
 def test_rollout_rejects_a_crossed_initial_book() -> None:
     day = _day()
     day.pre_book_ticks[2, 0, 0] = 105

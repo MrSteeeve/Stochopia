@@ -32,6 +32,10 @@ P1_FIT_PROTOCOL = FitProtocol()
 P1_TRAIN_SEEDS = (103, 137, 211)
 
 
+class NonfiniteModelLoss(ValueError):
+    """The model did not produce finite loss or training gradients."""
+
+
 @dataclass(frozen=True)
 class EncodedDay:
     day: SZSEDaySlice
@@ -103,9 +107,11 @@ def fit_lob_world_model(
         logits = FiveTupleLogits(*(head[:, supervised] for head in full))
         loss = world_model_loss(logits, targets[:, supervised]).total
         if not torch.isfinite(loss):
-            raise ValueError(f"seed {seed} produced a nonfinite training objective")
+            raise NonfiniteModelLoss(f"seed {seed} produced a nonfinite training objective")
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), protocol.grad_clip, error_if_nonfinite=True)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), protocol.grad_clip)
+        if not torch.isfinite(norm):
+            raise NonfiniteModelLoss(f"seed {seed} produced a nonfinite gradient norm")
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         if step + 1 < protocol.steps:
