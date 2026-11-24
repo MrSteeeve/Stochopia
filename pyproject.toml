@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 research = [
     "numpy",
+    "pyarrow<26",  # PyArrow 26 requires NumPy 2, while harness-lob uses NumPy 1.x.
     "torch",
     "scipy>=1.11",
 ]
