@@ -64,6 +64,10 @@ class Window:
     start: int
     end: int
 
+    @property
+    def max_events(self) -> int:
+        return max(6_000, 8 * (self.end - self.start))
+
 
 def _load_days(root: Path, symbol: str, dates: list[int]) -> list[EncodedDay]:
     loaded = []
@@ -168,7 +172,7 @@ def _json_value(value: object) -> object:
 
 def _save_traces(path: Path, traces: dict[RolloutArm, RolloutTrace]) -> None:
     fields = ("grid_ms", "mid_ticks", "spread_ticks", "touch_shares", "events",
-              "after_child_mid_ticks", "child_fill_shares", "exhausted")
+              "after_child_mid_ticks", "child_fill_shares", "exhausted", "budget_exhausted")
     arrays = {f"{arm.value}_{field}": getattr(trace, field) for arm, trace in traces.items() for field in fields}
     np.savez_compressed(path, **arrays)
 
@@ -177,6 +181,11 @@ def _likelihood(rows: list[tuple[np.ndarray, np.ndarray, int]]) -> list[dict[str
     weights = np.array([row[2] for row in rows])
     means = [np.average(np.array([row[i] for row in rows]), weights=weights, axis=0) for i in range(2)]
     return [{**dict(zip(HEADS, values.tolist())), "total": float(values.sum())} for values in means]
+
+
+def _window_exhausted(traces: dict[RolloutArm, RolloutTrace]) -> bool:
+    """Count a free-book failure or an early event cap in any arm once."""
+    return traces[RolloutArm.NO_INJECTION].exhausted or any(trace.budget_exhausted for trace in traces.values())
 
 
 def evaluate_symbol(
@@ -204,7 +213,8 @@ def evaluate_symbol(
                       "context": CONTEXT, "train_seeds": list(P1_TRAIN_SEEDS), "rollout_seed": rollout_seed,
                       "grid_ms": grid.tolist(), "child_times_ms": child_times.tolist(),
                       "windows": [{"date": w.data.day.trading_date, "session": w.session, "start": w.start,
-                                   "time_ms": int(w.data.day.time_ms[w.start]), "end": w.end} for w in windows]})
+                                   "time_ms": int(w.data.day.time_ms[w.start]), "end": w.end,
+                                   "max_events": w.max_events} for w in windows]})
     nll = []
     generated = []
     fit = []
@@ -232,7 +242,7 @@ def evaluate_symbol(
             seed_nll.append(_validation(model, window, marginal))
             traces = rollout_paired_window(model, window.data.day, window.start, child_times_ms=child_times,
                                            child_shares=int(cfg["child_shares"]), grid_ms=grid, seed=rollout_seed + number,
-                                           context_len=CONTEXT, max_events=4096)
+                                           context_len=CONTEXT, max_events=window.max_events)
             if save_traces:
                 _save_traces(directory / f"seed-{seed}-{window.data.day.trading_date}-{window.session}.npz", traces)
             seed_paths.append(traces)
@@ -253,9 +263,12 @@ def evaluate_symbol(
     estimates = market_metric_estimates(bootstrap)
     result["market_bootstrap"] = bootstrap
     seed_nll = {row["seed"]: row["dev_nll"]["total"] for row in fit}
-    exhausted = sum(pair[RolloutArm.NO_INJECTION].exhausted for seed in paths for pair in seed)
-    result["evidence"] = compact_evidence(profile, parameters, state_dim, exhausted_windows=exhausted,
-                                          train_seed_nll=seed_nll, l1_depth_mae=estimates["l1_depth_mae"])
+    exhausted = sum(_window_exhausted(pair) for seed in paths for pair in seed)
+    evidence = compact_evidence(profile, parameters, state_dim, exhausted_windows=exhausted,
+                                train_seed_nll=seed_nll, l1_depth_mae=estimates["l1_depth_mae"])
+    evidence["paired_windows"] = len(windows)
+    evidence["paired_seed_windows"] = sum(len(seed) for seed in paths)
+    result["evidence"] = evidence
     daily_metrics = {}
     for day_number, date in enumerate(dev_dates):
         indices = slice(2 * day_number, 2 * day_number + 2)
@@ -265,7 +278,7 @@ def evaluate_symbol(
             [trial[indices] for trial in paths], [generated[i] for i in flat_indices], replay[indices],
             cfg, grid, child_times, _likelihood([nll[i] for i in flat_indices]),
         )
-        daily_exhausted = sum(pair[RolloutArm.NO_INJECTION].exhausted for seed in paths for pair in seed[indices])
+        daily_exhausted = sum(_window_exhausted(pair) for seed in paths for pair in seed[indices])
         daily_metrics[str(date)] = compact_evidence(daily_profile, parameters, state_dim,
                                                    exhausted_windows=daily_exhausted)
     result["day_metrics"] = daily_metrics

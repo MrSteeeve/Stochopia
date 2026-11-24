@@ -151,6 +151,24 @@ def test_parallel_affine_scan_accepts_complex_and_zero_time() -> None:
     assert parallel_affine_scan(gates[:, :0], inputs[:, :0]).shape == (2, 0, 3)
 
 
+@pytest.mark.parametrize("complex_gates", [False, True])
+def test_one_dimensional_diagonal_broadcasts_for_sequence_and_step(complex_gates: bool) -> None:
+    logits = torch.tensor([-1.3, 0.6, 2.0], dtype=torch.float64, requires_grad=True)
+    if complex_gates:
+        gate = complex_diagonal(logits, torch.tensor([0.3, -0.1, 1.0], dtype=logits.dtype))
+    else:
+        gate = real_diagonal(logits)
+    inputs = torch.arange(1, 31).reshape(2, 5, 3).to(gate.dtype) / 15
+    h0 = gate.new_full((2, 3), 0.25)
+    scanned = parallel_affine_scan(gate, inputs, h0, chunk_size=2)
+    expected = _loop_scan(gate.expand_as(inputs), inputs, h0)
+    torch.testing.assert_close(scanned, expected)
+    torch.testing.assert_close(affine_scan_step(gate, inputs[:, 0], h0), expected[:, 0])
+    derivative = torch.autograd.grad(scanned.abs().square().sum(), logits, retain_graph=True)
+    expected_derivative = torch.autograd.grad(expected.abs().square().sum(), logits)
+    torch.testing.assert_close(derivative, expected_derivative)
+
+
 class _FutureBookModel(SeedGRULOBModel):
     def sequence_context(self, observation: StepObservation) -> Tensor:
         context = super().sequence_context(observation)

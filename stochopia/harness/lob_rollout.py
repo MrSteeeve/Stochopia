@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from heapq import merge
+from operator import index
 from typing import Any
 
 import numpy as np
@@ -32,8 +33,8 @@ class RolloutTrace:
     Events are [N, 4]: elapsed ms, action, relative ticks or cancel rank, and
     requested shares. Child submissions are separate. Mid and spread are NaN
     when either side is empty. Touch shares [G, 2] are in bid, ask order.
-    ``exhausted`` records an empty side after any message, including between
-    grid marks and before same-timestamp replenishment.
+    ``exhausted`` records an empty side after any message or an early end to
+    background sampling. ``budget_exhausted`` identifies the latter case.
     """
 
     grid_ms: np.ndarray
@@ -44,6 +45,7 @@ class RolloutTrace:
     after_child_mid_ticks: np.ndarray
     child_fill_shares: np.ndarray
     exhausted: bool = False
+    budget_exhausted: bool = False
 
 
 @dataclass(frozen=True)
@@ -198,7 +200,7 @@ class _Path:
             self.tape.append(order)
         return int(last)
 
-    def trace(self, grid: np.ndarray) -> RolloutTrace:
+    def trace(self, grid: np.ndarray, *, budget_exhausted: bool = False) -> RolloutTrace:
         last = np.searchsorted(self._times, grid, side="right") - 1
         if grid[0] == 0:
             last[0] = 0  # Preserve the pre-event book even when the tape starts with a burst.
@@ -208,7 +210,7 @@ class _Path:
             grid, touch[:, 0], touch[:, 1], touch[:, 2:].astype(np.int64),
             np.array(events, dtype=np.int64).reshape(-1, 4),
             np.array(self._child_mids), np.array(self._child_fills, dtype=np.int64),
-            self._exhausted,
+            self._exhausted or budget_exhausted, budget_exhausted,
         )
 
 
@@ -242,13 +244,18 @@ def _warm(
 def _simulate(
     model: LOBWorldModel, path: _Path, hidden: State, previous: torch.Tensor, orders: Sequence[_Order],
     horizon: int, seed: int, max_events: int,
-) -> None:
+) -> bool:
+    """Sample at most max_events, then complete the scheduled IOC children.
+
+    Return whether the background tape hit the cap before the final grid time.
+    The grid carries the last book state forward between messages after the cap.
+    """
     hidden = deepcopy(hidden)
     generator = torch.Generator(device=previous.device).manual_seed(seed)
     child = 0
     now = 0
     own = False
-    for _ in range(max_events + len(orders) + 1):
+    while len(path.tape) < max_events:
         ticks = torch.tensor(path.prices[None, :, :10], device=previous.device)
         shares = torch.tensor(path.shares[None, :, :10], device=previous.device)
         is_own = torch.tensor([own], device=previous.device)
@@ -275,15 +282,17 @@ def _simulate(
                 generator.set_state(old_rng)
             child += 1
         elif proposal_time <= horizon:
-            if len(path.tape) == max_events:
-                raise RuntimeError("Background event budget exhausted before the rollout horizon")
             order = path.instruction(proposal_time, decoded)
             path.apply(order)
             previous = tokens
         else:
-            break
+            return False
         now = order.time_ms
         own = order.is_own
+
+    for order in orders[child:]:
+        path.apply(order)
+    return now < horizon
 
 
 @torch.inference_mode()
@@ -307,6 +316,7 @@ def rollout_paired_window(
         raise ValueError("Child orders require positive size and increasing times within the horizon")
     if context_len <= 0 or not any(a + context_len <= start_index < b for a, b in day.session_bounds):
         raise ValueError("Rollout needs a complete same-session history before its start")
+    max_events = index(max_events)
     if max_events <= 0:
         raise ValueError("Rollout needs a positive background event budget")
 
@@ -316,18 +326,19 @@ def rollout_paired_window(
         raise ValueError("Initial replay book must have two uncrossed sides")
     device = next(model.parameters(), torch.empty(0)).device
     hidden, previous = _warm(model, day, start_index, context_len, device)
-    capacity = 11 + max_events
+    # Bucket book shapes for JIT reuse while enforcing the exact event cap.
+    capacity = 1 << (10 + max_events).bit_length()
     baseline = _Path(ticks, shares, capacity)
-    _simulate(model, baseline, hidden, previous, [], int(grid[-1]), seed, max_events)
-    traces = {RolloutArm.NO_INJECTION: baseline.trace(grid)}
+    baseline_capped = _simulate(model, baseline, hidden, previous, [], int(grid[-1]), seed, max_events)
+    traces = {RolloutArm.NO_INJECTION: baseline.trace(grid, budget_exhausted=baseline_capped)}
     pairs = ((RolloutArm.BUY_VISIBLE, RolloutArm.BUY_BLIND), (RolloutArm.SELL_VISIBLE, RolloutArm.SELL_BLIND))
     for side, (visible_arm, blind_arm) in enumerate(pairs):
         orders = _children(children, child_shares, side)
         visible = _Path(ticks, shares, capacity)
-        _simulate(model, visible, hidden, previous, orders, int(grid[-1]), seed, max_events)
+        visible_capped = _simulate(model, visible, hidden, previous, orders, int(grid[-1]), seed, max_events)
         blind = _Path(ticks, shares, capacity)
         for order in merge(orders, baseline.tape, key=lambda order: order.time_ms):
             blind.apply(order)
-        traces[visible_arm] = visible.trace(grid)
-        traces[blind_arm] = blind.trace(grid)
+        traces[visible_arm] = visible.trace(grid, budget_exhausted=visible_capped)
+        traces[blind_arm] = blind.trace(grid, budget_exhausted=baseline_capped)
     return traces

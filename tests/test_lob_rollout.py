@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from importlib.util import find_spec
 from sys import version_info
 
@@ -10,6 +11,7 @@ import pytest
 import torch
 from torch import Tensor, nn
 
+from experiments.p1_m2_baseline import Window, _window_exhausted
 from experiments.p1_m2_metrics import summarize_impact
 from stochopia.data import SZSEDaySlice
 from stochopia.harness.lob_rollout import RolloutArm, RolloutTrace, _Order, _Path, _children, rollout_paired_window
@@ -37,18 +39,19 @@ def _day() -> SZSEDaySlice:
 
 
 class _ScriptedModel(LOBWorldModel):
-    def __init__(self) -> None:
+    def __init__(self, wait_bucket: int = 1) -> None:
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(1))
         self.inputs: list[StepObservation] = []
+        self.wait_bucket = wait_bucket
 
     def step_context(self, step_obs: StepObservation, state: State) -> tuple[Tensor, State]:
         self.inputs.append(step_obs)
         return step_obs.is_own[:, None], self.anchor
 
     def head_logits(self, context: Tensor, stage: int, prior: tuple[Tensor, ...]) -> Tensor:
-        # Wait 10ms and quote 100 shares at the touch. An own child switches the side.
-        fixed = (1, 1, 5, 1)
+        # Quote 100 shares at the touch. An own child switches the side.
+        fixed = (self.wait_bucket, 1, 5, 1)
         index = (~context).long() if stage == 1 else torch.full_like(context, fixed[stage], dtype=torch.long)
         logits = torch.full((len(context), BUCKET_COUNTS[stage]), -torch.inf)
         return logits.scatter(-1, index, 0.0)
@@ -178,6 +181,50 @@ def test_exhaustion_retains_a_same_timestamp_replenishment() -> None:
     trace = path.trace(np.array([0, 20]))
     assert np.isfinite(trace.mid_ticks).all()
     assert trace.exhausted
+
+
+def test_event_cap_finishes_grid_and_all_scheduled_ioc_children() -> None:
+    day = _day()
+    model = _ScriptedModel(wait_bucket=0)
+    grid = (0, 10, 20, 30, 40)
+
+    def run() -> dict[RolloutArm, RolloutTrace]:
+        return rollout_paired_window(model, day, 2, child_times_ms=(20, 30), child_shares=90,
+                                     grid_ms=grid, seed=1, context_len=2, max_events=1)
+
+    if version_info >= (3, 13) and find_spec("jaxlob") is None:
+        with pytest.raises(ImportError, match="requires the harness-lob extra"):
+            run()
+        return
+
+    traces = run()
+    baseline = traces[RolloutArm.NO_INJECTION]
+    for arm, trace in traces.items():
+        assert trace.exhausted and trace.budget_exhausted
+        np.testing.assert_array_equal(trace.events, [[0, 1, 0, 100]])
+        np.testing.assert_array_equal(trace.grid_ms, grid)
+        assert trace.mid_ticks[-1] == trace.mid_ticks[-2]
+        if arm != RolloutArm.NO_INJECTION:
+            np.testing.assert_array_equal(trace.child_fill_shares, [90, 90])
+    np.testing.assert_array_equal(baseline.mid_ticks, [102.0] * len(grid))
+    assert _window_exhausted(traces)
+
+
+def test_exhaustion_count_distinguishes_book_failure_and_cap() -> None:
+    empty = np.empty(0)
+    sample = RolloutTrace(empty, empty, empty, empty, empty, empty, empty)
+    traces = {arm: sample for arm in RolloutArm}
+    assert not _window_exhausted(traces)
+    traces[RolloutArm.BUY_VISIBLE] = replace(sample, exhausted=True)
+    assert not _window_exhausted(traces)
+    traces[RolloutArm.BUY_VISIBLE] = replace(sample, exhausted=True, budget_exhausted=True)
+    assert _window_exhausted(traces)
+
+
+def test_event_cap_scales_with_historical_window() -> None:
+    data = encode_day(_day())
+    assert Window(data, 0, 30, 730).max_events == 6_000
+    assert Window(data, 0, 30, 930).max_events == 7_200
 
 
 def test_rollout_rejects_a_crossed_initial_book() -> None:

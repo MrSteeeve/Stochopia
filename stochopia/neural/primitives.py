@@ -11,22 +11,27 @@ from .lob_interface import BUCKET_COUNTS, IS_OWN_FEATURE_INDEX, LOBWorldModel, S
 
 
 def affine_scan_step(gate_t: Tensor, input_t: Tensor, h_prev: Tensor) -> Tensor:
-    """One diagonal affine transition h[t] = gate[t] * h[t-1] + input[t]."""
+    """Return h[t] = gate[t] * h[t-1] + input[t], broadcasting gates [C]."""
+    if gate_t.shape == input_t.shape[-1:]:
+        gate_t = gate_t.expand_as(input_t)
     return gate_t * h_prev + input_t
 
 
 def parallel_affine_scan(gates: Tensor, inputs: Tensor, h0: Tensor | None = None,
                          chunk_size: int = 32) -> Tensor:
-    """Scan [batch, time, channels] real or complex diagonal affine transitions.
+    """Scan [B, T, C] real or complex diagonal affine transitions.
 
+    Inputs and outputs are [B, T, C], gates are [B, T, C] or [C], and h0 is [B, C].
     Parallel prefixes within a chunk compose (g, x) without division by decay
     products. Only the final state is carried between chunks. With time zero,
     the output is empty. Without h0, the initial state is zero for every batch.
     """
     if chunk_size < 1:
         raise ValueError("chunk_size must be positive")
+    if gates.shape == inputs.shape[-1:]:
+        gates = gates.expand_as(inputs)
     if gates.shape != inputs.shape or inputs.ndim != 3:
-        raise ValueError("gates and inputs must have the same [batch, time, channels] shape")
+        raise ValueError("gates and inputs must have the same [batch, time, channels] shape or gates must be [channels]")
     if inputs.size(1) == 0:
         return inputs
 

@@ -112,6 +112,47 @@ class MarketClusters:
                     values[i] = value
         return samples
 
+    def day_support(self, metric: str) -> np.ndarray:
+        """Return [day] support for the physical terms underlying a pooled metric.
+
+        Individual dates can support the impact score even though C2 eligibility
+        and the score itself are estimated only on a pooled panel. Response
+        ratios need a finite path and positive denominator on a supported day.
+        Tape-exponent gaps need at least three positive finite lags in each tape.
+        """
+        day_children = self.paths["child_visible"]
+        if metric == "impact_exponent_gap":
+            return np.isfinite(day_children).all(axis=(1, 2))
+        if metric in ("lob_impact_score", "end_over_peak_ratio", "visible_over_blind_ratio"):
+            peak = (day_children[:, 0, -1] - day_children[:, 1, -1]) / 2
+            if metric == "visible_over_blind_ratio":
+                blind = self.paths["child_blind"]
+                blind_peak = (blind[:, 0, -1] - blind[:, 1, -1]) / 2
+                return np.isfinite(peak) & np.isfinite(blind_peak) & (blind_peak > 0)
+            last = int(np.flatnonzero(self.schedule)[-1])
+            post = np.isfinite(self.paths["visible_mid"][:, :, last:]).all(axis=(1, 2))
+            recovery = np.isfinite(peak) & (peak > 0) & post
+            if metric == "end_over_peak_ratio":
+                return recovery
+            fills = _finite_mean(self.paths["child_filled"].sum(axis=-1), axis=1)
+            drift = np.isfinite(self.generated["drift_ticks"]).any(axis=1)
+            complete_execution = np.isfinite(day_children).all(axis=(1, 2))
+            return recovery & complete_execution & (fills > 0) & drift
+        if metric in ("trade_sign_acf_exp_gap", "hurst_gap"):
+            field = "flow_acf" if metric == "trade_sign_acf_exp_gap" else "price_msd"
+            generated = _finite_mean(self.generated[field], axis=1)
+            historical = _finite_mean(self.historical[field], axis=1)
+            return ((generated > 0).sum(axis=1) >= 3) & ((historical > 0).sum(axis=1) >= 3)
+        if metric == "event_count_rel_gap":
+            generated = _finite_mean(self.generated["events"], axis=1)
+            historical = _finite_mean(self.historical["events"], axis=1)
+            return np.isfinite(generated) & (historical > 0)
+        if metric == "free_abs_drift_ticks":
+            return np.isfinite(self.generated["drift_ticks"]).any(axis=1)
+        if metric == "l1_depth_mae":
+            return np.zeros(self.days, dtype=bool) if self.depth_errors is None else np.isfinite(self.depth_errors)
+        raise ValueError(f"unknown pooled market metric {metric}")
+
     def score_support(self, dates: tuple[int, ...], samples: np.ndarray) -> dict[str, object]:
         """Identify missing original day marks and undefined composite draws.
 
