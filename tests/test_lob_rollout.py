@@ -12,8 +12,10 @@ from torch import Tensor, nn
 
 from experiments.p1_m2_metrics import summarize_impact
 from stochopia.data import SZSEDaySlice
-from stochopia.harness.lob_rollout import RolloutArm, RolloutTrace, _Order, _Path, rollout_paired_window
-from stochopia.neural.lob_interface import BUCKET_COUNTS, LOBWorldModel, State, StepObservation, StepSampler
+from stochopia.harness.lob_rollout import RolloutArm, RolloutTrace, _Order, _Path, _children, rollout_paired_window
+from stochopia.neural.lob_interface import BUCKET_COUNTS, FiveTupleLogits, LOBBatch, LOBWorldModel, State, StepObservation, StepSampler
+from stochopia.neural.lob_training import FitProtocol, encode_day, fit_lob_world_model
+from stochopia.neural.primitives import SeedGRULOBModel
 
 
 def _day() -> SZSEDaySlice:
@@ -120,6 +122,41 @@ def test_cancellation_at_price_can_span_fifo_orders_and_clips_to_depth() -> None
     trace = path.trace(np.array([0, 10, 20, 30]))
     np.testing.assert_array_equal(trace.touch_shares[:, 1], [60, 130, 30, 75])
     np.testing.assert_array_equal(trace.mid_ticks, [102, 102, 102, 102.5])
+
+
+@pytest.mark.parametrize(("side", "filled"), [(0, 225), (1, 210)])
+def test_ioc_child_discards_all_residue_when_opposite_book_is_empty(side: int, filled: int) -> None:
+    day = _day()
+    if version_info >= (3, 13) and find_spec("jaxlob") is None:
+        with pytest.raises(ImportError, match="requires the harness-lob extra"):
+            _Path(day.pre_book_ticks[0], day.pre_book_shares[0], 12)
+        return
+    path = _Path(day.pre_book_ticks[0], day.pre_book_shares[0], 12)
+    path.apply(_children((10,), 500, side)[0])
+    path.apply(_children((20,), 500, side)[0])
+    np.testing.assert_array_equal(path.trace(np.array([0, 10, 20])).child_fill_shares, [filled, 0])
+    np.testing.assert_array_equal(path.prices[side, :10], day.pre_book_ticks[0, side])
+    np.testing.assert_array_equal(path.shares[side, :10], day.pre_book_shares[0, side])
+    assert not path.shares[1 - side].any()
+
+
+class _WarmupLogits(SeedGRULOBModel):
+    def forward_sequence(self, batch: LOBBatch) -> FiveTupleLogits:
+        logits = super().forward_sequence(batch)
+        dt = logits.dt.clone()
+        dt[:, 0] = torch.nan
+        return logits._replace(dt=dt)
+
+
+def test_fit_uses_burn_in_for_context_without_scoring_its_targets() -> None:
+    day = encode_day(_day())
+    protocol = FitProtocol(subseq_len=3, burn_in=1, steps=2, batch_size=1)
+    fitted = fit_lob_world_model(_WarmupLogits, [day], 103, protocol=protocol)
+    assert np.isfinite(fitted.last_nll)
+    assert not fitted.model.training
+    immediate_timeout = FitProtocol(subseq_len=3, burn_in=1, steps=2, batch_size=1, max_train_seconds=0)
+    with pytest.raises(TimeoutError, match="training budget"):
+        fit_lob_world_model(_WarmupLogits, [day], 103, protocol=immediate_timeout)
 
 
 def test_warmup_cannot_cross_a_session_boundary() -> None:

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from itertools import accumulate
-from typing import cast
+from inspect import getsource
 
 import torch
 from torch import Tensor, nn
 
-from .lob_interface import BUCKET_COUNTS, LOBWorldModel, State, StepObservation
+from .lob_interface import BUCKET_COUNTS, IS_OWN_FEATURE_INDEX, LOBWorldModel, State, StepObservation
 
 
 def affine_scan_step(gate_t: Tensor, input_t: Tensor, h_prev: Tensor) -> Tensor:
@@ -66,12 +65,14 @@ class SeedGRULOBModel(LOBWorldModel):
     def __init__(self, state_dim: int = 48, embedding_dim: int = 8) -> None:
         super().__init__()
         self.state_dim = state_dim
-        token_offsets = tuple(accumulate(BUCKET_COUNTS, initial=0))[:-1]
+        token_offsets = [0]
+        for count in BUCKET_COUNTS[:-1]:
+            token_offsets.append(token_offsets[-1] + count)
         self.register_buffer("token_offsets", torch.tensor(token_offsets), persistent=False)
         self.token_embed = nn.Embedding(sum(BUCKET_COUNTS), embedding_dim)
         self.input_projection = nn.Linear(43 + 4 * embedding_dim, state_dim)
         # Historical orders have no own labels. Start with no untrained flag response.
-        nn.init.zeros_(self.input_projection.weight[:, 42])
+        nn.init.zeros_(self.input_projection.weight[:, IS_OWN_FEATURE_INDEX])
         self.gru = nn.GRU(state_dim, state_dim, batch_first=True)
         self.heads = nn.ModuleList(
             nn.Linear(state_dim + stage * embedding_dim, count)
@@ -103,7 +104,7 @@ class SeedGRULOBModel(LOBWorldModel):
         return out
 
     def step_context(self, observation: StepObservation, state: State) -> tuple[Tensor, Tensor]:
-        prior = None if state is None else cast(Tensor, state).unsqueeze(0)
+        prior = None if state is None else state.unsqueeze(0)
         out, hidden = self.gru(self._features(observation).unsqueeze(1), prior)
         return out[:, 0], hidden[0]
 
@@ -113,3 +114,17 @@ class SeedGRULOBModel(LOBWorldModel):
             prefix = self.token_embed(tokens).flatten(-2)
             context = torch.cat((context, prefix), dim=-1)
         return self.heads[stage](context)
+
+
+def seed_lob_source() -> str:
+    """Export the exact trusted seed implementation using the candidate entry point."""
+    imports = (
+        "from __future__ import annotations\n"
+        "import torch\n"
+        "from torch import Tensor, nn\n"
+        "from stochopia.neural.lob_interface import (\n"
+        "    BUCKET_COUNTS, IS_OWN_FEATURE_INDEX, LOBWorldModel, State, StepObservation,\n"
+        ")\n\n\n"
+    )
+    source = getsource(SeedGRULOBModel)
+    return imports + source.replace("class SeedGRULOBModel(", "class CandidateLOBWorldModel(", 1)

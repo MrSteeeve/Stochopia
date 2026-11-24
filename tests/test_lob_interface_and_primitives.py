@@ -180,7 +180,7 @@ class _LargeStateModel(SeedGRULOBModel):
     def forward_step(self, step_obs: StepObservation, hidden_state: State = None) -> tuple[StepSampler, State]:
         state = hidden_state[0] if isinstance(hidden_state, tuple) else hidden_state
         sampler, state = super().forward_step(step_obs, state)
-        return sampler, (state, sampler.context.new_zeros(1, 32))
+        return sampler, (state, torch.zeros(1, 41, dtype=torch.complex64, device=sampler.context.device))
 
 
 @pytest.mark.parametrize("model_type", [_FutureBookModel, _FutureTargetModel, _WrongStepModel])
@@ -191,9 +191,10 @@ def test_contract_rejects_future_or_inconsistent_conditional_heads(model_type: t
 
 def test_contract_checks_learnable_parameters_and_actual_state() -> None:
     model = SeedGRULOBModel()
-    verify_world_model_contract(model)
+    parameters, state_dim = verify_world_model_contract(model)
+    assert state_dim == 48
     assert model.training
-    model.extra = nn.Parameter(torch.zeros(20_000))
+    model.extra = nn.Parameter(torch.zeros(28_001 - parameters))
     with pytest.raises(ValueError, match="max_params"):
         verify_world_model_contract(model)
     with pytest.raises(ValueError, match="max_state_dim"):

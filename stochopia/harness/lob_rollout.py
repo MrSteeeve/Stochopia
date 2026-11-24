@@ -120,6 +120,7 @@ def _matching_functions() -> tuple[Any, Any, Any]:
             "price": price, "quantity": unfilled, "orderid": order_id,
             "traderid": order_id, "time": seconds, "time_ns": nanos,
         }
+        # A child only consumes existing depth. Discard IOC residue at either price bound.
         rests = (cancel == 0) & (ioc == 0) & (unfilled > 0)
         own = jax.lax.cond(rests, lambda rows: engine.add_order(rows, resting), lambda rows: rows, own)
         return (jax.lax.select(cancel != 0, updated, own),

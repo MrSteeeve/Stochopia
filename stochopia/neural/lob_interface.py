@@ -14,6 +14,9 @@ _LOT_UPPER = (99, 100, 200, 300, 400, 500, 800, 1200, 2000, 5000, 10000)
 _LOT_SHARES = (50, 100, 200, 300, 400, 500, 700, 1000, 1600, 3500, 7500, 15000)
 DT_BINS, ACTION_BINS, REL_TICK_BINS, LOT_BINS = 16, 6, 26, 12
 BUCKET_COUNTS = (DT_BINS, ACTION_BINS, REL_TICK_BINS, LOT_BINS)
+IS_OWN_FEATURE_INDEX = 42  # 40 book features, then spread and imbalance.
+MAX_WORLD_MODEL_PARAMS = 28_000
+MAX_WORLD_MODEL_STATE = 128
 State = Tensor | tuple[Tensor, ...] | None
 
 
@@ -206,9 +209,12 @@ def _probe(device: torch.device, seed: int) -> LOBBatch:
 
 
 @torch.no_grad()
-def verify_world_model_contract(model: LOBWorldModel, *, max_params: int = 32_768, max_state_dim: int = 64) -> None:
-    """Check budget, prefix invariance and step/sequence equality on a seeded probe."""
-    if sum(p.numel() for p in model.parameters() if p.requires_grad) > max_params:
+def verify_world_model_contract(
+    model: LOBWorldModel, *, max_params: int = MAX_WORLD_MODEL_PARAMS, max_state_dim: int = MAX_WORLD_MODEL_STATE,
+) -> tuple[int, int]:
+    """Check prefix and step equivalence, then return parameters and largest scalar state."""
+    parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if parameters > max_params:
         raise ValueError("model exceeds max_params")
     device = next(model.parameters(), torch.empty(0)).device
     batch = _probe(device, 291)
@@ -237,10 +243,12 @@ def verify_world_model_contract(model: LOBWorldModel, *, max_params: int = 32_76
             raise ValueError("non-finite likelihood for a legal event")
 
         state = None
+        largest_state = 0
         for t in range(targets.size(1)):
             sampler, state = model.forward_step(obs.at((slice(None), t)), state)
             leaves = state if isinstance(state, tuple) else (state,)
             size = sum(x.numel() * (2 if x.is_complex() else 1) for x in leaves if x is not None)
+            largest_state = max(largest_state, size)
             if size > max_state_dim:
                 raise ValueError("model exceeds max_state_dim")
             torch.testing.assert_close(sampler.context, context[:, t], rtol=0, atol=1e-5)
@@ -248,3 +256,4 @@ def verify_world_model_contract(model: LOBWorldModel, *, max_params: int = 32_76
                 torch.testing.assert_close(step, seq[:, t], rtol=0, atol=1e-5)
     finally:
         model.train(training)
+    return parameters, largest_state
