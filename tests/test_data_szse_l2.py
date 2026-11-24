@@ -1,6 +1,7 @@
 """Wind three-table fixtures with hand-calculated book and event expectations."""
 
 from collections.abc import Sequence
+from dataclasses import fields
 from pathlib import Path
 
 import numpy as np
@@ -10,8 +11,10 @@ import pytest
 
 from stochopia.data import (
     ACTION_TYPES,
+    load_day_slice,
     parse_wind_time_ms,
     reconstruct_szse_day,
+    save_day_slice,
     validate_chronological_splits,
 )
 
@@ -174,6 +177,53 @@ def test_replays_an_entire_day_without_counting_fills_as_events(one_day: Path) -
     assert checks.n_snapshots == 3
     assert checks.touch_match_rate == 1.0
     assert checks.top5_log_vol_mae == checks.top10_log_vol_mae == 0.0
+    assert np.isnan(checks.vol_aligned_touch_match_rate)
+    assert checks.n_volume_aligned_snapshots == 0
+
+
+def test_volume_alignment_uses_first_fill_reaching_each_waterline(tmp_path: Path) -> None:
+    _write(tmp_path / ORDER_TABLE, [
+        _order(1, 91_500_000, "B", 998, 500),
+        _order(2, 91_500_000, "S", 1000, 300),
+        _order(3, 91_500_000, "S", 1001, 900),
+        _order(4, 92_500_000, "B", 1000, 100),
+        _order(6, 93_000_010, "B", 1000, 200),
+        _order(9, 93_000_015, "B", 999, 100),
+    ])
+    _write(tmp_path / TRADE_TABLE, [
+        _trade(5, 92_500_000, 4, 2, 1000, 100),
+        _trade(7, 93_000_010, 6, 2, 1000, 200),
+        _trade(8, 93_000_012, 1, 0, 0, 100, "C"),
+    ])
+    _write(tmp_path / QUOTE_TABLE, [
+        {**_quote(93_000_020, [(998, 500)], [(1001, 900)]), "cum_volume": 300},
+        {**_quote(93_000_030, [(999, 100), (998, 400)], [(1001, 900)]), "cum_volume": 300},
+        {**_quote(93_000_040, [(999, 100), (998, 400)], [(1001, 900)]), "cum_volume": 250},
+    ])
+
+    _, checks = reconstruct_szse_day(tmp_path, CODE)
+    assert checks is not None
+    assert checks.n_snapshots == 3
+    assert checks.touch_match_rate == pytest.approx(2 / 3)
+    assert checks.n_volume_aligned_snapshots == 2
+    assert checks.vol_aligned_touch_match_rate == 0.5
+
+
+def test_npz_cache_preserves_the_day_without_pickling(one_day: Path) -> None:
+    source, _ = reconstruct_szse_day(one_day, CODE)
+    path = one_day / "cache" / f"{CODE}.npz"
+    save_day_slice(path, source)
+    restored = load_day_slice(path)
+
+    for field in fields(source):
+        expected = getattr(source, field.name)
+        value = getattr(restored, field.name)
+        if isinstance(expected, np.ndarray):
+            assert value.dtype == expected.dtype
+            assert not value.flags.writeable
+            np.testing.assert_array_equal(value, expected)
+        else:
+            assert value == expected
 
 
 def test_special_orders_keep_automatic_and_external_cancels_distinct(tmp_path: Path) -> None:

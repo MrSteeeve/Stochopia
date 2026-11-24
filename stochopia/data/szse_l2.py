@@ -63,6 +63,8 @@ class BookReconciliation:
     top5_log_vol_mae: float
     top10_log_vol_mae: float
     max_deviation_time_ms: int | None = None
+    vol_aligned_touch_match_rate: float = np.nan
+    n_volume_aligned_snapshots: int = 0
 
 
 def parse_wind_time_ms(hhmmssmmm: int | np.ndarray) -> int | np.ndarray:
@@ -91,11 +93,14 @@ def validate_chronological_splits(
 
 # --- Parquet input and message ordering ---
 
-def _read(path: Path, wind_code: str, fields: tuple[str, ...]) -> pa.Table:
+def _read(path: Path, wind_code: str, fields: tuple[str, ...], *, waterline: bool = False) -> pa.Table:
     columns = ["wind_code", "date", "time", *fields]
-    missing = set(columns) - set(pq.read_schema(path).names)
+    names = set(pq.read_schema(path).names)
+    missing = set(columns) - names
     if missing:
         raise ValueError(f"{path.name} missing required columns: {', '.join(sorted(missing))}")
+    if waterline and "cum_volume" in names:
+        columns.append("cum_volume")
     return pq.read_table(path, columns=columns, filters=[("wind_code", "==", wind_code)])
 
 
@@ -126,7 +131,7 @@ def _messages(orders: pa.Table, trades: pa.Table) -> np.ndarray:
     return packed[np.lexsort((packed["seq"], packed["ms"]))]
 
 
-def _quote_books(quotes: pa.Table, times: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _quote_books(quotes: pa.Table, times: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     order = np.argsort(times, kind="stable")
     sorted_times = times[order]
     keep = np.r_[sorted_times[:-1] != sorted_times[1:], True]
@@ -140,7 +145,11 @@ def _quote_books(quotes: pa.Table, times: np.ndarray) -> tuple[np.ndarray, np.nd
     shares = shares.reshape(-1, 2, 10).astype(np.int64)
     valid = (prices[:, :, 0] > 0).all(axis=1)
     shares[prices <= 0] = 0
-    return times[order][valid], prices[valid], shares[valid]
+    selected = order[valid]
+    volumes = np.zeros(len(selected), dtype=np.int64)
+    if "cum_volume" in quotes.column_names:
+        volumes = _numbers(quotes, "cum_volume")[selected].astype(np.int64)
+    return times[selected], prices[valid], shares[valid], volumes
 
 
 # --- Book replay ---
@@ -199,7 +208,10 @@ def _arrival(
     ms, seq, kind, side, price, size, _, _ = row
     direction = 1 if side == 0 else -1
     opposite = touch[1 - side]
-    filled = canceled = furthest = 0
+    filled = 0
+    canceled = 0
+    furthest = 0
+
     # Attribute only adjacent same-time outcomes that actually reference this arrival.
     for time, outcome, code, _, execution_price, qty, bid, ask in following:
         if time != ms or code not in ("0", "C"):
@@ -213,6 +225,7 @@ def _arrival(
         elif kind not in ("L", "U"):
             canceled += int(qty)
             auto_cancels.add(int(outcome))
+
     resting = int(size) - filled - canceled
     if price <= 0:
         if kind == "U":
@@ -229,6 +242,7 @@ def _arrival(
 def _reconciliation(
     times: np.ndarray, actual_prices: np.ndarray, actual_depth: np.ndarray,
     replay_prices: np.ndarray, replay_depth: np.ndarray,
+    volumes: np.ndarray, waterline_books: dict[int, tuple[int, int]],
 ) -> BookReconciliation:
     """For [snapshot, side, level], mean absolute log(1+shares) difference and its worst row."""
     if not len(times):
@@ -236,8 +250,13 @@ def _reconciliation(
     touch = (actual_prices[:, :, 0] == replay_prices[:, :, 0]).all(axis=1)
     error = np.abs(np.log1p(actual_depth) - np.log1p(replay_depth))
     worst = int(times[error.mean(axis=(1, 2)).argmax()])
+    # A plateau may contain quote changes between fills. Compare to the first
+    # post-fill touch reaching the exact positive volume, without fitting a lag.
+    matches = [tuple(px) == waterline_books[v] for v, px in zip(volumes, actual_prices[:, :, 0])
+               if v in waterline_books]
     return BookReconciliation(
         len(times), float(touch.mean()), float(error[:, :, :5].mean()), float(error.mean()), worst,
+        float(np.mean(matches)) if matches else np.nan, len(matches),
     )
 
 
@@ -248,7 +267,7 @@ def reconstruct_szse_day(
     if not wind_code.endswith(".SZ"):
         raise ValueError("Expected a Shenzhen stock code ending in .SZ")
     quote_fields = ("prev_close", *_QUOTE_COLUMNS) if reconcile else ("prev_close",)
-    quotes = _read(day_dir / "行情.parquet", wind_code, quote_fields)
+    quotes = _read(day_dir / "行情.parquet", wind_code, quote_fields, waterline=reconcile)
     orders = _read(day_dir / "逐笔委托.parquet", wind_code, _ORDER_COLUMNS)
     trades = _read(day_dir / "逐笔成交.parquet", wind_code, _TRADE_COLUMNS)
     if not len(quotes):
@@ -256,33 +275,52 @@ def reconstruct_szse_day(
     date = quotes["date"][0].as_py()
     if any(np.any(table["date"].to_numpy() != date) for table in (quotes, orders, trades)):
         raise ValueError(f"Tables in {day_dir} must describe the same trading date")
+
     quote_times = np.asarray(parse_wind_time_ms(quotes["time"].to_numpy()))
     prev_close = int(_ticks(_numbers(quotes, "prev_close"))[len(quotes) - 1 - quote_times[::-1].argmax()])
     if reconcile:
-        times, actual_px, actual_qty = _quote_books(quotes, quote_times)
+        times, actual_px, actual_qty, volumes = _quote_books(quotes, quote_times)
     else:
-        times, actual_px, actual_qty = np.empty(0), np.empty((0, 2, 10)), np.empty((0, 2, 10))
-    replay_px, replay_qty = np.zeros_like(actual_px), np.zeros_like(actual_qty)
+        times = np.empty(0, dtype=np.int64)
+        volumes = np.empty(0, dtype=np.int64)
+        actual_px = np.empty((0, 2, 10), dtype=np.int64)
+        actual_qty = np.empty((0, 2, 10), dtype=np.int64)
+    replay_px = np.zeros_like(actual_px)
+    replay_qty = np.zeros_like(actual_qty)
+    requested_volumes = {int(v) for v in volumes if v > 0}
+    waterline_books: dict[int, tuple[int, int]] = {}
+
     messages = _messages(orders, trades)
     events = np.empty(np.count_nonzero(messages["kind"] != "0"), dtype=_EVENT)
     prices = np.zeros((len(events), 2, 10), dtype=np.int32)
     depth = np.zeros_like(prices, dtype=np.int64)
-    book, auto_cancels = _Book(), set()
-    counts, previous = [0, 0], [0, 0]
-    n = q = 0
+    book = _Book()
+    auto_cancels: set[int] = set()
+    counts = [0, 0]
+    previous = [0, 0]
+    cumulative_volume = 0
+    n = 0
+    q = 0
     for index, row in enumerate(messages):
         ms, seq, kind, side, _, size, bid, ask = row
         while q < len(times) and times[q] < ms:
             book.write_top(replay_px[q], replay_qty[q])
             q += 1
+
         if kind == "0":
             book.reduce(int(bid), int(size))
             book.reduce(int(ask), int(size))
+            cumulative_volume += abs(int(size))
+            if cumulative_volume in requested_volumes:
+                waterline_books[cumulative_volume] = book.touch()
+                requested_volumes.remove(cumulative_volume)
             continue
         if kind == "?":
             continue
+
         touch = book.touch()
-        age, action = 0, -1
+        age = 0
+        action = -1
         if kind == "C":
             order_id = int(bid or ask)
             order = book.orders.get(order_id)
@@ -290,15 +328,19 @@ def reconstruct_szse_day(
                 side, price, remaining, submit = order
                 size = min(int(size), remaining)
                 offset = max(0, (touch[side] - price) * (1 if side == 0 else -1))
-                age, action = int(ms) - submit, 4 + side
+                age = int(ms) - submit
+                action = 4 + side
         else:
             price, action, offset = _arrival(row, messages[index + 1:], touch, auto_cancels)
+
         for session, (start, end) in enumerate(_SESSIONS):
             if start <= ms < end and min(touch) > 0 and action >= 0 and size > 0:
                 dt = int(ms) - previous[session] if counts[session] else 0
                 events[n] = (ms, seq, dt, action, offset, size, age)
                 book.write_top(prices[n], depth[n])
-                previous[session], counts[session], n = int(ms), counts[session] + 1, n + 1
+                previous[session] = int(ms)
+                counts[session] += 1
+                n += 1
         if kind == "C":
             book.reduce(order_id, int(size))
         else:
@@ -306,8 +348,12 @@ def reconstruct_szse_day(
     while q < len(times):
         book.write_top(replay_px[q], replay_qty[q])
         q += 1
-    report = _reconciliation(times, actual_px, actual_qty, replay_px, replay_qty) if reconcile else None
-    prices, depth = prices[:n].copy(), depth[:n].copy()
+    report = None
+    if reconcile:
+        report = _reconciliation(times, actual_px, actual_qty, replay_px, replay_qty, volumes, waterline_books)
+
+    prices = prices[:n].copy()
+    depth = depth[:n].copy()
     arrays = {name: events[name][:n].copy() for name in events.dtype.names}
     arrays.update(
         pre_book_ticks=prices, pre_book_shares=depth,
