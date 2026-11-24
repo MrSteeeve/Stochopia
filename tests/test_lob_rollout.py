@@ -129,6 +129,14 @@ def test_warmup_cannot_cross_a_session_boundary() -> None:
                               grid_ms=(0, 10, 20), seed=1, context_len=2)
 
 
+def test_rollout_rejects_a_crossed_initial_book() -> None:
+    day = _day()
+    day.pre_book_ticks[2, 0, 0] = 105
+    with pytest.raises(ValueError, match="two uncrossed sides"):
+        rollout_paired_window(_ScriptedModel(), day, 2, child_times_ms=(10,), child_shares=90,
+                              grid_ms=(0, 10, 20), seed=1, context_len=2)
+
+
 def test_impact_uses_common_day_support_for_paired_ratios() -> None:
     visible = np.array([[0, 1, 3, 4, 3, 3, 2], [0, 2, 6, 8, 7, 7, np.nan], [0, 1, 2, np.nan, 3, 3, 2]])
     blind = np.array([[0, 1, 1, 1, 1, 1, 1], [0, 1, 1, np.nan, 1, 1, 1], [0, 4, 6, 10, 10, 9, 9]])
@@ -146,4 +154,21 @@ def test_impact_uses_common_day_support_for_paired_ratios() -> None:
     assert result["days_with_complete_recovery"] == 1
     assert result["score"]["visible_to_blind_ratio"] == 4.0
     assert result["measurements"]["end_over_peak"] == 0.5
+    assert type(result["measurements"]["y"]) is float
     assert result["measurements"]["y"] == 1.2
+
+
+def test_exact_threefold_peak_ratio_passes_on_the_tick_grid() -> None:
+    visible = np.zeros((12, 2, 7))
+    blind = np.zeros_like(visible)
+    visible[0, 0, 3] = 0.25
+    blind[0, 0, 3] = 1 / 12
+    tape = {"gamma_flow": None, "hurst": None, "drift_ticks": 0.0}
+    result = summarize_impact(
+        visible_mid=visible, blind_mid=blind, child_visible=visible[:, :, 1:4],
+        child_blind=blind[:, :, 1:4], child_filled=np.ones((12, 2, 3)), sigma_ticks=1, daily_shares=10,
+        schedule=np.array([False, True, True, True, False, False, False]), generated=tape, replay=tape,
+        paths_per_day=6,
+    )
+    assert result["score"]["visible_to_blind_ratio"] == 3.0
+    assert result["score"]["claims"]["C3"]["status"] == "pass"

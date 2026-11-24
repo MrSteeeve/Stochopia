@@ -305,6 +305,8 @@ def rollout_paired_window(
 
     ticks = day.pre_book_ticks[start_index]
     shares = day.pre_book_shares[start_index]
+    if not 0 < ticks[0, 0] < ticks[1, 0]:
+        raise ValueError("Initial replay book must have two uncrossed sides")
     device = next(model.parameters(), torch.empty(0)).device
     hidden, previous = _warm(model, day, start_index, context_len, device)
     capacity = 11 + max_events

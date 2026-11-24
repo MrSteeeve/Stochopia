@@ -91,7 +91,7 @@ def aggregate_tapes(rows: list[TapeStats]) -> dict[str, object]:
 def summarize_impact(
     *, visible_mid: np.ndarray, blind_mid: np.ndarray, child_visible: np.ndarray,
     child_blind: np.ndarray, child_filled: np.ndarray, sigma_ticks: float, daily_shares: float,
-    schedule: np.ndarray, generated: dict[str, object], replay: dict[str, object],
+    schedule: np.ndarray, generated: dict[str, object], replay: dict[str, object], paths_per_day: int = 1,
 ) -> dict[str, object]:
     """Re-use the LOB-Impact scorer on day-clustered buy/sell paths.
 
@@ -113,9 +113,16 @@ def summarize_impact(
     peak = float(_finite_mean(execution_visible[peak_days, -1]))
     visible_peak = float(_finite_mean(execution_visible[paired_days, -1]))
     blind_peak = float(_finite_mean(execution_blind[paired_days, -1]))
+
+    # Convert means back to sums in quarter ticks before forming the ratio.
+    # Each signed buy/sell difference uses half-tick mids and a factor of 1/2.
+    unit = 4 * paths_per_day
+    visible_sum = int(np.rint(execution_visible[paired_days, -1] * unit).sum())
+    blind_sum = int(np.rint(execution_blind[paired_days, -1] * unit).sum())
+    peak_ratio = visible_sum / blind_sum if blind_sum > 0 else None
     traded = float(_finite_mean(child_filled[peak_days].sum(axis=-1)))
     denominator = sigma_ticks * np.sqrt(traded / daily_shares) if daily_shares > 0 else 0
-    y = peak / denominator if denominator > 0 and np.isfinite(peak) else None
+    y = float(peak / denominator) if denominator > 0 and np.isfinite(peak) else None
 
     visible_mean = _finite_mean(visible, axis=0)
     last_child = int(np.flatnonzero(schedule)[-1])
@@ -138,7 +145,7 @@ def summarize_impact(
         end_over_peak=rec.end_over_peak if rec else None,
         relaxation_slope=rec.slope if rec else None,
         law_identified=law.identified if law is not None else None, peak_interval_ticks=ci,
-        visible_peak_ticks=visible_peak, blind_peak_ticks=blind_peak,
+        visible_to_blind_ratio=peak_ratio,
         gamma_flow=generated["gamma_flow"], hurst=generated["hurst"], idle_drift_ticks=generated["drift_ticks"],
     )
     reference = ImpactReference(
@@ -150,6 +157,7 @@ def summarize_impact(
         "paired_days": n_days, "days_with_complete_execution_marks": int(whole_days.sum()),
         "days_with_visible_last_child": int(peak_days.sum()), "days_with_paired_last_child": int(paired_days.sum()),
         "days_with_complete_recovery": int(recovery_days.sum()), "visible_peak_for_amplitude_ticks": peak,
+        "paired_visible_peak_ticks": visible_peak, "paired_blind_peak_ticks": blind_peak,
         "visible_curve_ticks": visible_mean.tolist(), "blind_curve_ticks": _finite_mean(blind, axis=0).tolist(),
         "visible_child_ticks": _finite_mean(execution_visible, axis=0).tolist(),
         "blind_child_ticks": _finite_mean(execution_blind, axis=0).tolist(),

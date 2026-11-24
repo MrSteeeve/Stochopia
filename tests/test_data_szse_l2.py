@@ -226,15 +226,18 @@ def test_npz_cache_preserves_the_day_without_pickling(one_day: Path) -> None:
             assert value == expected
 
 
-def test_special_orders_keep_automatic_and_external_cancels_distinct(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("market_raw_ticks", "own_best_raw_ticks"), [(0, 0), (1_300, 1_200)])
+def test_special_orders_keep_automatic_and_external_cancels_distinct(
+    tmp_path: Path, market_raw_ticks: int, own_best_raw_ticks: int,
+) -> None:
     orders = [
         _order(1, 91_500_000, "B", 998, 500),
         _order(2, 91_500_000, "S", 1000, 200),
         _order(3, 91_500_000, "S", 1002, 250),
         _order(4, 91_500_000, "S", 1004, 250),
         _order(5, 91_500_000, "S", 1006, 400),
-        _order(6, 93_000_010, "B", 0, 300, "1"),
-        _order(8, 93_000_020, "S", 0, 50, "U"),
+        _order(6, 93_000_010, "B", market_raw_ticks, 300, "1"),
+        _order(8, 93_000_020, "S", own_best_raw_ticks, 50, "U"),
         _order(9, 93_000_030, "B", 0, 600, "3"),
         _order(16, 93_000_050, "B", 999, 15),
         _order(17, 93_000_060, "S", 1003, 250),
@@ -291,6 +294,31 @@ def test_reconciliation_reports_volume_error_by_book_depth(one_day: Path) -> Non
     assert checks.top5_log_vol_mae == 0.0
     assert checks.top10_log_vol_mae == pytest.approx(np.log1p(3) / (3 * 2 * 10))
     assert checks.max_deviation_time_ms == 34_200_020
+
+
+def test_market_residual_uses_last_immediate_fill_after_sweeping_multiple_levels(tmp_path: Path) -> None:
+    _write(tmp_path / ORDER_TABLE, [
+        _order(1, 91_500_000, "B", 998, 500),
+        _order(2, 91_500_000, "S", 1000, 200),
+        _order(3, 91_500_000, "S", 1002, 200),
+        _order(4, 91_500_000, "S", 1004, 200),
+        _order(5, 93_000_010, "B", 1200, 500, "1"),
+    ])
+    _write(tmp_path / TRADE_TABLE, [
+        _trade(6, 93_000_010, 5, 2, 1000, 200),
+        _trade(7, 93_000_010, 5, 3, 1002, 200),
+        _trade(8, 93_000_020, 5, 0, 0, 40, "C"),
+    ])
+    _write(tmp_path / QUOTE_TABLE, [_quote(93_000_020, [(1002, 60), (998, 500)], [(1004, 200)])])
+
+    day, report = reconstruct_szse_day(tmp_path, CODE)
+    np.testing.assert_array_equal(day.action_type, [2, 4])
+    np.testing.assert_array_equal(day.rel_ticks, [2, 0])
+    assert day.pre_book_ticks[1, 0, 0] == 1002
+    assert day.pre_book_shares[1, 0, 0] == 100
+    assert report is not None
+    assert report.touch_match_rate == 1.0
+    assert report.top10_log_vol_mae == 0.0
 
 
 def test_book_keeps_deep_levels_and_promotes_the_eleventh_level(tmp_path: Path) -> None:

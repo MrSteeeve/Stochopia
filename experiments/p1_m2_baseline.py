@@ -273,6 +273,7 @@ def _summarize_paths(paths: list[list[dict[RolloutArm, RolloutTrace]]], generate
         child_blind=paired(blind, "after_child_mid_ticks", relative=True),
         child_filled=paired(visible, "child_fill_shares"), sigma_ticks=float(cfg["sigma_ticks"]),
         daily_shares=float(cfg["daily_shares"]), schedule=np.isin(grid, children), generated=simulated, replay=actual,
+        paths_per_day=2 * len(paths),
     )
     impact["visible_fill_fraction"] = float(impact["average_filled_shares"]) / (len(children) * cfg["child_shares"])
     return ResidualProfile(scores[0], scores[1], simulated, actual, impact)

@@ -227,11 +227,14 @@ def _arrival(
             auto_cancels.add(int(outcome))
 
     resting = int(size) - filled - canceled
-    if price <= 0:
-        if kind == "U":
-            price = touch[side]
-        else:
-            price = opposite if kind == "1" else furthest
+    if kind == "U":
+        # Shenzhen own-best orders join the current touch; Wind may report a price limit.
+        price = touch[side]
+    elif kind == "1":
+        # A market residual can become a limit at the deepest immediately executed price.
+        price = furthest or opposite
+    elif price <= 0:
+        price = furthest
     if filled or (kind == "L" and price > 0 and opposite > 0 and (price - opposite) * direction >= 0):
         target = price if kind == "L" or not furthest else furthest
         return int(price), 2 + int(side), max(0, int((target - opposite) * direction))
