@@ -36,6 +36,19 @@ def _observation() -> StepObservation:
     return StepObservation(books, depth, torch.zeros(2, 4, dtype=torch.long), torch.zeros(2, dtype=torch.bool))
 
 
+@pytest.mark.parametrize("error", [AssertionError, TypeError, ValueError])
+def test_trained_model_contract_failure_is_classified(error: type[Exception], monkeypatch: pytest.MonkeyPatch) -> None:
+    from experiments import p1_m2_baseline
+
+    def rejected(model: nn.Module) -> tuple[int, int]:
+        raise error("invalid trained state")
+
+    monkeypatch.setattr(p1_m2_baseline, "verify_world_model_contract", rejected)
+    with pytest.raises(RuntimeError, match="Trained model failed tensor contract") as caught:
+        p1_m2_baseline._verify_trained_model(SeedGRULOBModel())
+    assert isinstance(caught.value.__cause__, error)
+
+
 def test_event_codes_preserve_zero_time_and_price_level_semantics() -> None:
     books = _observation().book_ticks[[0, 0, 0, 0, 0]]
     tokens = encode_events(torch.tensor([0, 1, 20, 500, 11000]),

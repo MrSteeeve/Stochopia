@@ -188,6 +188,14 @@ def _window_exhausted(traces: dict[RolloutArm, RolloutTrace]) -> bool:
     return traces[RolloutArm.NO_INJECTION].exhausted or any(trace.budget_exhausted for trace in traces.values())
 
 
+def _verify_trained_model(model: LOBWorldModel) -> tuple[int, int]:
+    """Classify a trained-weight tensor contract failure at the model boundary."""
+    try:
+        return verify_world_model_contract(model)
+    except (AssertionError, TypeError, ValueError) as exc:
+        raise RuntimeError("Trained model failed tensor contract") from exc
+
+
 def evaluate_symbol(
     root: Path, symbol: str, train_dates: list[int], dev_dates: list[int], directory: Path,
     *, factory: Callable[[], LOBWorldModel] = SeedGRULOBModel, rollout_seed: int = 12300,
@@ -233,7 +241,7 @@ def evaluate_symbol(
             model.load_state_dict(torch.load(checkpoints[seed], weights_only=True, map_location="cpu"))
             elapsed = None
             loss = None
-        parameters, state_dim = verify_world_model_contract(model)
+        parameters, state_dim = _verify_trained_model(model)
         fit.append({"seed": seed, "seconds": elapsed, "last_batch_nll": loss,
                     "params": parameters, "state_dim": state_dim})
         seed_paths = []
