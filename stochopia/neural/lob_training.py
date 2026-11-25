@@ -25,7 +25,7 @@ class FitProtocol:
     end_lr: float = 0.0001
     weight_decay: float = 0.0001
     grad_clip: float = 1.0
-    max_train_seconds: float = 60.0
+    max_train_seconds: float = 180.0
 
 
 P1_FIT_PROTOCOL = FitProtocol()
