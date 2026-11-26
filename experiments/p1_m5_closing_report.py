@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from math import isclose, isfinite
@@ -183,13 +182,89 @@ def _data_rows(artifact: Path, manifest: Json, receipt: Json) -> str:
     return _table(("股票", "划分", "重构日/注册日", "已核对事件数", "有效双边窗口/理论数", "一档同时匹配 %", "十档对数深度 MAE"), rows)
 
 
+def _month_span(months: object) -> str:
+    """Preserve the observed span and month count without enumerating the calendar."""
+    if not isinstance(months, list) or not months:
+        return "—"
+    first, last = min(months), max(months)
+    return f"{first}–{last}（{len(months)} 月）"
+
+
+def _metadata_value(value: object) -> str:
+    return str(value) if value is not None else "未知"
+
+
+def _count_list(values: object) -> str:
+    return str(len(values)) if isinstance(values, list) else "未知"
+
+
+def _membership_bounds(row: Json) -> str:
+    exact = row.get("trade_day_files")
+    if exact is not None:
+        return str(exact)
+    lower = row.get("confirmed_trade_day_files")
+    upper = row.get("possible_trade_day_files")
+    if lower is not None and upper is not None:
+        return f"{lower}–{upper}（未确定）"
+    return "未知"
+
+
 def _remote_availability(receipt: Json) -> str:
-    """Describe the listing metadata exactly; unknown stock membership is not availability."""
+    """Summarize remote metadata; preserve original date-level lists in the receipt.
+
+    The complete market-wide files are stock bundles, not individual-stock
+    evidence. Footer metadata can prove presence or absence in a limited
+    audited period, and leave a symbol unresolved in the interior range.
+    Do not infer either absence or positive-spread anchors for unknown dates.
+    """
     available = receipt.get("remote_availability")
     if not available:
         return "20170601+ 远端库存未取得可核验的元数据；不外推单股可用日。"
-    # JSON preserves exact provider listing scope, month/date counts, and unknown fields.
-    return "20170601+ 仅盘点远端元数据；不读取盘口内容，不将全市场文件数等同单股有效日：\n\n```json\n" + json.dumps(available, ensure_ascii=False, indent=2) + "\n```"
+    market_dates = available.get("market_wide_complete_dates", [])
+    date_span = f"{min(market_dates)}–{max(market_dates)}" if market_dates else "未列明"
+    market_summary = (
+        f"20170601+ 远端仅盘点元数据。全市场完整交易日文件组 {_metadata_value(available.get('market_wide_trade_day_files'))} 个，"
+        f"Parquet 表 {_metadata_value(available.get('market_wide_parquet_files'))} 个；"
+        f"不完整日期 {_count_list(available.get('market_wide_partial_dates'))} 个，"
+        f"不完整日期中的表 {_metadata_value(available.get('market_wide_partial_parquet_files'))} 个。"
+        f"现有日期范围 {date_span}，月份 {_month_span(available.get('market_wide_months'))}。"
+        "全市场文件组按日包含多只股票，不等同于任一单股的数据覆盖。"
+    )
+    footer = available.get("footer_audit") or {}
+    audit_summary = "未取得按股票核验的 Footer 审计统计。"
+    if footer:
+        audit_summary = (
+            f"在 {_metadata_value(footer.get('scope_from'))}–{_metadata_value(footer.get('scope_through'))} 范围，"
+            f"核对 {_metadata_value(footer.get('complete_date_bundles_attempted'))} 个完整日期组、"
+            f"{_metadata_value(footer.get('table_footers_attempted'))} 个 Parquet footer；"
+            f"失败 {_metadata_value(footer.get('table_footers_failed'))} 个。"
+            f"范围后另有 {_metadata_value(footer.get('uninspected_after_scope'))} 个完整日期组未作单股核对。"
+            "仅读取 footer 统计及尾部定位字节，未读取任何盘口数据页；所有三种表的 `wind_code` 精确 min/max 端点是确证依据。"
+            "区间内部不能确证的日期是未知，不是缺失。"
+        )
+    rows = []
+    for stock in STOCKS:
+        full = (available.get("by_stock") or {}).get(stock) or available.get(stock) or {}
+        scoped = (footer.get("by_stock") or {}).get(stock) or {}
+        scoped_absent = scoped.get("absent_dates")
+        absent = _count_list(scoped_absent)
+        if isinstance(scoped_absent, list) and 0 < len(scoped_absent) <= 3:
+            absent += "（" + "、".join(map(str, scoped_absent)) + "）"
+        rows.append((stock, _metadata_value(scoped.get("confirmed_trade_day_files")), _membership_bounds(scoped),
+                     absent, _count_list(scoped.get("unresolved_dates")), _month_span(scoped.get("confirmed_months")),
+                     _membership_bounds(full), _count_list(full.get("unresolved_dates")),
+                     _month_span(full.get("possible_market_months"))))
+    stock_summary = _table(("股票", "审计范围确证日期", "审计范围单股日期/上下界", "范围内确证缺席", "范围内未知",
+                            "范围内确证月份", "20170601+ 单股总日期/上下界", "全范围未知日期", "全范围可能月份"), rows)
+    receipt_ref = (
+        "逐日清单、各月文件数、确证缺席/未决日期、完整 metadata 审计状态和源版本见"
+        " [OpenHyra 的原始对账凭据](https://github.com/MrSteeeve/OpenHyra/blob/world-model/artifacts/p1-m5-formal-20261124/verification/test-data-reconciliation.json)"
+        "（`remote_availability` 字段）；上述覆盖仅表示文件/代码元数据，不保证正价差双边窗口或交易日有效性。"
+    )
+    source = available.get("source_revision")
+    if source is not None:
+        receipt_ref += f" 数据源固定版本 `{source}`。"
+    return "\n\n".join((market_summary, audit_summary, stock_summary, receipt_ref))
 
 
 # --- Table 2: all 90 development trials ---

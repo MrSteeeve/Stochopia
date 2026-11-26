@@ -159,3 +159,52 @@ def test_closing_refuses_unfrozen_or_incomplete_inputs(tmp_path: Path) -> None:
     report["secondary_best_guarded"].pop()
     with pytest.raises(ValueError, match="ten stock-arm cells"):
         render_closing(tmp_path, manifest, report, receipt, "source notes")
+
+
+def test_remote_inventory_compact_with_full_bounds_and_metadata_scope() -> None:
+    """A multi-year listing must not expand all 2,303 date records into prose."""
+    from experiments.p1_m5_closing_report import _remote_availability
+
+    # Deliberately large synthetic date arrays. Only endpoints and length matter.
+    market_days = list(range(20170601, 20172904))
+    months = [f"{year}-{month:02d}" for year in range(2017, 2027) for month in range(1, 13)
+              if "2017-06" <= f"{year}-{month:02d}" <= "2026-11"]
+    assert len(market_days) == 2303
+    assert len(months) == 114
+    first = {
+        "trade_day_files": None, "confirmed_trade_day_files": 146,
+        "possible_trade_day_files": 2302, "unresolved_dates": market_days[147:],
+        "possible_market_months": months,
+    }
+    second = {
+        "trade_day_files": None, "confirmed_trade_day_files": 137,
+        "possible_trade_day_files": 2303, "unresolved_dates": market_days[137:],
+        "possible_market_months": months,
+    }
+    scoped_first = {"trade_day_files": 146, "confirmed_trade_day_files": 146,
+                    "possible_trade_day_files": 146, "absent_dates": [20171201],
+                    "unresolved_dates": [], "confirmed_months": months[:7]}
+    scoped_second = {"trade_day_files": None, "confirmed_trade_day_files": 137,
+                     "possible_trade_day_files": 147, "absent_dates": [],
+                     "unresolved_dates": market_days[137:147], "confirmed_months": months[:7]}
+    receipt = {"remote_availability": {
+        "market_wide_complete_dates": market_days, "market_wide_months": months,
+        "market_wide_trade_day_files": 2303, "market_wide_parquet_files": 6909,
+        "market_wide_partial_dates": [], "market_wide_partial_parquet_files": 0,
+        "footer_audit": {"scope_from": 20170601, "scope_through": 20171231,
+                         "complete_date_bundles_attempted": 147, "table_footers_attempted": 441,
+                         "table_footers_failed": 0, "uninspected_after_scope": 2156,
+                         "by_stock": {STOCKS[0]: scoped_first, STOCKS[1]: scoped_second}},
+        "by_stock": {STOCKS[0]: first, STOCKS[1]: second}, STOCKS[0]: first, STOCKS[1]: second,
+    }}
+    text = _remote_availability(receipt)
+    assert "2303 个" in text and "6909 个" in text
+    assert "2017-06–2026-11（114 月）" in text
+    assert "147 个完整日期组" in text and "441 个 Parquet footer" in text
+    assert "| 000001.SZ | 146 | 146 | 1（20171201） | 0 |" in text
+    assert "| 300001.SZ | 137 | 137–147（未确定） | 0 | 10 |" in text
+    assert "146–2302（未确定）" in text and "137–2303（未确定）" in text
+    assert "2156" in text and "2166" in text
+    assert "verification/test-data-reconciliation.json" in text
+    assert len(text.splitlines()) < 20 and len(text) < 2000
+    assert str(market_days[700]) not in text
