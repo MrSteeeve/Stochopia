@@ -120,6 +120,10 @@ def render(artifact: Path, architecture_notes: str) -> str:
         raise ValueError("M5 report requires its independently registered study")
     if manifest["code"] != report["code"] or report["test_dates"] != receipt["test_dates"]:
         raise ValueError("report must match frozen code and effective holdout calendar")
+    if report.get("mode") == "m5-closing":
+        from experiments.p1_m5_closing_report import render_closing
+
+        return render_closing(artifact, manifest, report, receipt, architecture_notes)
     if len(report["test_dates"]) != 20 or len(receipt["reconciliation"]) != 40 or len(receipt["anchors"]) != 80:
         raise ValueError("the report requires 20 audited common trading days")
     if sum(len(row["trials"]) for row in manifest["trajectories"].values()) != 90:
