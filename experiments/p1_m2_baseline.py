@@ -148,10 +148,11 @@ def _validation(model: LOBWorldModel, window: Window, marginal: list[np.ndarray]
     first = window.start - CONTEXT
     end = window.end
     data = window.data
-    tokens = data.tokens[None, first:end]
-    batch = make_batch(data.ticks[None, first:end], data.shares[None, first:end], tokens)
+    device = next(model.parameters(), torch.empty(0)).device
+    tokens = data.tokens[None, first:end].to(device)
+    batch = make_batch(data.ticks[None, first:end].to(device), data.shares[None, first:end].to(device), tokens)
     loss = world_model_loss(model.forward_sequence(batch), tokens, reduction="none")
-    observed = tokens[0, CONTEXT:].numpy()
+    observed = data.tokens[window.start:end].cpu().numpy()
     predicted = np.array([float(getattr(loss, name)[:, CONTEXT:].mean()) for name in HEADS])
     if not np.isfinite(predicted).all():
         raise NonfiniteModelLoss(f"Nonfinite evaluation likelihood for {data.day.wind_code} {data.day.trading_date}")
@@ -200,9 +201,11 @@ def evaluate_symbol(
     root: Path, symbol: str, train_dates: list[int], dev_dates: list[int], directory: Path,
     *, factory: Callable[[], LOBWorldModel] = SeedGRULOBModel, rollout_seed: int = 12300,
     checkpoints: dict[int, Path] | None = None, save_traces: bool = True,
+    device: str | torch.device = "cpu",
 ) -> dict[str, object]:
     """Apply the same train/validation and injection protocol to any model factory."""
     torch.set_num_threads(1)
+    selected = torch.device(device)
     train = _load_days(root, symbol, train_dates)
     dev = _load_days(root, symbol, dev_dates)
     marginal = _marginal(train)
@@ -230,7 +233,7 @@ def evaluate_symbol(
     start_all = perf_counter()
     for seed in P1_TRAIN_SEEDS:
         if checkpoints is None:
-            fitted = fit_lob_world_model(factory, train, seed)
+            fitted = fit_lob_world_model(factory, train, seed, device=selected)
             model = fitted.model
             elapsed = fitted.seconds
             loss = fitted.last_nll
@@ -239,6 +242,7 @@ def evaluate_symbol(
         else:
             model = factory().eval()
             model.load_state_dict(torch.load(checkpoints[seed], weights_only=True, map_location="cpu"))
+            model.to(selected)
             elapsed = None
             loss = None
         parameters, state_dim = _verify_trained_model(model)

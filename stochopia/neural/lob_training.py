@@ -63,7 +63,7 @@ def encode_day(day: SZSEDaySlice) -> EncodedDay:
 
 def fit_lob_world_model(
     factory: Callable[[], LOBWorldModel], days: Sequence[EncodedDay], seed: int,
-    *, protocol: FitProtocol = P1_FIT_PROTOCOL,
+    *, protocol: FitProtocol = P1_FIT_PROTOCOL, device: str | torch.device = "cpu",
 ) -> LobFit:
     """Fit the same set of sampled session windows for any factory at a fixed seed.
 
@@ -81,7 +81,8 @@ def fit_lob_world_model(
     started = perf_counter()
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
-    model = factory().train()
+    selected = torch.device(device)
+    model = factory().to(selected).train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=protocol.start_lr, weight_decay=protocol.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(1, protocol.steps - 1), eta_min=protocol.end_lr,
@@ -101,8 +102,10 @@ def fit_lob_world_model(
             shares.append(item.shares[window])
             tokens.append(item.tokens[window])
 
-        targets = torch.stack(tokens)
-        batch = make_batch(torch.stack(ticks), torch.stack(shares), targets)
+        # Keep the full encoded archive on CPU; move only each sampled
+        # minibatch to the same device as the candidate.
+        targets = torch.stack(tokens).to(selected)
+        batch = make_batch(torch.stack(ticks).to(selected), torch.stack(shares).to(selected), targets)
         full = model.forward_sequence(batch)
         logits = FiveTupleLogits(*(head[:, supervised] for head in full))
         loss = world_model_loss(logits, targets[:, supervised]).total
