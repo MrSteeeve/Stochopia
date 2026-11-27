@@ -11,8 +11,9 @@ import pytest
 import torch
 from torch import Tensor, nn
 
-from experiments.p1_m2_baseline import Window, _window_exhausted
-from experiments.p1_m2_metrics import summarize_impact
+from stochopia.market.windows import Window
+from stochopia.market.szse_eval import window_exhausted
+from stochopia.market.tape_metrics import summarize_impact
 from stochopia.data import SZSEDaySlice
 from stochopia.harness.lob_rollout import RolloutArm, RolloutTrace, _Order, _Path, _children, rollout_paired_window
 from stochopia.neural.lob_interface import BUCKET_COUNTS, FiveTupleLogits, LOBBatch, LOBWorldModel, State, StepObservation, StepSampler
@@ -207,18 +208,18 @@ def test_event_cap_finishes_grid_and_all_scheduled_ioc_children() -> None:
         if arm != RolloutArm.NO_INJECTION:
             np.testing.assert_array_equal(trace.child_fill_shares, [90, 90])
     np.testing.assert_array_equal(baseline.mid_ticks, [102.0] * len(grid))
-    assert _window_exhausted(traces)
+    assert window_exhausted(traces)
 
 
 def test_exhaustion_count_distinguishes_book_failure_and_cap() -> None:
     empty = np.empty(0)
     sample = RolloutTrace(empty, empty, empty, empty, empty, empty, empty)
     traces = {arm: sample for arm in RolloutArm}
-    assert not _window_exhausted(traces)
+    assert not window_exhausted(traces)
     traces[RolloutArm.BUY_VISIBLE] = replace(sample, exhausted=True)
-    assert not _window_exhausted(traces)
+    assert not window_exhausted(traces)
     traces[RolloutArm.BUY_VISIBLE] = replace(sample, exhausted=True, budget_exhausted=True)
-    assert _window_exhausted(traces)
+    assert window_exhausted(traces)
 
 
 def test_event_cap_scales_with_historical_window() -> None:

@@ -6,6 +6,7 @@ import csv
 import io
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from importlib import import_module as _import_module
 from importlib.metadata import PackageNotFoundError, version
 from numbers import Integral
@@ -14,7 +15,6 @@ from types import ModuleType
 from typing import Any, Literal
 
 from stochopia.common import atomic_write_text
-from stochopia.harness.contract import ReportStatus
 
 
 # --- Input and trace records ---
@@ -53,9 +53,16 @@ class LobTrace:
     fills: tuple[Fill, ...]
 
 
+class LobReplayStatus(str, Enum):
+    """Availability of the deterministic exchange comparison."""
+
+    SUPPORTED = "supported"
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class LobComparison:
-    status: ReportStatus
+    status: LobReplayStatus
     with_order: LobTrace | None = None
     without_order: LobTrace | None = None
     fills: tuple[Fill, ...] = ()
@@ -211,7 +218,7 @@ def run_short_lob(*, depth: int = 2, import_module: Callable[[str], ModuleType] 
         engine = import_module("jaxlob.gymnax_exchange.jaxob.JaxOrderBookArrays")
         engine_version = f"jaxlob=={version('jaxlob')}"
     except (ImportError, PackageNotFoundError) as exc:
-        return LobComparison(ReportStatus.UNAVAILABLE, reason=f"JAX-LOB dependency unavailable: {exc}")
+        return LobComparison(LobReplayStatus.UNAVAILABLE, reason=f"JAX-LOB dependency unavailable: {exc}")
 
     start = 34200 * 10**9
     initial = (
@@ -225,7 +232,7 @@ def run_short_lob(*, depth: int = 2, import_module: Callable[[str], ModuleType] 
     with_order = _replay(engine, jnp, (*initial, child, cancel), depth)
     without_order = _replay(engine, jnp, (*initial, cancel), depth)
     return LobComparison(
-        ReportStatus.SUPPORTED, with_order, without_order, with_order.fills, engine_version,
+        LobReplayStatus.SUPPORTED, with_order, without_order, with_order.fills, engine_version,
     )
 
 

@@ -31,8 +31,8 @@ class FitProtocol:
     max_train_seconds: float = 180.0
 
 
-P1_FIT_PROTOCOL = FitProtocol()
-P1_TRAIN_SEEDS = (103, 137, 211)
+DEFAULT_FIT_PROTOCOL = FitProtocol()
+DEFAULT_TRAIN_SEEDS = (103, 137, 211)
 
 
 class NonfiniteModelLoss(ValueError):
@@ -66,7 +66,7 @@ def encode_day(day: SZSEDaySlice) -> EncodedDay:
 
 def fit_lob_world_model(
     factory: Callable[[], LOBWorldModel], days: Sequence[EncodedDay], seed: int,
-    *, protocol: FitProtocol = P1_FIT_PROTOCOL, device: str | torch.device = "cpu",
+    *, protocol: FitProtocol = DEFAULT_FIT_PROTOCOL, device: str | torch.device = "cpu",
 ) -> LobFit:
     """Fit the same set of sampled session windows for any factory at a fixed seed.
 

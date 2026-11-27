@@ -38,14 +38,14 @@ def _observation() -> StepObservation:
 
 @pytest.mark.parametrize("error", [AssertionError, TypeError, ValueError])
 def test_trained_model_contract_failure_is_classified(error: type[Exception], monkeypatch: pytest.MonkeyPatch) -> None:
-    from experiments import p1_m2_baseline
+    from stochopia.market import szse_eval
 
     def rejected(model: nn.Module) -> tuple[int, int]:
         raise error("invalid trained state")
 
-    monkeypatch.setattr(p1_m2_baseline, "verify_world_model_contract", rejected)
+    monkeypatch.setattr(szse_eval, "verify_world_model_contract", rejected)
     with pytest.raises(RuntimeError, match="Trained model failed tensor contract") as caught:
-        p1_m2_baseline._verify_trained_model(SeedGRULOBModel())
+        szse_eval._verify_trained_model(SeedGRULOBModel())
     assert isinstance(caught.value.__cause__, error)
 
 

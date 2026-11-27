@@ -1,1 +1,1 @@
-"""Contracts shared by Stochopia and the research harness."""
+"""LOB matching, replay, and world-model evaluation interfaces."""

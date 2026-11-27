@@ -8,14 +8,18 @@ Stochopia是一个市场世界模型。它描述挂单、撤单、成交与价�
 
 ## 状态
 
-新代码正在搭建。仓库里目前只有通用工具模块：
+当前仓库保留可复用的世界模型、市场评估及合成实验基础设施。LLM 研究循环由 [OpenHyra](https://github.com/MrSteeeve/OpenHyra/tree/world-model) 维护。
 
-| 文件 | 内容 |
+| 路径 | 内容 |
 |---|---|
-| `stochopia/llm.py` | OpenAI兼容接口与Anthropic接口的客户端，模型在`config/models.yaml`登记 |
-| `stochopia/llm_json.py` | 从模型回复中提取JSON |
-| `stochopia/stats.py` | 种子派生、bootstrap置信区间、配对检验、Holm校正 |
-| `stochopia/common.py` | 规范化JSON、功能性哈希ID、原子写入 |
+| `stochopia/neural/` | 因果盘口世界模型接口、训练与参考算子 |
+| `stochopia/harness/` | 合法事件回放与 JAX-LOB 撮合 |
+| `stochopia/market/` | 市场窗口、订单流统计、闭环回放与深市评估 |
+| `stochopia/measure/` | 数据属性、冲击曲线与评估指标 |
+| `stochopia/sim/` | 可控传播子与队列反应合成世界 |
+| `experiments/synthetic_tau_z/` | 条件算子合成研究的可复现入口和报告 |
+
+P0 与 P1 历史报告及代码保存在 `tier0-p0-final` 与 `p1-szse-final` 标签下。现役测量协议及 P2 报告仍位于 `docs/research/`。
 
 ## 旧版：Benchmark v3
 
@@ -30,11 +34,11 @@ git checkout benchmark-v3-final
 ## 开发
 
 ```bash
-uv sync --all-extras --dev
+uv sync --locked --python 3.12 --all-extras --dev
 ```
 
 ```bash
 .venv/bin/python -m pytest
 ```
 
-API key从环境变量读取，变量名见`.env.example`。
+合成实验不需要私有市场数据或 LLM API Key。

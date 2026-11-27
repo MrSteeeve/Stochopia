@@ -8,14 +8,18 @@ Stochopia is a market world model. It describes how order placements, cancellati
 
 ## Status
 
-The new code is under construction. For now the repository only holds general-purpose modules:
+The current repository contains the reusable world-model, market evaluation, and synthetic research infrastructure. The LLM research loop is maintained in [OpenHyra](https://github.com/MrSteeeve/OpenHyra/tree/world-model).
 
-| File | Contents |
+| Path | Contents |
 |---|---|
-| `stochopia/llm.py` | Clients for OpenAI-compatible and Anthropic APIs; models are registered in `config/models.yaml` |
-| `stochopia/llm_json.py` | JSON extraction from model replies |
-| `stochopia/stats.py` | Seed derivation, bootstrap confidence intervals, paired tests, Holm correction |
-| `stochopia/common.py` | Canonical JSON, functional hash IDs, atomic writes |
+| `stochopia/neural/` | Causal LOB world-model interfaces, training, and reference operators |
+| `stochopia/harness/` | Legal event replay and JAX-LOB matching |
+| `stochopia/market/` | Market windows, tape metrics, rollout evaluation, and SZSE evaluation |
+| `stochopia/measure/` | Data properties, impact curves, and evaluation metrics |
+| `stochopia/sim/` | Controlled synthetic propagator and queue-reactive worlds |
+| `experiments/synthetic_tau_z/` | Reproducible conditional-operator study and report |
+
+The historical P0 and P1 research reports and code are preserved in the `tier0-p0-final` and `p1-szse-final` tags. Current measurement protocols and P2 reports remain under `docs/research/`.
 
 ## Previous version: Benchmark v3
 
@@ -30,11 +34,11 @@ The research notes for that version (in Chinese) are kept under the same tag, in
 ## Development
 
 ```bash
-uv sync --all-extras --dev
+uv sync --locked --python 3.12 --all-extras --dev
 ```
 
 ```bash
 .venv/bin/python -m pytest
 ```
 
-API keys are read from environment variables; see `.env.example` for the names.
+The synthetic study requires no private market data or LLM API keys.
