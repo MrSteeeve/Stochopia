@@ -12,7 +12,10 @@ from torch import Tensor
 
 from stochopia.data import SZSEDaySlice
 
-from .lob_interface import FiveTupleLogits, LOBWorldModel, encode_events, make_batch, world_model_loss
+from .lob_interface import (
+    FiveTupleLogits, FiveTupleLoss, LOBBatch, LOBWorldModel, StepObservation,
+    encode_events, make_batch, world_model_loss,
+)
 
 
 @dataclass(frozen=True)
@@ -124,3 +127,66 @@ def fit_lob_world_model(
     if elapsed >= protocol.max_train_seconds:
         raise TimeoutError(f"seed {seed} exceeded {protocol.max_train_seconds:g}s training budget")
     return LobFit(model.eval(), elapsed, float(loss.detach()))
+
+
+# --- Trained-model likelihood and memory ablation ---
+
+@torch.no_grad()
+def world_model_nll_events(
+    model: LOBWorldModel, batch: LOBBatch, *, stateless: bool = False,
+) -> FiveTupleLoss:
+    """Return fixed four-head losses [B, T] in nats per event.
+
+    The stateless path maps each observation [B,T,...] to an independent
+    length-one sequence [B*T,1,...]. Its previous-event tokens, own marker,
+    contemporaneous pre-book and target are unchanged. This removes only
+    recurrent propagation, not information already present in the event's
+    observation. Use the same framework loss and masks for both paths.
+    """
+    was_training = model.training
+    model.eval()
+    try:
+        if not stateless:
+            return world_model_loss(model.forward_sequence(batch), batch.targets, reduction="none")
+
+        batch_size, time_steps = batch.targets.shape[:2]
+        observations = []
+        for field in batch.observation:
+            if field is None:
+                observations.append(None)
+            else:
+                observations.append(field.reshape(batch_size * time_steps, 1, *field.shape[2:]))
+        folded_targets = batch.targets.reshape(batch_size * time_steps, 1, 4)
+        folded = LOBBatch(StepObservation(*observations), folded_targets)
+        loss = world_model_loss(model.forward_sequence(folded), folded_targets, reduction="none")
+        return FiveTupleLoss(*(field.reshape(batch_size, time_steps) for field in loss))
+    finally:
+        model.train(was_training)
+
+
+def evaluate_world_model_nll(
+    model: LOBWorldModel, batches: Sequence[LOBBatch], *, stateless: bool = False,
+    supervised: slice = slice(None),
+) -> dict[str, float]:
+    """Aggregate fixed head means, weighting by number of supervised events.
+
+    With like-shaped batches, setting supervised=slice(burn_in,None) excludes
+    the same burn-in positions from both recurrent and stateless denominators.
+    Total is the unweighted sum of four per-event means. Empty supervision and
+    non-finite likelihood are invalid, not silently replaced with zero.
+    """
+    head_sums = [0.0, 0.0, 0.0, 0.0]
+    events = 0
+    for batch in batches:
+        loss = world_model_nll_events(model, batch, stateless=stateless)
+        events += loss.total[:, supervised].numel()
+        for position, value in enumerate(loss[1:]):
+            head_sums[position] += float(value[:, supervised].sum(dtype=torch.float64))
+    if events == 0:
+        raise ValueError("no supervised events for NLL evaluation")
+    mean_heads = np.array(head_sums) / events
+    if not np.isfinite(mean_heads).all():
+        raise NonfiniteModelLoss("non-finite evaluation likelihood")
+    means = {name: float(value) for name, value in zip(FiveTupleLoss._fields[1:], mean_heads, strict=True)}
+    means["total"] = float(mean_heads.sum())
+    return means

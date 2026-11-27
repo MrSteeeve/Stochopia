@@ -15,6 +15,9 @@ from stochopia.measure.impact import (
     antisymmetrise,
     fit_power_law,
     identify_law,
+    continuous_impact_readouts,
+    P1_METRIC_SCHEMA,
+    P2_METRIC_SCHEMA,
     relaxation,
     score_impact,
 )
@@ -84,14 +87,22 @@ def _log_slope(x: np.ndarray, y: np.ndarray) -> float | None:
     return float(np.polyfit(np.log(x[valid]), np.log(y[valid]), 1)[0])
 
 
-def aggregate_tapes(rows: list[TapeStats]) -> dict[str, object]:
+def aggregate_tapes(
+    rows: list[TapeStats], *, absolute_drifts: Sequence[float] | None = None,
+) -> dict[str, object]:
     means = {key: _finite_mean(np.array([asdict(row)[key] for row in rows]), axis=0) for key in asdict(rows[0])}
     gamma = _log_slope(FLOW_LAGS, means["flow_acf"])
     hurst = _log_slope(PRICE_LAGS, means["price_msd"])
     result = {key: value.tolist() for key, value in means.items()}
     result["gamma_flow"] = -gamma if gamma is not None else None
     result["hurst"] = hurst / 2 if hurst is not None else None
-    result["mean_absolute_drift_ticks"] = float(_finite_mean(np.abs([row.drift_ticks for row in rows])))
+    # With K > 1, average each replicate's absolute drift before pooling.
+    # Taking abs after averaging signed replicate drift understates the guard.
+    if absolute_drifts is None:
+        absolute_drifts = np.abs([row.drift_ticks for row in rows])
+    if len(absolute_drifts) != len(rows):
+        raise ValueError("absolute drifts must align with tape rows")
+    result["mean_absolute_drift_ticks"] = float(_finite_mean(np.asarray(absolute_drifts)))
     return result
 
 
@@ -121,6 +132,9 @@ def summarize_impact(
     child_blind: np.ndarray, child_filled: np.ndarray, sigma_ticks: float, daily_shares: float,
     schedule: np.ndarray, generated: dict[str, object], replay: dict[str, object], paths_per_day: int = 1,
     include_peak_interval: bool = True, law_admitted: bool | None = None,
+    metric_schema_version: str = P1_METRIC_SCHEMA, grid_ms: np.ndarray | None = None,
+    planned_child_shares: float | None = None,
+    continuous_panel: Mapping[str, np.ndarray] | None = None,
 ) -> dict[str, object]:
     """Re-use the LOB-Impact scorer on day-clustered buy/sell paths.
 
@@ -130,7 +144,13 @@ def summarize_impact(
     During outer bootstrap, C2 admission is fixed at the original-panel
     result and the peak diagnostic interval is omitted. Each draw still
     refits the admissible exponent and re-estimates the raw measurements.
+    P2 instead rejudges C2 on each draw (law_admitted=None); continuous
+    readouts do not use admission. The P2 fixed square-root reference
+    uses historical daily volatility in ticks and intended total child
+    shares / historical daily shares, never realized simulated fills.
     """
+    if metric_schema_version not in (P1_METRIC_SCHEMA, P2_METRIC_SCHEMA):
+        raise ValueError("unknown market metric schema")
     n_days = len(visible_mid)
     visible = antisymmetrise(visible_mid[:, 0], visible_mid[:, 1])
     blind = antisymmetrise(blind_mid[:, 0], blind_mid[:, 1])
@@ -185,7 +205,7 @@ def summarize_impact(
         near_zero_peak_band_ticks=(-0.5, 0.5),
     )
     score = score_impact(metrics, reference)
-    return {
+    result = {
         "paired_days": n_days, "days_with_complete_execution_marks": int(whole_days.sum()),
         "days_with_visible_last_child": int(peak_days.sum()), "days_with_paired_last_child": int(paired_days.sum()),
         "days_with_complete_recovery": int(recovery_days.sum()), "visible_peak_for_amplitude_ticks": peak,
@@ -196,6 +216,33 @@ def summarize_impact(
         "average_filled_shares": traded, "law": asdict(law) if law is not None else None,
         "measurements": asdict(metrics), "reference": asdict(reference), "score": asdict(score),
     }
+    if metric_schema_version == P2_METRIC_SCHEMA:
+        if grid_ms is None or planned_child_shares is None or not daily_shares > 0:
+            raise ValueError("P2 market metrics need a physical grid and fixed injection calibration")
+        participation = planned_child_shares * int(np.count_nonzero(schedule)) / daily_shares
+        continuous_visible = visible_mean
+        continuous_blind = _finite_mean(blind, axis=0)
+        continuous_peak = peak
+        joint_difference = None
+        if continuous_panel is not None:
+            # Equal-day means of each date's available physical window means.
+            # The strict complete-replica panel above remains the P1 scorer's
+            # input; the two estimands must never be silently conflated.
+            continuous_visible = _finite_mean(continuous_panel["visible"], axis=0)
+            continuous_blind = None
+            continuous_peak = float(_finite_mean(continuous_panel["execution_peak"]))
+            joint_difference = _finite_mean(continuous_panel["joint_difference"], axis=0)
+        continuous = dict(continuous_impact_readouts(
+            visible_curve_ticks=continuous_visible, blind_curve_ticks=continuous_blind,
+            grid_ms=grid_ms, schedule=schedule, scale_ticks=sigma_ticks, participation=participation,
+            c2_pass=score.claims["C2"].status == "pass", execution_peak_ticks=continuous_peak,
+            visible_minus_blind_curve_ticks=joint_difference,
+        ))
+        if continuous_panel is not None:
+            from experiments.p2_m1_quote_support import quote_support
+            continuous["available_quote_support"] = quote_support(continuous_panel, paths_per_day)
+        result["continuous"] = continuous
+    return result
 
 
 # --- Compact day-cluster observations ---
@@ -242,6 +289,10 @@ def market_bootstrap_payload(
     generated: Sequence[TapeStats], replay: Sequence[TapeStats], *,
     cfg: Mapping[str, int | float], grid: np.ndarray, children: np.ndarray,
     replay_touch_shares: np.ndarray | None = None,
+    num_replicates: int = 1, metric_schema_version: str = P1_METRIC_SCHEMA,
+    window_depth_errors: np.ndarray | None = None,
+    generated_absolute_drifts: Sequence[float] | None = None,
+    continuous_panel: Mapping[str, np.ndarray] | None = None,
 ) -> dict[str, object]:
     """Serialize chronological day clusters for exact repooling on each draw.
 
@@ -250,7 +301,17 @@ def market_bootstrap_payload(
     averages the absolute difference over all same-clock bid/ask cells and
     seeds, including zero usable depth. A missing historical panel leaves
     this optional readout unavailable. No event tape leaves the evaluator.
+    P2 paths and tapes supplied here are already averaged *within* each
+    seed/window over K replicates; the independent cluster count is still
+    windows/2. Absolute depth/drift readouts are averaged before collapsing
+    replicate signs. paths_per_day accounts for the mean's tick lattice.
     """
+    if metric_schema_version not in (P1_METRIC_SCHEMA, P2_METRIC_SCHEMA):
+        raise ValueError("unknown market metric schema")
+    if type(num_replicates) is not int or num_replicates < 1:
+        raise ValueError("num_replicates must be a positive integer")
+    if metric_schema_version == P1_METRIC_SCHEMA and num_replicates != 1:
+        raise ValueError("multiple replicas require the P2 metric schema")
     windows = len(replay)
     if not paths or not windows or windows % 2:
         raise ValueError("market clusters need seeds and two sessions per day")
@@ -264,7 +325,12 @@ def market_bootstrap_payload(
             ordered.extend(generated[first:first + 2])
 
     depth_errors = None
-    if replay_touch_shares is not None:
+    if window_depth_errors is not None:
+        errors = np.asarray(window_depth_errors, dtype=float)
+        if errors.shape != (len(paths), windows):
+            raise ValueError("window depth errors must align by seed and window")
+        depth_errors = errors.reshape(len(paths), -1, 2).mean(axis=(0, 2)).tolist()
+    elif replay_touch_shares is not None:
         observed = np.asarray(replay_touch_shares)
         if observed.shape != (windows, len(grid), 2):
             raise ValueError("historical touch shares must align by window, grid mark and side")
@@ -277,13 +343,13 @@ def market_bootstrap_payload(
 
     visible = (RolloutArm.BUY_VISIBLE, RolloutArm.SELL_VISIBLE)
     blind = (RolloutArm.BUY_BLIND, RolloutArm.SELL_BLIND)
-    return {
+    payload = {
         "visible_mid": day_paired_paths(paths, visible, "mid_ticks", relative=True).tolist(),
         "blind_mid": day_paired_paths(paths, blind, "mid_ticks", relative=True).tolist(),
         "child_visible": day_paired_paths(paths, visible, "after_child_mid_ticks", relative=True).tolist(),
         "child_blind": day_paired_paths(paths, blind, "after_child_mid_ticks", relative=True).tolist(),
         "child_filled": day_paired_paths(paths, visible, "child_fill_shares").tolist(),
-        "paths_per_day": len(paths) * 2,
+        "paths_per_day": len(paths) * 2 * num_replicates,
         "sigma_ticks": float(cfg["sigma_ticks"]),
         "daily_shares": float(cfg["daily_shares"]),
         "schedule": np.isin(grid, children).tolist(),
@@ -291,3 +357,19 @@ def market_bootstrap_payload(
         "historical_tapes": _cluster_tapes(replay, 2),
         "l1_depth_errors": depth_errors,
     }
+    if metric_schema_version == P2_METRIC_SCHEMA:
+        payload["metric_schema_version"] = metric_schema_version
+        payload["grid_ms"] = grid.tolist()
+        payload["planned_child_shares"] = float(cfg["child_shares"])
+        payload["num_replicates"] = num_replicates
+        if continuous_panel is not None:
+            from experiments.p2_m1_quote_support import decode_quote_panel
+            panel = decode_quote_panel(continuous_panel, windows // 2, len(grid), payload["paths_per_day"])
+            payload["continuous_panel"] = {key: values.tolist() for key, values in panel.items()}
+        if generated_absolute_drifts is not None:
+            values = np.asarray(generated_absolute_drifts, dtype=float)
+            if values.shape != (len(generated),):
+                raise ValueError("absolute drifts must align with generated tape rows")
+            reordered = values.reshape(len(paths), -1, 2).transpose(1, 0, 2)
+            payload["generated_tapes"]["absolute_drift_ticks"] = reordered.reshape(-1, len(paths) * 2).tolist()
+    return payload

@@ -134,29 +134,20 @@ def _matching_functions() -> tuple[Any, Any, Any]:
     return jnp.asarray, apply, engine.get_L2_state
 
 
-class _Path:
-    def __init__(self, ticks: np.ndarray, shares: np.ndarray, capacity: int) -> None:
-        as_array, self._match, self._top = _matching_functions()
-        self._sides = []
-        self._id = 0
-        for side in range(2):
-            rows = np.full((capacity, 6), -1, dtype=np.int32)
-            for level in range(10):
-                if ticks[side, level] > 0 and shares[side, level] > 0:
-                    self._id += 1
-                    rows[level] = (ticks[side, level], shares[side, level], self._id, self._id, 0, 0)
-            self._sides.append(as_array(rows))
+class _BookTape:
+    """Track one path's exact orders and physical-grid touch observations."""
+
+    def __init__(self) -> None:
         self.tape: list[_Order] = []
         self._times: list[int] = []
         self._touch: list[tuple[float, float, int, int]] = []
         self._child_mids: list[float] = []
         self._child_fills: list[int] = []
         self._exhausted = False
-        self._record(0)
 
-    def _record(self, time_ms: int) -> None:
-        rows = np.asarray(self._top(self._sides[1], self._sides[0], 11)).reshape(11, 2, 2)
-        book = np.maximum(rows[:, ::-1].transpose(1, 0, 2), 0)
+    def record(self, time_ms: int, rows: np.ndarray) -> None:
+        """Record flattened JAX-LOB ask/bid L2 [price, depth] rows."""
+        book = np.maximum(rows.reshape(11, 2, 2)[:, ::-1].transpose(1, 0, 2), 0)
         self.prices = np.where(book[:, :, 1] > 0, book[:, :, 0], 0)
         self.shares = book[:, :, 1]
         bid, ask = map(int, self.prices[:, 0])
@@ -168,6 +159,7 @@ class _Path:
         self._touch.append((mid, spread, best_bid, best_ask))
 
     def instruction(self, time_ms: int, tokens: list[int]) -> _Order:
+        """Translate relative event fields to an absolute order at this book."""
         _, action, relative, shares = tokens
         side = action % 2
         direction = 1 - 2 * side
@@ -182,23 +174,12 @@ class _Path:
             price = anchor - direction * relative
         return _Order(time_ms, action, relative, shares, price)
 
-    def apply(self, order: _Order) -> int:
-        """Apply one request and return the deepest execution price, or zero."""
-        side = order.action % 2
-        self._id += 1
-        seconds, millis = divmod(order.time_ms, 1_000)
-        args = np.array([1 - 2 * side, order.price, order.shares, self._id,
-                         seconds, millis * 1_000_000, order.action >= 4, order.is_own], dtype=np.int32)
-        own, other, filled, last = self._match(self._sides[side], self._sides[1 - side], args)
-        self._sides[side] = own
-        self._sides[1 - side] = other
-        self._record(order.time_ms)
+    def store_order(self, order: _Order, filled: int) -> None:
         if order.is_own:
             self._child_mids.append(self._touch[-1][0])
-            self._child_fills.append(int(filled))
+            self._child_fills.append(filled)
         else:
             self.tape.append(order)
-        return int(last)
 
     def trace(self, grid: np.ndarray, *, budget_exhausted: bool = False) -> RolloutTrace:
         last = np.searchsorted(self._times, grid, side="right") - 1
@@ -212,6 +193,39 @@ class _Path:
             np.array(self._child_mids), np.array(self._child_fills, dtype=np.int64),
             self._exhausted or budget_exhausted, budget_exhausted,
         )
+
+
+class _Path(_BookTape):
+    def __init__(self, ticks: np.ndarray, shares: np.ndarray, capacity: int) -> None:
+        super().__init__()
+        as_array, self._match, self._top = _matching_functions()
+        self._sides = []
+        self._id = 0
+        for side in range(2):
+            rows = np.full((capacity, 6), -1, dtype=np.int32)
+            for level in range(10):
+                if ticks[side, level] > 0 and shares[side, level] > 0:
+                    self._id += 1
+                    rows[level] = (ticks[side, level], shares[side, level], self._id, self._id, 0, 0)
+            self._sides.append(as_array(rows))
+        self._record(0)
+
+    def _record(self, time_ms: int) -> None:
+        self.record(time_ms, np.asarray(self._top(self._sides[1], self._sides[0], 11)))
+
+    def apply(self, order: _Order) -> int:
+        """Apply one request and return the deepest execution price, or zero."""
+        side = order.action % 2
+        self._id += 1
+        seconds, millis = divmod(order.time_ms, 1_000)
+        args = np.array([1 - 2 * side, order.price, order.shares, self._id,
+                         seconds, millis * 1_000_000, order.action >= 4, order.is_own], dtype=np.int32)
+        own, other, filled, last = self._match(self._sides[side], self._sides[1 - side], args)
+        self._sides[side] = own
+        self._sides[1 - side] = other
+        self._record(order.time_ms)
+        self.store_order(order, int(filled))
+        return int(last)
 
 
 # --- Paired tapes and recurrent warmup ---
@@ -293,6 +307,32 @@ def _simulate(
     for order in orders[child:]:
         path.apply(order)
     return now < horizon
+
+
+@dataclass(frozen=True)
+class RolloutWindow:
+    """One physical session start and its independent background budget."""
+
+    day: SZSEDaySlice
+    start_index: int
+    window_id: int
+    max_events: int = 1024
+
+
+def rollout_paired_windows(
+    model: LOBWorldModel, windows: Sequence[RolloutWindow], *,
+    child_times_ms: Sequence[int], child_shares: int, grid_ms: Sequence[int],
+    seed: int, context_len: int = 128, num_replicates: int = 1,
+) -> list[tuple[dict[RolloutArm, RolloutTrace], ...]]:
+    """Batch W × K independent traces, preserving window-major replicate order.
+
+    This is the explicit v2 protocol. The legacy single-window entry retains
+    its original sample() random-number protocol when called with defaults.
+    """
+    from stochopia.harness.lob_rollout_batch import rollout_batch
+
+    return rollout_batch(model, windows, child_times_ms=child_times_ms, child_shares=child_shares,
+                         grid_ms=grid_ms, seed=seed, context_len=context_len, num_replicates=num_replicates)
 
 
 @torch.inference_mode()

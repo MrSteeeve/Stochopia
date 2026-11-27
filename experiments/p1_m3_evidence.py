@@ -7,6 +7,7 @@ from math import isfinite
 from numbers import Real
 
 from stochopia.harness.lob_rollout import ResidualProfile
+from stochopia.measure.impact import C2_PASS_METRIC, CONTINUOUS_IMPACT_METRICS
 
 
 M4_MARKET_METRICS = (
@@ -20,6 +21,8 @@ M4_MARKET_METRICS = (
     "event_count_rel_gap",
     "l1_depth_mae",
 )
+
+P2_MARKET_METRICS = M4_MARKET_METRICS + CONTINUOUS_IMPACT_METRICS + (C2_PASS_METRIC,)
 
 
 def _absolute_gap(left: object, right: object) -> float | None:
@@ -46,7 +49,7 @@ def mechanism_readouts(
         event_gap = count_difference / n_observed
     score = impact["score"]
     measurements = impact["measurements"]
-    return {
+    result = {
         "lob_impact_score": score["score"],
         "end_over_peak_ratio": measurements["end_over_peak"],
         "free_abs_drift_ticks": generated["mean_absolute_drift_ticks"],
@@ -57,10 +60,15 @@ def mechanism_readouts(
         "event_count_rel_gap": event_gap,
         "l1_depth_mae": l1_depth_mae,
     }
+    if "continuous" in impact:
+        continuous = impact["continuous"]
+        for metric in (*CONTINUOUS_IMPACT_METRICS, C2_PASS_METRIC):
+            result[metric] = continuous[metric]
+    return result
 
 
 def compact_evidence(
-    profile: ResidualProfile, parameters: int, state_dim: int, *, exhausted_windows: int | None = None,
+    profile: ResidualProfile, parameters: int, state_dim: int, *, exhausted_windows: int | float | None = None,
     train_seed_nll: Mapping[int, float] | None = None, l1_depth_mae: float | None = None,
 ) -> dict[str, object]:
     def residual(key: str) -> float | None:
@@ -71,7 +79,7 @@ def compact_evidence(
     impact = profile.impact
     metrics = impact["measurements"]
     score = impact["score"]
-    return {
+    evidence = {
         **mechanism_readouts(profile.generated, profile.historical, impact, l1_depth_mae),
         "parameters": parameters,
         "state_dim": state_dim,
@@ -96,3 +104,11 @@ def compact_evidence(
         "impact_delta": metrics["delta"],
         "recovery_ratio": metrics["end_over_peak"],
     }
+    if "continuous" in impact:
+        continuous = impact["continuous"]
+        evidence["impact_identifiability_state"] = continuous["impact_identifiability_state"]
+        evidence["reference_scale_ticks"] = continuous["reference_scale_ticks"]
+        evidence["reference_participation"] = continuous["reference_participation"]
+        if "available_quote_support" in continuous:
+            evidence["available_quote_support"] = continuous["available_quote_support"]
+    return evidence

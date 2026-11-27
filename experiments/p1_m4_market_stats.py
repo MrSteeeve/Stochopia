@@ -9,6 +9,10 @@ import numpy as np
 
 from .p1_m2_metrics import FLOW_LAGS, PRICE_LAGS, _finite_mean, _log_slope, summarize_impact
 from .p1_m3_evidence import mechanism_readouts
+from .p2_m1_quote_support import decode_quote_panel
+from stochopia.measure.impact import (
+    C2_PASS_METRIC, CONTINUOUS_IMPACT_METRICS, P1_METRIC_SCHEMA, P2_METRIC_SCHEMA,
+)
 
 
 PATH_FIELDS = ("visible_mid", "blind_mid", "child_visible", "child_blind", "child_filled")
@@ -27,12 +31,15 @@ def _pool_tapes(tapes: Mapping[str, np.ndarray], days: np.ndarray) -> dict[str, 
     flow_slope = _log_slope(FLOW_LAGS, acf)
     price_slope = _log_slope(PRICE_LAGS, price_msd)
     drift = tapes["drift_ticks"][days]
+    absolute_drift = np.abs(drift)
+    if "absolute_drift_ticks" in tapes:
+        absolute_drift = tapes["absolute_drift_ticks"][days]
     return {
         "events": float(_finite_mean(tapes["events"][days])),
         "gamma_flow": -flow_slope if flow_slope is not None else None,
         "hurst": price_slope / 2 if price_slope is not None else None,
         "drift_ticks": float(_finite_mean(drift)),
-        "mean_absolute_drift_ticks": float(_finite_mean(np.abs(drift))),
+        "mean_absolute_drift_ticks": float(_finite_mean(absolute_drift)),
     }
 
 
@@ -48,20 +55,54 @@ class MarketClusters:
     paths_per_day: int
     sigma_ticks: float
     daily_shares: float
+    metric_schema_version: str = P1_METRIC_SCHEMA
+    grid_ms: np.ndarray | None = None
+    planned_child_shares: float | None = None
+    num_replicates: int = 1
+    continuous_panel: Mapping[str, np.ndarray] | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> MarketClusters:
         """Decode JSON null as unavailable rather than a zero physical mark."""
         depth = payload["l1_depth_errors"]
+        schema = payload.get("metric_schema_version", P1_METRIC_SCHEMA)
+        if schema not in (P1_METRIC_SCHEMA, P2_METRIC_SCHEMA):
+            raise ValueError("unknown market metric schema")
+        replicates = payload.get("num_replicates", 1)
+        grid = None
+        child_shares = None
+        continuous = None
+        generated = {name: np.asarray(payload["generated_tapes"][name], dtype=float) for name in TAPE_FIELDS}
+        if schema == P2_METRIC_SCHEMA:
+            grid = np.asarray(payload["grid_ms"], dtype=float)
+            child_shares = float(payload["planned_child_shares"])
+            if "continuous_panel" in payload:
+                continuous = decode_quote_panel(
+                    payload["continuous_panel"], len(payload["visible_mid"]), len(grid),
+                    int(payload["paths_per_day"]),
+                )
+            if type(replicates) is not int or replicates < 1:
+                raise ValueError("P2 replicas must be a positive integer")
+            if "absolute_drift_ticks" in payload["generated_tapes"]:
+                generated["absolute_drift_ticks"] = np.asarray(
+                    payload["generated_tapes"]["absolute_drift_ticks"], dtype=float,
+                )
+        elif replicates != 1:
+            raise ValueError("P1 bootstrap payload cannot contain multiple replicates")
         return cls(
             paths={name: np.asarray(payload[name], dtype=float) for name in PATH_FIELDS},
-            generated={name: np.asarray(payload["generated_tapes"][name], dtype=float) for name in TAPE_FIELDS},
+            generated=generated,
             historical={name: np.asarray(payload["historical_tapes"][name], dtype=float) for name in TAPE_FIELDS},
             depth_errors=None if depth is None else np.asarray(depth, dtype=float),
             schedule=np.asarray(payload["schedule"], dtype=bool),
             paths_per_day=int(payload["paths_per_day"]),
             sigma_ticks=float(payload["sigma_ticks"]),
             daily_shares=float(payload["daily_shares"]),
+            metric_schema_version=schema,
+            grid_ms=grid,
+            planned_child_shares=child_shares,
+            num_replicates=replicates,
+            continuous_panel=continuous,
         )
 
     @property
@@ -82,9 +123,14 @@ class MarketClusters:
         resampling targets score uncertainty conditional on the full-panel C2
         result. Reapplying the 3-SE detection cutoff inside each draw would
         change the estimand and cause law detection to censor score draws.
+        P2 explicitly changes this bootstrap estimand: independent C2
+        adjudication in each draw and continuous metrics without that gate.
         """
         generated = _pool_tapes(self.generated, days)
         historical = _pool_tapes(self.historical, days)
+        continuous = None
+        if self.continuous_panel is not None:
+            continuous = {name: values[days] for name, values in self.continuous_panel.items()}
         impact = summarize_impact(
             **{key: marks[days] for key, marks in self.paths.items()},
             sigma_ticks=self.sigma_ticks,
@@ -95,14 +141,24 @@ class MarketClusters:
             paths_per_day=self.paths_per_day,
             include_peak_interval=False,
             law_admitted=law_admitted,
+            metric_schema_version=self.metric_schema_version,
+            grid_ms=self.grid_ms,
+            planned_child_shares=self.planned_child_shares,
+            continuous_panel=continuous,
         )
         depth = None if self.depth_errors is None else float(_finite_mean(self.depth_errors[days]))
         admitted = impact["measurements"]["law_identified"] is True
         return mechanism_readouts(generated, historical, impact, depth), admitted
 
     def resample(self, draws: np.ndarray, metrics: Sequence[str]) -> dict[str, np.ndarray]:
-        """Return one pooled value per [draw, day] row, with original C2 admission."""
-        _, admitted = self._measure(np.arange(self.days), law_admitted=None)
+        """Return one pooled value per [draw, day] row.
+
+        Legacy payloads retain P1's original-panel admission. P2 calls
+        identify_law independently for each resampled complete-day panel.
+        """
+        admitted = None
+        if self.metric_schema_version == P1_METRIC_SCHEMA:
+            _, admitted = self._measure(np.arange(self.days), law_admitted=None)
         samples = {metric: np.full(len(draws), np.nan) for metric in metrics}
         for i, days in enumerate(draws):
             result, _ = self._measure(days, law_admitted=admitted)
@@ -111,6 +167,20 @@ class MarketClusters:
                 if value is not None:
                     values[i] = value
         return samples
+
+    def continuous_mark_support(self, metric: str) -> np.ndarray:
+        """Return [day, required clock marks] support for paired continuous metrics."""
+        if self.continuous_panel is None:
+            raise ValueError("available quote support requires the P2 continuous panel")
+        visible = self.continuous_panel["visible"]
+        if metric == "visible_minus_blind_auc":
+            return np.isfinite(self.continuous_panel["joint_difference"])
+        if metric == "impact_curve_mae":
+            return np.isfinite(visible)
+        if metric in ("post_stop_relaxation_delta", "bounded_relaxation_ratio"):
+            last = int(np.flatnonzero(self.schedule)[-1])
+            return np.isfinite(visible[:, [last, -1]])
+        raise ValueError(f"unknown continuous mark metric {metric}")
 
     def day_support(self, metric: str) -> np.ndarray:
         """Return [day] support for the physical terms underlying a pooled metric.
@@ -121,6 +191,21 @@ class MarketClusters:
         Tape-exponent gaps need at least three positive finite lags in each tape.
         """
         day_children = self.paths["child_visible"]
+        if metric == C2_PASS_METRIC:
+            # Admission is defined (pass or not admitted) for every draw;
+            # complete strict marks are reported separately from the indicator.
+            return np.ones(self.days, dtype=bool)
+        if metric in CONTINUOUS_IMPACT_METRICS:
+            if self.continuous_panel is not None:
+                return self.continuous_mark_support(metric).all(axis=1)
+            visible = self.paths["visible_mid"]
+            if metric == "visible_minus_blind_auc":
+                blind = self.paths["blind_mid"]
+                return np.isfinite(visible).all(axis=(1, 2)) & np.isfinite(blind).all(axis=(1, 2))
+            if metric == "impact_curve_mae":
+                return np.isfinite(visible).all(axis=(1, 2))
+            last = int(np.flatnonzero(self.schedule)[-1])
+            return np.isfinite(visible[:, :, [last, -1]]).all(axis=(1, 2))
         if metric == "impact_exponent_gap":
             return np.isfinite(day_children).all(axis=(1, 2))
         if metric in ("lob_impact_score", "end_over_peak_ratio", "visible_over_blind_ratio"):

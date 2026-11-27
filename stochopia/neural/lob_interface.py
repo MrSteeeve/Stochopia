@@ -1,8 +1,33 @@
-"""Discrete, autoregressive order-event interface shared by fitting and replay."""
+"""Discrete, autoregressive order-event interface shared by fitting and replay.
+
+Causal observations, before any candidate-specific encoding:
+
+* book_ticks[..., 2, 10]: integer absolute price ticks; bid side first, ask
+  side second, levels ordered from touch to depth; zero denotes an empty level.
+* book_shares[..., 2, 10]: resting quantity in shares, on the same level grid.
+* previous_event[..., 4]: previous event's discrete (waiting-time, action
+  including direction, relative price/rank, size) tokens. The fixed historical
+  tokenization bins time and size and clips price distances; it is not a
+  lossless representation of the continuous raw event fields. The full token
+  values, not one scalar summary, reach the candidate.
+* is_own[...]: previous event's own-order bit (available in visible replay).
+* has_deep[..., 2]: optional exact beyond-level-ten availability.
+
+The two ten-level book arrays are not aggregated or clipped at this boundary.
+Candidates can form relative prices from these ticks. The historical seed
+uses a 43-channel numeric book prefix (layout below) followed by learned
+embeddings of all four prior-event tokens. It alone chooses its price scaling,
+clipping, and depth transform. Four categorical vocabularies, matching masks,
+and the unweighted sum of their NLLs remain fixed in the shared framework.
+"""
 
 from __future__ import annotations
 
 from typing import NamedTuple
+
+from .lob_state import (
+    State, concat_states, detach_or_clone_state, index_select_state, state_num_elements_per_sample,
+)
 
 import torch
 from torch import Tensor, nn
@@ -14,10 +39,23 @@ _LOT_UPPER = (99, 100, 200, 300, 400, 500, 800, 1200, 2000, 5000, 10000)
 _LOT_SHARES = (50, 100, 200, 300, 400, 500, 700, 1000, 1600, 3500, 7500, 15000)
 DT_BINS, ACTION_BINS, REL_TICK_BINS, LOT_BINS = 16, 6, 26, 12
 BUCKET_COUNTS = (DT_BINS, ACTION_BINS, REL_TICK_BINS, LOT_BINS)
-IS_OWN_FEATURE_INDEX = 42  # 40 book features, then spread and imbalance.
+# Numeric book prefix in side-major, touch-to-depth order. A packed extension
+# uses the four raw prior tokens instead of a candidate's learned embeddings.
+BID_PRICE_FEATURE_SLICE = slice(0, 10)
+ASK_PRICE_FEATURE_SLICE = slice(10, 20)
+BID_DEPTH_FEATURE_SLICE = slice(20, 30)
+ASK_DEPTH_FEATURE_SLICE = slice(30, 40)
+SPREAD_FEATURE_INDEX = 40
+IMBALANCE_FEATURE_INDEX = 41
+IS_OWN_FEATURE_INDEX = 42
+BOOK_FEATURE_WIDTH = 43
+PRIOR_DT_FEATURE_INDEX = 43
+PRIOR_ACTION_FEATURE_INDEX = 44
+PRIOR_REL_FEATURE_INDEX = 45
+PRIOR_VOLUME_FEATURE_INDEX = 46
+PACKED_OBSERVATION_WIDTH = 47
 MAX_WORLD_MODEL_PARAMS = 28_000
 MAX_WORLD_MODEL_STATE = 128
-State = Tensor | tuple[Tensor, ...] | None
 
 
 class StepObservation(NamedTuple):
@@ -191,15 +229,15 @@ def world_model_loss(logits: FiveTupleLogits, targets: Tensor, *, reduction: str
 
 # --- Tensor contract checks ---
 
-def _probe(device: torch.device, seed: int) -> LOBBatch:
+def _probe(device: torch.device, seed: int, batch_size: int = 1) -> LOBBatch:
     rng = torch.Generator().manual_seed(seed)
-    bid = torch.randint(100, 300, (1, 9, 1), generator=rng)
+    bid = torch.randint(100, 300, (batch_size, 9, 1), generator=rng)
     spread = torch.randint(1, 10, bid.shape, generator=rng)
     levels = torch.arange(10)
     ticks = torch.stack((bid - levels, bid + spread + levels), dim=-2)
     shares = torch.randint(1, 1500, ticks.shape, generator=rng)
-    dt = torch.randint(DT_BINS, (1, 9), generator=rng)
-    action = (torch.arange(9).unsqueeze(0) + seed) % ACTION_BINS
+    dt = torch.randint(DT_BINS, (batch_size, 9), generator=rng)
+    action = (torch.arange(9).unsqueeze(0) + seed + torch.arange(batch_size)[:, None]) % ACTION_BINS
     size = torch.randint(LOT_BINS, dt.shape, generator=rng)
     own = torch.rand(dt.shape, generator=rng) > 0.5
     mask = valid_rel_tick_mask(StepObservation(ticks, shares, torch.empty(0), own), action)
@@ -208,52 +246,68 @@ def _probe(device: torch.device, seed: int) -> LOBBatch:
     return make_batch(ticks.to(device), shares.to(device), targets, own.to(device))
 
 
+def _check_batch_contract(
+    model: LOBWorldModel, batch: LOBBatch, other: LOBBatch, max_state_dim: int,
+) -> int:
+    """Check causal prefix, legal likelihood, and step/sequence equality in one batch."""
+    obs, targets = batch
+    prefix = targets.size(1) // 2 + 1
+    edited = StepObservation(*(torch.cat((a[:, :prefix], b[:, prefix:]), dim=1)
+                               for a, b in zip(obs[:4], other.observation[:4], strict=True)))
+    changed = torch.cat((targets[:, :prefix], other.targets[:, prefix:]), dim=1)
+    expected = model.forward_sequence(batch)
+    alternate = model.forward_sequence(LOBBatch(edited, changed))
+    context = model.sequence_context(obs)
+    for head, perturbed, classes in zip(expected, alternate, BUCKET_COUNTS, strict=True):
+        if head.shape != (*targets.shape[:-1], classes):
+            raise ValueError("wrong categorical head shape")
+        torch.testing.assert_close(head[:, :prefix], perturbed[:, :prefix], rtol=0, atol=1e-5)
+    action_mask = valid_action_mask(obs.book_ticks, obs.book_shares)
+    price_mask = valid_rel_tick_mask(obs, targets[..., 1])
+    for head, legal in zip(expected[1:3], (action_mask, price_mask), strict=True):
+        if not torch.isneginf(head[~legal]).all():
+            raise ValueError("unmasked illegal action or price bucket")
+    if not torch.isfinite(world_model_loss(expected, targets).total):
+        raise ValueError("non-finite likelihood for a legal event")
+
+    state = None
+    largest_state = 0
+    for t in range(targets.size(1)):
+        sampler, state = model.forward_step(obs.at((slice(None), t)), state)
+        size = state_num_elements_per_sample(state, batch_size=targets.size(0))
+        largest_state = max(largest_state, size)
+        if size > max_state_dim:
+            raise ValueError("model exceeds max_state_dim")
+        torch.testing.assert_close(sampler.context, context[:, t], rtol=0, atol=1e-5)
+        for step, seq in zip(sampler.conditioned(targets[:, t]), expected, strict=True):
+            torch.testing.assert_close(step, seq[:, t], rtol=0, atol=1e-5)
+    return largest_state
+
+
 @torch.no_grad()
 def verify_world_model_contract(
     model: LOBWorldModel, *, max_params: int = MAX_WORLD_MODEL_PARAMS, max_state_dim: int = MAX_WORLD_MODEL_STATE,
 ) -> tuple[int, int]:
-    """Check prefix and step equivalence, then return parameters and largest scalar state."""
+    """Check fixed categorical heads, causality and sequence/step equivalence.
+
+    Independent probes at batch sizes one and five exercise dynamic batching;
+    each returned state is charged by real scalar elements per sample (not the
+    product of batch size and state geometry). The tolerance is 1e-5 absolute
+    for prefix and step equivalence. Restore the caller's training mode.
+    """
     parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if parameters > max_params:
         raise ValueError("model exceeds max_params")
     device = next(model.parameters(), torch.empty(0)).device
-    batch = _probe(device, 291)
-    other = _probe(device, 106)
-    obs, targets = batch
-    prefix = targets.size(1) // 2 + 1
-    edited = StepObservation(*(torch.cat((a[:, :prefix], b[:, prefix:]), dim=1)
-                               for a, b in zip(obs[:4], other.observation[:4])))
-    changed = torch.cat((targets[:, :prefix], other.targets[:, prefix:]), dim=1)
     training = model.training
     model.eval()
+    largest_state = 0
     try:
-        expected = model.forward_sequence(batch)
-        alternate = model.forward_sequence(LOBBatch(edited, changed))
-        context = model.sequence_context(obs)
-        for head, perturbed, classes in zip(expected, alternate, BUCKET_COUNTS, strict=True):
-            if head.shape != (*targets.shape[:-1], classes):
-                raise ValueError("wrong categorical head shape")
-            torch.testing.assert_close(head[:, :prefix], perturbed[:, :prefix], rtol=0, atol=1e-5)
-        action_mask = valid_action_mask(obs.book_ticks, obs.book_shares)
-        price_mask = valid_rel_tick_mask(obs, targets[..., 1])
-        for head, legal in zip(expected[1:3], (action_mask, price_mask), strict=True):
-            if not torch.isneginf(head[~legal]).all():
-                raise ValueError("unmasked illegal action or price bucket")
-        if not torch.isfinite(world_model_loss(expected, targets).total):
-            raise ValueError("non-finite likelihood for a legal event")
-
-        state = None
-        largest_state = 0
-        for t in range(targets.size(1)):
-            sampler, state = model.forward_step(obs.at((slice(None), t)), state)
-            leaves = state if isinstance(state, tuple) else (state,)
-            size = sum(x.numel() * (2 if x.is_complex() else 1) for x in leaves if x is not None)
+        for batch_size in (1, 5):
+            batch = _probe(device, 291, batch_size)
+            other = _probe(device, 106, batch_size)
+            size = _check_batch_contract(model, batch, other, max_state_dim)
             largest_state = max(largest_state, size)
-            if size > max_state_dim:
-                raise ValueError("model exceeds max_state_dim")
-            torch.testing.assert_close(sampler.context, context[:, t], rtol=0, atol=1e-5)
-            for step, seq in zip(sampler.conditioned(targets[:, t]), expected, strict=True):
-                torch.testing.assert_close(step, seq[:, t], rtol=0, atol=1e-5)
     finally:
         model.train(training)
     return parameters, largest_state
