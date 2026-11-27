@@ -35,16 +35,23 @@ def background_uniforms(base_seed: int, date: int, window_id: int, replicate: in
     return np.random.default_rng(seed).random((count, 4))
 
 
+class NonfiniteRolloutProbability(ValueError):
+    """A conditional categorical head has no finite positive probability mass."""
+
+
 def _sample_uniforms(sampler: StepSampler, values: torch.Tensor) -> torch.Tensor:
     """Inverse-CDF sample each row at fixed uniforms using the existing masks."""
     tokens: list[torch.Tensor] = []
     for stage in range(4):
-        logits = sampler.model._logits(sampler, stage, tuple(tokens))
+        logits = sampler.logits(stage, tuple(tokens))
         cdf = torch.cumsum(logits.softmax(dim=-1), dim=-1, dtype=torch.float64)
-        cdf = cdf / cdf[:, -1:]
+        mass = cdf[:, -1:]
+        if not bool((torch.isfinite(mass) & (mass > 0)).all()):
+            raise NonfiniteRolloutProbability(f"conditional head {stage} has zero or nonfinite probability mass")
+        cdf = cdf / mass
         chosen = torch.searchsorted(cdf, values[:, stage:stage + 1].contiguous(), right=True)
         if torch.any(chosen >= logits.shape[-1]):
-            raise ValueError("Rollout logits do not define a finite categorical distribution")
+            raise NonfiniteRolloutProbability(f"conditional head {stage} did not define a categorical distribution")
         tokens.append(chosen[:, 0])
     return torch.stack(tokens, dim=-1)
 

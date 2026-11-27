@@ -29,6 +29,7 @@ from stochopia.measure.continuous_impact import (
     P2_METRIC_SCHEMA,
     RESPONSE_EPSILON_TICKS,
     continuous_impact_readouts,
+    counterfactual_impact_mae,
     impact_identifiability_state,
     reference_impact_curve,
 )

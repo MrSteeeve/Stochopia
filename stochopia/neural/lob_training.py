@@ -134,39 +134,58 @@ def fit_lob_world_model(
 @torch.no_grad()
 def world_model_nll_events(
     model: LOBWorldModel, batch: LOBBatch, *, stateless: bool = False,
+    reset_interval: int | None = None,
 ) -> FiveTupleLoss:
     """Return fixed four-head losses [B, T] in nats per event.
 
-    The stateless path maps each observation [B,T,...] to an independent
-    length-one sequence [B*T,1,...]. Its previous-event tokens, own marker,
-    contemporaneous pre-book and target are unchanged. This removes only
-    recurrent propagation, not information already present in the event's
-    observation. Use the same framework loss and masks for both paths.
+    A finite reset interval L partitions each sequence at 0,L,2L,... and
+    resets only the recurrent state. Complete blocks run in one batched
+    forward pass and any short tail in another. Previous tokens, book,
+    markers, targets and original event indices are unchanged. Stateless
+    means L=1; None uses the full stateful sequence. Supervision masks must
+    be applied after restoring [B,T], so denominators are identical.
     """
+    if reset_interval is not None and (
+        isinstance(reset_interval, bool) or not isinstance(reset_interval, int) or reset_interval < 1
+    ):
+        raise ValueError("reset_interval must be a positive integer or None")
+    if stateless and reset_interval not in (None, 1):
+        raise ValueError("stateless=True requires reset_interval=1")
+    interval = 1 if stateless else reset_interval
     was_training = model.training
     model.eval()
     try:
-        if not stateless:
+        batch_size, time_steps = batch.targets.shape[:2]
+        if interval is None or interval >= time_steps:
             return world_model_loss(model.forward_sequence(batch), batch.targets, reduction="none")
 
-        batch_size, time_steps = batch.targets.shape[:2]
-        observations = []
+        complete = time_steps // interval * interval
+        observations: list[Tensor | None] = []
         for field in batch.observation:
             if field is None:
                 observations.append(None)
             else:
-                observations.append(field.reshape(batch_size * time_steps, 1, *field.shape[2:]))
-        folded_targets = batch.targets.reshape(batch_size * time_steps, 1, 4)
+                observations.append(field[:, :complete].reshape(-1, interval, *field.shape[2:]))
+        folded_targets = batch.targets[:, :complete].reshape(-1, interval, 4)
         folded = LOBBatch(StepObservation(*observations), folded_targets)
         loss = world_model_loss(model.forward_sequence(folded), folded_targets, reduction="none")
-        return FiveTupleLoss(*(field.reshape(batch_size, time_steps) for field in loss))
+        restored = [field.reshape(batch_size, complete) for field in loss]
+        if complete < time_steps:
+            tail_observation = StepObservation(*[
+                None if field is None else field[:, complete:] for field in batch.observation
+            ])
+            tail_targets = batch.targets[:, complete:]
+            tail_batch = LOBBatch(tail_observation, tail_targets)
+            tail = world_model_loss(model.forward_sequence(tail_batch), tail_targets, reduction="none")
+            restored = [torch.cat((prefix, suffix), dim=1) for prefix, suffix in zip(restored, tail, strict=True)]
+        return FiveTupleLoss(*restored)
     finally:
         model.train(was_training)
 
 
 def evaluate_world_model_nll(
     model: LOBWorldModel, batches: Sequence[LOBBatch], *, stateless: bool = False,
-    supervised: slice = slice(None),
+    supervised: slice = slice(None), reset_interval: int | None = None,
 ) -> dict[str, float]:
     """Aggregate fixed head means, weighting by number of supervised events.
 
@@ -178,7 +197,7 @@ def evaluate_world_model_nll(
     head_sums = [0.0, 0.0, 0.0, 0.0]
     events = 0
     for batch in batches:
-        loss = world_model_nll_events(model, batch, stateless=stateless)
+        loss = world_model_nll_events(model, batch, stateless=stateless, reset_interval=reset_interval)
         events += loss.total[:, supervised].numel()
         for position, value in enumerate(loss[1:]):
             head_sums[position] += float(value[:, supervised].sum(dtype=torch.float64))
@@ -190,3 +209,20 @@ def evaluate_world_model_nll(
     means = {name: float(value) for name, value in zip(FiveTupleLoss._fields[1:], mean_heads, strict=True)}
     means["total"] = float(mean_heads.sum())
     return means
+
+
+def compute_memory_horizon_profile(
+    model: LOBWorldModel, batches: Sequence[LOBBatch], intervals: Sequence[int] = (1, 4, 16, 64),
+    *, supervised: slice = slice(None),
+) -> dict[int, float]:
+    """G_mem(L)=NLL_reset_every_L - NLL_stateful on identical target positions.
+
+    Each estimate uses the same batches, fitted weights and supervised slice.
+    Non-finite likelihood is an error; no clipping of signed gaps is applied.
+    """
+    stateful = evaluate_world_model_nll(model, batches, supervised=supervised)["total"]
+    profile: dict[int, float] = {}
+    for interval in intervals:
+        reset = evaluate_world_model_nll(model, batches, reset_interval=interval, supervised=supervised)["total"]
+        profile[interval] = reset - stateful
+    return profile

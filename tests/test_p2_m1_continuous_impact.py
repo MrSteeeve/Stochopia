@@ -24,7 +24,7 @@ TAPE = {"gamma_flow": None, "hurst": None, "drift_ticks": 0.0}
 
 
 def _reference() -> np.ndarray:
-    return reference_impact_curve(GRID, 8, scale_ticks=SIGMA, participation=0.25)
+    return reference_impact_curve(GRID, 8, scale_ticks=SIGMA, participation=0.25, permanent_fraction=0.0)
 
 
 def _summarize(amplitudes: np.ndarray) -> dict[str, object]:

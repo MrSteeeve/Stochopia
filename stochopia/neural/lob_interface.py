@@ -175,14 +175,29 @@ class StepSampler(NamedTuple):
     context: Tensor
     observation: StepObservation
 
+    def logits(self, stage: int, prior: tuple[Tensor, ...]) -> Tensor:
+        """Return conditional categorical logits subject to framework masks.
+
+        Candidates supply only the public `head_logits` contract. The book
+        masks belong to the sampler, so training and both rollout engines
+        use exactly the same legal event vocabulary.
+        """
+        logits = self.model.head_logits(self.context, stage, prior)
+        obs = self.observation
+        if stage == 1:
+            return logits.masked_fill(~valid_action_mask(obs.book_ticks, obs.book_shares), -torch.inf)
+        if stage == 2:
+            return logits.masked_fill(~valid_rel_tick_mask(obs, prior[1]), -torch.inf)
+        return logits
+
     def conditioned(self, targets: Tensor) -> FiveTupleLogits:
         prior = targets.unbind(dim=-1)
-        return FiveTupleLogits(*(self.model._logits(self, i, prior[:i]) for i in range(4)))
+        return FiveTupleLogits(*(self.logits(i, prior[:i]) for i in range(4)))
 
     def sample(self, generator: torch.Generator | None = None) -> Tensor:
         tokens: list[Tensor] = []
         for stage in range(4):
-            logits = self.model._logits(self, stage, tuple(tokens))
+            logits = self.logits(stage, tuple(tokens))
             chosen = torch.multinomial(logits.softmax(dim=-1), 1, generator=generator)
             tokens.append(chosen.squeeze(-1))
         return torch.stack(tokens, dim=-1)
@@ -209,13 +224,8 @@ class LOBWorldModel(nn.Module):
         return StepSampler(self, context, step_obs), state
 
     def _logits(self, sampler: StepSampler, stage: int, prior: tuple[Tensor, ...]) -> Tensor:
-        logits = self.head_logits(sampler.context, stage, prior)
-        obs = sampler.observation
-        if stage == 1:
-            return logits.masked_fill(~valid_action_mask(obs.book_ticks, obs.book_shares), -torch.inf)
-        if stage == 2:
-            return logits.masked_fill(~valid_rel_tick_mask(obs, prior[1]), -torch.inf)
-        return logits
+        """Compatibility alias for old candidates using the former helper."""
+        return sampler.logits(stage, prior)
 
 
 def world_model_loss(logits: FiveTupleLogits, targets: Tensor, *, reduction: str = "mean") -> FiveTupleLoss:

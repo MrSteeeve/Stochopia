@@ -23,7 +23,7 @@ from experiments.p1_m2_metrics import (
 )
 from experiments.p1_m3_evidence import compact_evidence
 from experiments.p2_m1_rollout_eval import (
-    average_replicates, pool_continuous_days, stateless_projection, window_replicates,
+    average_replicates, exhausted_replicate_rate, pool_continuous_days, stateless_projection, window_replicates,
 )
 from experiments.p1_m4_market_stats import market_metric_estimates
 from stochopia.common import atomic_write_json
@@ -168,6 +168,7 @@ def evaluate_symbol(
     absolute_drifts = []
     continuous_rows = []
     exhaustion = []
+    replica_exhaustion = []
     generated = []
     fit = []
     paths = []
@@ -210,6 +211,7 @@ def evaluate_symbol(
                 window_depth_errors.append(depth_error)
                 absolute_drifts.append(absolute_drift)
                 exhaustion.append(exhausted)
+                replica_exhaustion.append(exhausted_replicate_rate(replicas))
                 continuous_rows.append(continuous)
                 if save_traces:
                     for replica, pair in enumerate(replicas):
@@ -259,6 +261,7 @@ def evaluate_symbol(
     evidence["paired_seed_windows"] = sum(len(seed) for seed in paths)
     if p2:
         evidence.update(evaluation_protocol)
+        evidence["exhausted_replicate_rate"] = float(np.mean(replica_exhaustion))
         evidence.update(stateless_projection(profile.model_nll, _likelihood(stateless_nll)[0], HEADS))
         evidence["paired_replica_windows"] = evidence["paired_seed_windows"] * num_replicates
     result["evidence"] = evidence
@@ -281,6 +284,7 @@ def evaluate_symbol(
         if p2:
             stateless_daily = _likelihood([stateless_nll[i] for i in flat_indices])[0]
             daily_row.update(stateless_projection(daily_profile.model_nll, stateless_daily, HEADS))
+            daily_row["exhausted_replicate_rate"] = float(np.mean([replica_exhaustion[i] for i in flat_indices]))
         daily_metrics[str(date)] = daily_row
     result["day_metrics"] = daily_metrics
     result.update(dev_targets=sum(entry[2] for entry in nll), fit=fit, seconds=perf_counter() - start_all)

@@ -23,7 +23,7 @@ NOISY_UNIDENTIFIED = "NOISY_UNIDENTIFIED"
 
 CONTINUOUS_IMPACT_METRICS = (
     "impact_curve_mae", "post_stop_relaxation_delta",
-    "bounded_relaxation_ratio", "visible_minus_blind_auc",
+    "bounded_relaxation_ratio", "visible_minus_blind_auc", "stylized_impact_mae",
 )
 C2_PASS_METRIC = "c2_pass_prob"
 
@@ -32,10 +32,13 @@ class ContinuousImpactReadouts(TypedDict):
     impact_identifiability_state: str | None
     c2_pass_prob: float
     impact_curve_mae: float | None
+    stylized_impact_mae: float | None
     post_stop_relaxation_delta: float | None
     bounded_relaxation_ratio: float | None
     visible_minus_blind_auc: float | None
     reference_curve_ticks: list[float]
+    stylized_reference_curve_ticks: list[float]
+    permanent_fraction: float
     reference_scale_ticks: float
     reference_participation: float
 
@@ -58,13 +61,15 @@ def impact_identifiability_state(*, c2_pass: bool, execution_peak_ticks: float) 
 
 def reference_impact_curve(
     grid_ms: np.ndarray, execution_end_ms: float, *, scale_ticks: float, participation: float,
+    permanent_fraction: float = 0.5,
 ) -> np.ndarray:
     """Evaluate the fixed square-root propagator on a physical-clock grid.
 
     Input [grid] is elapsed milliseconds; T_exec must be strictly positive.
     With normalized time u=t/T_exec, the model-independent reference is
     S_mkt sqrt(eta) sqrt(u) during execution. After the last child it is
-    S_mkt sqrt(eta) [sqrt(u)-sqrt(u-1)]. The amplitude is in ticks; neither
+    S_mkt sqrt(eta) [f + (1-f)*(sqrt(u)-sqrt(u-1))], where f is the
+    permanent fraction. f=0 reproduces the historical M1 transient reference. The amplitude is in ticks; neither
     model's realized fills nor model's estimated impact calibrate it.
     """
     grid = np.asarray(grid_ms, dtype=float)
@@ -78,8 +83,11 @@ def reference_impact_curve(
         raise ValueError("reference scale must be a finite nonnegative volatility in ticks")
     if not isfinite(participation) or participation <= 0:
         raise ValueError("reference participation must be a positive finite fraction")
+    if not isfinite(permanent_fraction) or not 0 <= permanent_fraction <= 1:
+        raise ValueError("permanent_fraction must be finite and within [0,1]")
     relative_time = grid / execution_end_ms
-    shape = np.sqrt(relative_time) - np.sqrt(np.maximum(relative_time - 1.0, 0.0))
+    transient = np.sqrt(relative_time) - np.sqrt(np.maximum(relative_time - 1.0, 0.0))
+    shape = np.where(relative_time <= 1, transient, permanent_fraction + (1 - permanent_fraction) * transient)
     return scale_ticks * sqrt(participation) * shape
 
 
@@ -92,11 +100,13 @@ def continuous_impact_readouts(
     grid_ms: np.ndarray, schedule: np.ndarray, scale_ticks: float,
     participation: float, c2_pass: bool, execution_peak_ticks: float,
     visible_minus_blind_curve_ticks: np.ndarray | None = None,
+    permanent_fraction: float = 0.5,
 ) -> ContinuousImpactReadouts:
     """Measure [grid] pooled, antisymmetric signed responses on the same clock.
 
-    MAE is mean absolute tick error over every grid mark against the fixed
-    propagator. Relaxation is I(T_exec)-I(T_end); its bounded-denominator
+    MAE is mean absolute tick error over every grid mark against a fixed
+    stylized propagator, not empirical counterfactual ground truth. The legacy
+    impact_curve_mae uses f=0; stylized_impact_mae uses the declared fraction. Relaxation is I(T_exec)-I(T_end); its bounded-denominator
     ratio divides by max(abs(I(T_exec)), 1e-3 ticks), without clipping the
     numerator. AUC is trapezoidal integral of visible-blind over t/T_exec.
     Complete finite response curves always yield finite readouts regardless
@@ -112,7 +122,11 @@ def continuous_impact_readouts(
         raise ValueError("injection schedule must align with the reference clock")
     last = int(np.flatnonzero(schedule)[-1])
     reference = reference_impact_curve(
+        grid, float(grid[last]), scale_ticks=scale_ticks, participation=participation, permanent_fraction=0.0,
+    )
+    stylized_reference = reference_impact_curve(
         grid, float(grid[last]), scale_ticks=scale_ticks, participation=participation,
+        permanent_fraction=permanent_fraction,
     )
     visible = np.asarray(visible_curve_ticks, dtype=float)
     blind = None if blind_curve_ticks is None else np.asarray(blind_curve_ticks, dtype=float)
@@ -126,11 +140,13 @@ def continuous_impact_readouts(
         raise ValueError("response curves must align with the reference clock")
 
     mae = None
+    stylized_mae = None
     relaxation_delta = None
     relaxation_ratio = None
     auc = None
     if _finite_curve(visible, grid.shape):
         mae = float(np.abs(visible - reference).mean())
+        stylized_mae = float(np.abs(visible - stylized_reference).mean())
     if joint is None and blind is not None and _finite_curve(visible, grid.shape) and _finite_curve(blind, grid.shape):
         joint = visible - blind
     if joint is not None and _finite_curve(joint, grid.shape):
@@ -147,10 +163,26 @@ def continuous_impact_readouts(
         ),
         "c2_pass_prob": float(c2_pass),
         "impact_curve_mae": mae,
+        "stylized_impact_mae": stylized_mae,
         "post_stop_relaxation_delta": relaxation_delta,
         "bounded_relaxation_ratio": relaxation_ratio,
         "visible_minus_blind_auc": auc,
         "reference_curve_ticks": reference.tolist(),
+        "stylized_reference_curve_ticks": stylized_reference.tolist(),
+        "permanent_fraction": float(permanent_fraction),
         "reference_scale_ticks": float(scale_ticks),
         "reference_participation": float(participation),
     }
+
+
+def counterfactual_impact_mae(visible_curve: np.ndarray, ground_truth_curve: np.ndarray) -> float:
+    """MAE in ticks on aligned nonempty exact counterfactual observations.
+
+    For curves [G] difference is mean(abs(model - truth)); missing or
+    unaligned observations are rejected, never replaced by a stylized curve.
+    """
+    visible = np.asarray(visible_curve, dtype=float)
+    truth = np.asarray(ground_truth_curve, dtype=float)
+    if visible.ndim != 1 or not visible.size or not _finite_curve(visible, truth.shape) or not np.isfinite(truth).all():
+        raise ValueError("counterfactual curves must be aligned, nonempty and finite")
+    return float(np.abs(visible - truth).mean())

@@ -175,7 +175,7 @@ class MarketClusters:
         visible = self.continuous_panel["visible"]
         if metric == "visible_minus_blind_auc":
             return np.isfinite(self.continuous_panel["joint_difference"])
-        if metric == "impact_curve_mae":
+        if metric in ("impact_curve_mae", "stylized_impact_mae"):
             return np.isfinite(visible)
         if metric in ("post_stop_relaxation_delta", "bounded_relaxation_ratio"):
             last = int(np.flatnonzero(self.schedule)[-1])
@@ -202,7 +202,7 @@ class MarketClusters:
             if metric == "visible_minus_blind_auc":
                 blind = self.paths["blind_mid"]
                 return np.isfinite(visible).all(axis=(1, 2)) & np.isfinite(blind).all(axis=(1, 2))
-            if metric == "impact_curve_mae":
+            if metric in ("impact_curve_mae", "stylized_impact_mae"):
                 return np.isfinite(visible).all(axis=(1, 2))
             last = int(np.flatnonzero(self.schedule)[-1])
             return np.isfinite(visible[:, :, [last, -1]]).all(axis=(1, 2))

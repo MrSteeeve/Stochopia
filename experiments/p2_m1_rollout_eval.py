@@ -95,6 +95,31 @@ def pool_continuous_days(rows: Sequence[dict[str, np.ndarray]], window_count: in
     return panel
 
 
+def exhausted_replicate_rate(replicas: Sequence[dict[RolloutArm, RolloutTrace]]) -> float:
+    """Fraction of window-replicate trajectories with any failed paired arm.
+
+    Exhausted books, exhausted event budget and missing midpoint marks count
+    once per replica even if multiple arms or marks fail. K identical copies
+    of each trajectory leave this fraction unchanged. Missing arms are an
+    invalid paired input; unavailable prices are never treated as zero.
+    """
+    if not replicas:
+        raise ValueError("At least one replica is required")
+    bad = 0
+    for replica in replicas:
+        if set(replica) != set(RolloutArm):
+            raise ValueError("Incomplete paired trajectory")
+        for trace in replica.values():
+            if (
+                trace.exhausted or trace.budget_exhausted or not np.isfinite(trace.mid_ticks).all()
+                or not np.isfinite(trace.spread_ticks).all()
+                or not np.isfinite(trace.after_child_mid_ticks).all()
+            ):
+                bad += 1
+                break
+    return bad / len(replicas)
+
+
 def average_replicates(
     replicas: Sequence[dict[RolloutArm, RolloutTrace]], replay_depth: np.ndarray,
 ) -> tuple[dict[RolloutArm, RolloutTrace], TapeStats, float, float, float, dict[str, np.ndarray]]:

@@ -47,11 +47,14 @@ def parallel_affine_scan(
     state_shape = (inputs.size(0), *inputs.shape[2:])
     if init_state is not None and init_state.shape != state_shape:
         raise ValueError("initial state must have shape [batch, *state_shape]")
-    if (
-        gates.ndim == inputs.ndim - 1
-        and gates.size(0) == inputs.size(0)
-        and gates.size(0) != inputs.size(1)
-    ):
+    if gates.ndim == inputs.ndim - 2 and gates.shape == inputs.shape[2:]:
+        gates = gates.unsqueeze(0).unsqueeze(0)
+    elif gates.ndim == inputs.ndim - 1 and gates.size(0) == inputs.size(0):
+        if gates.size(0) == inputs.size(1):
+            raise ValueError(
+                "ambiguous gates when batch equals time: use [B, 1, *state_shape], "
+                "[1, T, *state_shape], or [*state_shape]",
+            )
         gates = gates.unsqueeze(1)
     if gates.shape != inputs.shape:
         gates = gates.expand_as(inputs)
