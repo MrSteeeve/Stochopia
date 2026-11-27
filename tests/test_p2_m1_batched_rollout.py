@@ -19,7 +19,7 @@ from stochopia.harness.lob_rollout import (
 )
 from stochopia.harness.lob_rollout_batch import background_uniforms
 from stochopia.neural.lob_interface import State, StepObservation
-from tests.test_lob_rollout import _day, _fixture_rollout, _ScriptedModel
+from test_lob_rollout import _day, _fixture_rollout, _ScriptedModel
 
 
 class BatchedScript(_ScriptedModel):
