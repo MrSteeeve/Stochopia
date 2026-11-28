@@ -92,6 +92,15 @@ def _mean_complete(values: Sequence[float | None]) -> float | None:
     return float(np.mean(values)) if all(x is not None and isfinite(x) for x in values) else None
 
 
+def _relative_clock_error(generated_cv2: float | None, historical_cv2: float | None) -> float | None:
+    """Window-local CV² discrepancy, normalized by its matched historical flow."""
+    if generated_cv2 is None or historical_cv2 is None:
+        return None
+    if not isfinite(generated_cv2) or not isfinite(historical_cv2):
+        return None
+    return abs(generated_cv2 - historical_cv2) / max(historical_cv2, 1.0)
+
+
 def evaluate_discovery_model(model: LOBWorldModel, panel: MeasurementPanel) -> list[dict[str, Any]]:
     """Two sessions/physical day, K aligned replicas; no fabrication of unavailable quotations."""
     if panel.truth.shape != (len(panel.windows), len(GRID_MS)) or len(panel.windows) != 2 * len(panel.evaluation):
@@ -115,6 +124,9 @@ def evaluate_discovery_model(model: LOBWorldModel, panel: MeasurementPanel) -> l
                 raise ValueError("window order changed relative to the registered day calendar")
             values = _window_metrics(window, replicas, panel.truth[index], GRID_MS)
             values["sign_acf_abs_error"] = values.pop("direction_acf_mae")
+            values["interarrival_cv2_rel_error"] = _relative_clock_error(
+                values["interarrival_cv2_generated"], values["interarrival_cv2_historical"],
+            )
             values.update(_impact_readouts(replicas, panel))
             by_day[index//2].append(values)
     strict = ("counterfactual_impact_mae", "stylized_impact_mae", "post_stop_relaxation_delta",
