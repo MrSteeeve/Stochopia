@@ -291,9 +291,30 @@ def test_reconciliation_reports_volume_error_by_book_depth(one_day: Path) -> Non
     assert checks is not None
     assert checks.n_snapshots == 3
     assert checks.touch_match_rate == pytest.approx(2 / 3)
+    assert checks.top1_quote_match_rate == pytest.approx(2 / 3)
     assert checks.top5_log_vol_mae == 0.0
     assert checks.top10_log_vol_mae == pytest.approx(np.log1p(3) / (3 * 2 * 10))
+    assert checks.top10_depth_mae == pytest.approx(3 / (3 * 2 * 10))
+    assert checks.invalid_spread_rate == 0.0
     assert checks.max_deviation_time_ms == 34_200_020
+
+
+def test_reconciliation_flags_invalid_spread_when_replayed_side_is_empty(tmp_path: Path) -> None:
+    _write(tmp_path / ORDER_TABLE, [
+        _order(1, 91_500_000, "B", 998, 500),
+        _order(2, 93_000_020, "S", 1000, 300),
+    ])
+    _write(tmp_path / TRADE_TABLE, [_trade(3, 93_000_030, 1, 0, 0, 100, "C")])
+    _write(tmp_path / QUOTE_TABLE, [
+        _quote(93_000_010, [(998, 500)], [(1000, 300)]),
+        _quote(93_000_025, [(998, 500)], [(1000, 300)]),
+    ])
+    _, checks = reconstruct_szse_day(tmp_path, CODE)
+    assert checks is not None
+    assert checks.n_snapshots == 2
+    assert checks.top1_quote_match_rate == checks.touch_match_rate == 0.5
+    assert checks.invalid_spread_rate == 0.5
+    assert checks.top10_depth_mae == pytest.approx(300 / (2 * 2 * 10))
 
 
 def test_market_residual_uses_last_immediate_fill_after_sweeping_multiple_levels(tmp_path: Path) -> None:

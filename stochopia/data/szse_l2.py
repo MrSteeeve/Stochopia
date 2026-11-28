@@ -9,6 +9,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from stochopia.measure.data_properties import measure_reconstruction_quality
+
 ACTION_TYPES = (
     "passive_buy", "passive_sell", "aggressive_buy", "aggressive_sell", "cancel_buy", "cancel_sell",
 )
@@ -65,6 +67,9 @@ class BookReconciliation:
     max_deviation_time_ms: int | None = None
     vol_aligned_touch_match_rate: float = np.nan
     n_volume_aligned_snapshots: int = 0
+    top1_quote_match_rate: float = np.nan
+    top10_depth_mae: float = np.nan
+    invalid_spread_rate: float = np.nan
 
 
 def parse_wind_time_ms(hhmmssmmm: int | np.ndarray) -> int | np.ndarray:
@@ -250,7 +255,12 @@ def _reconciliation(
     """For [snapshot, side, level], mean absolute log(1+shares) difference and its worst row."""
     if not len(times):
         return BookReconciliation(0, np.nan, np.nan, np.nan)
-    touch = (actual_prices[:, :, 0] == replay_prices[:, :, 0]).all(axis=1)
+    quality = measure_reconstruction_quality([{
+        "observed_ticks": actual_prices,
+        "reconstructed_ticks": replay_prices,
+        "observed_shares": actual_depth,
+        "reconstructed_shares": replay_depth,
+    }])
     error = np.abs(np.log1p(actual_depth) - np.log1p(replay_depth))
     worst = int(times[error.mean(axis=(1, 2)).argmax()])
     # A plateau may contain quote changes between fills. Compare to the first
@@ -258,8 +268,16 @@ def _reconciliation(
     matches = [tuple(px) == waterline_books[v] for v, px in zip(volumes, actual_prices[:, :, 0])
                if v in waterline_books]
     return BookReconciliation(
-        len(times), float(touch.mean()), float(error[:, :, :5].mean()), float(error.mean()), worst,
-        float(np.mean(matches)) if matches else np.nan, len(matches),
+        len(times),
+        quality["top1_quote_match_rate"],
+        float(error[:, :, :5].mean()),
+        float(error.mean()),
+        worst,
+        float(np.mean(matches)) if matches else np.nan,
+        len(matches),
+        quality["top1_quote_match_rate"],
+        quality["top10_depth_mae"],
+        quality["invalid_spread_rate"],
     )
 
 
