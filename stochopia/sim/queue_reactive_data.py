@@ -108,13 +108,27 @@ def generate_dataset(
     if not 0 < context_len < events_per_session or train_days < 1 or eval_days < 0:
         raise ValueError("nonempty train and a complete context before each anchor required")
     train, _ = _days(spec, seed, 0, train_days, events_per_session, context_len)
-    evaluation, state = _days(spec, seed, train_days, eval_days, events_per_session, context_len)
+    evaluation = generate_evaluation_dataset(
+        spec, seed=seed, first_day=train_days, eval_days=eval_days,
+        events_per_session=events_per_session, context_len=context_len,
+    )
+    return QueueDataset(spec, train, evaluation.evaluation, evaluation.windows, evaluation.truth_initial)
+
+
+def generate_evaluation_dataset(
+    spec: QueueWorldSpec, *, seed: int, first_day: int, eval_days: int,
+    events_per_session: int = EVENTS_PER_SESSION, context_len: int = CONTEXT_LEN,
+) -> QueueDataset:
+    """Materialize only the requested evaluation calendar, never train or earlier days."""
+    if not 0 < context_len < events_per_session or first_day < 0 or eval_days < 0:
+        raise ValueError("an independent nonnegative day range and a complete context are required")
+    evaluation, state = _days(spec, seed, first_day, eval_days, events_per_session, context_len)
     windows = tuple(
         RolloutWindow(day, start + context_len, session, MAX_EVENTS)
         for day in evaluation
         for session, (start, _) in enumerate(day.session_bounds)
     )
-    return QueueDataset(spec, train, evaluation, windows, state)
+    return QueueDataset(spec, (), evaluation, windows, state)
 
 
 def _truth_chunk(
